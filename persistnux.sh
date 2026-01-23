@@ -163,7 +163,7 @@ log_error() {
 
 log_finding() {
     echo -e "${RED}[FINDING]${NC} $1"
-    ((FINDINGS_COUNT++))
+    FINDINGS_COUNT=$((FINDINGS_COUNT + 1))
 }
 
 # Calculate file hash
@@ -279,16 +279,25 @@ check_systemd() {
                 fi
 
                 local confidence="MEDIUM"
+
+                # Check modification time (recently modified = more suspicious)
+                local mod_time=$(stat -c %Y "$service_file" 2>/dev/null || stat -f %m "$service_file" 2>/dev/null || echo "0")
+                local current_time=$(date +%s)
+                local days_old=$(( (current_time - mod_time) / 86400 ))
+
                 # Increase confidence for suspicious patterns
-                if echo "$exec_start" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|base64|chmod \+x)"; then
+                if echo "$exec_start" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|/dev/tcp|/dev/udp|base64|chmod \+x)"; then
                     confidence="HIGH"
                     log_finding "Suspicious systemd service: $service_file"
                 elif check_suspicious_patterns "$exec_start"; then
                     confidence="HIGH"
                     log_finding "Suspicious systemd service (advanced patterns): $service_file"
+                elif [[ $days_old -lt 7 ]] && [[ "$enabled_status" == "enabled" ]]; then
+                    confidence="HIGH"
+                    log_finding "Recently created enabled systemd service: $service_file (${days_old} days old)"
                 fi
 
-                add_finding "Systemd" "Service" "systemd_service" "$service_file" "Service: $service_name | Status: $enabled_status | ExecStart: $exec_start" "$confidence" "$hash" "$metadata" "enabled=$enabled_status"
+                add_finding "Systemd" "Service" "systemd_service" "$service_file" "Service: $service_name | Status: $enabled_status | ExecStart: $exec_start" "$confidence" "$hash" "$metadata" "enabled=$enabled_status|days_old=$days_old"
 
             done < <(find "$path" -maxdepth 1 -type f \( -name "*.service" -o -name "*.timer" -o -name "*.socket" \) -print0 2>/dev/null)
         fi
@@ -320,7 +329,7 @@ check_cron() {
                 local content=$(grep -Ev "^#|^$" "$cron_path" 2>/dev/null | head -20 || echo "")
 
                 local confidence="MEDIUM"
-                if echo "$content" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|base64)"; then
+                if echo "$content" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|/dev/tcp|/dev/udp|base64)"; then
                     confidence="HIGH"
                     log_finding "Suspicious cron job in: $cron_path"
                 elif check_suspicious_patterns "$content"; then
@@ -338,15 +347,24 @@ check_cron() {
                     local content=$(grep -Ev "^#|^$" "$cron_file" 2>/dev/null | head -10 || echo "")
 
                     local confidence="MEDIUM"
-                    if echo "$content" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|base64|chmod \+x)"; then
+
+                    # Check modification time
+                    local mod_time=$(stat -c %Y "$cron_file" 2>/dev/null || stat -f %m "$cron_file" 2>/dev/null || echo "0")
+                    local current_time=$(date +%s)
+                    local days_old=$(( (current_time - mod_time) / 86400 ))
+
+                    if echo "$content" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|/dev/tcp|/dev/udp|base64|chmod \+x)"; then
                         confidence="HIGH"
                         log_finding "Suspicious cron job: $cron_file"
                     elif check_suspicious_patterns "$content"; then
                         confidence="HIGH"
                         log_finding "Suspicious cron job (advanced patterns): $cron_file"
+                    elif [[ $days_old -lt 7 ]]; then
+                        confidence="HIGH"
+                        log_finding "Recently created cron job: $cron_file (${days_old} days old)"
                     fi
 
-                    add_finding "Cron" "System" "cron_script" "$cron_file" "Scheduled script: $(basename "$cron_file")" "$confidence" "$hash" "$metadata" "content_preview=${content:0:100}"
+                    add_finding "Cron" "System" "cron_script" "$cron_file" "Scheduled script: $(basename "$cron_file")" "$confidence" "$hash" "$metadata" "content_preview=${content:0:100}|days_old=$days_old"
 
                 done < <(find "$cron_path" -type f -print0 2>/dev/null)
             fi
@@ -360,7 +378,7 @@ check_cron() {
                 local user_cron=$(crontab -u "$username" -l 2>/dev/null || echo "")
                 if [[ -n "$user_cron" ]]; then
                     local confidence="MEDIUM"
-                    if echo "$user_cron" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|base64)"; then
+                    if echo "$user_cron" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|/dev/tcp|/dev/udp|base64)"; then
                         confidence="HIGH"
                         log_finding "Suspicious user crontab for: $username"
                     fi
