@@ -1,0 +1,41 @@
+# Persistnux output files
+persistnux_output/
+*.csv
+*.jsonl
+
+# Except example outputs
+!examples/*.csv
+!examples/*.jsonl
+
+# Temporary files
+/tmp/persistnux_*
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Python cache (for future offline analysis tool)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
