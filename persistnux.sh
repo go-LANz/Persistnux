@@ -30,6 +30,107 @@ FINDINGS_COUNT=0
 EUID_CHECK=$(id -u)
 
 ################################################################################
+# Suspicious Pattern Definitions
+################################################################################
+
+# Enhanced suspicious patterns based on research from multiple sources
+# Includes patterns from Crackdown and community DFIR knowledge
+declare -a SUSPICIOUS_NETWORK_PATTERNS=(
+    "bash -i >& /dev/tcp/"
+    "bash -i >& /dev/udp/"
+    "sh -i >\$ /dev/tcp/"
+    "sh -i >\$ /dev/udp/"
+    "/bin/bash -c exec 5<>/dev/tcp/"
+    "/bin/bash -c exec 5<>/dev/udp/"
+    "nc -e /bin/sh"
+    "/bin/sh | nc"
+    "mknod.*backpipe"
+    "telnet.*bash"
+    "socat exec:"
+    "xterm -display"
+)
+
+declare -a SUSPICIOUS_COMMANDS=(
+    "curl.*|.*bash"
+    "curl.*|.*sh"
+    "wget.*|.*bash"
+    "wget.*|.*sh"
+    "curl.*sh -c"
+    "wget.*sh -c"
+    "chmod \+x.*tmp"
+    "chmod 777"
+    "base64.*decode"
+    "eval.*base64"
+    "echo.*base64.*decode"
+    "python.*-c.*socket"
+    "perl.*socket"
+    "ruby.*socket"
+    "php.*fsockopen"
+    "ncat"
+    "socat"
+)
+
+declare -a SUSPICIOUS_LOCATIONS=(
+    "/dev/shm"
+    "/tmp"
+    "/var/tmp"
+    "hidden directory"
+    "\.\."
+)
+
+declare -a SUSPICIOUS_FILES=(
+    "/etc/shadow"
+    "/etc/passwd"
+    "/root/.ssh"
+    "id_rsa"
+    "authorized_keys"
+)
+
+# Check if content matches suspicious patterns
+check_suspicious_patterns() {
+    local content="$1"
+    local pattern_type="${2:-all}"  # all, network, command, location, file
+
+    # Network-based patterns
+    if [[ "$pattern_type" == "all" ]] || [[ "$pattern_type" == "network" ]]; then
+        for pattern in "${SUSPICIOUS_NETWORK_PATTERNS[@]}"; do
+            if echo "$content" | grep -qE "$pattern" 2>/dev/null; then
+                return 0  # Found suspicious pattern
+            fi
+        done
+    fi
+
+    # Command-based patterns
+    if [[ "$pattern_type" == "all" ]] || [[ "$pattern_type" == "command" ]]; then
+        for pattern in "${SUSPICIOUS_COMMANDS[@]}"; do
+            if echo "$content" | grep -qE "$pattern" 2>/dev/null; then
+                return 0  # Found suspicious pattern
+            fi
+        done
+    fi
+
+    # Location-based patterns
+    if [[ "$pattern_type" == "all" ]] || [[ "$pattern_type" == "location" ]]; then
+        for pattern in "${SUSPICIOUS_LOCATIONS[@]}"; do
+            if echo "$content" | grep -qE "$pattern" 2>/dev/null; then
+                return 0  # Found suspicious pattern
+            fi
+        done
+    fi
+
+    # File-based patterns
+    if [[ "$pattern_type" == "all" ]] || [[ "$pattern_type" == "file" ]]; then
+        for pattern in "${SUSPICIOUS_FILES[@]}"; do
+            if echo "$content" | grep -qE "$pattern" 2>/dev/null; then
+                return 0  # Found suspicious pattern
+            fi
+        done
+    fi
+
+    return 1  # No suspicious patterns found
+}
+
+################################################################################
 # Utility Functions
 ################################################################################
 
@@ -182,6 +283,9 @@ check_systemd() {
                 if echo "$exec_start" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|base64|chmod \+x)"; then
                     confidence="HIGH"
                     log_finding "Suspicious systemd service: $service_file"
+                elif check_suspicious_patterns "$exec_start"; then
+                    confidence="HIGH"
+                    log_finding "Suspicious systemd service (advanced patterns): $service_file"
                 fi
 
                 add_finding "Systemd" "Service" "systemd_service" "$service_file" "Service: $service_name | Status: $enabled_status | ExecStart: $exec_start" "$confidence" "$hash" "$metadata" "enabled=$enabled_status"
@@ -219,6 +323,9 @@ check_cron() {
                 if echo "$content" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|base64)"; then
                     confidence="HIGH"
                     log_finding "Suspicious cron job in: $cron_path"
+                elif check_suspicious_patterns "$content"; then
+                    confidence="HIGH"
+                    log_finding "Suspicious cron job (advanced patterns): $cron_path"
                 fi
 
                 add_finding "Cron" "System" "cron_file" "$cron_path" "Cron configuration file" "$confidence" "$hash" "$metadata" "entries=$(echo "$content" | wc -l)"
@@ -234,6 +341,9 @@ check_cron() {
                     if echo "$content" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|base64|chmod \+x)"; then
                         confidence="HIGH"
                         log_finding "Suspicious cron job: $cron_file"
+                    elif check_suspicious_patterns "$content"; then
+                        confidence="HIGH"
+                        log_finding "Suspicious cron job (advanced patterns): $cron_file"
                     fi
 
                     add_finding "Cron" "System" "cron_script" "$cron_file" "Scheduled script: $(basename "$cron_file")" "$confidence" "$hash" "$metadata" "content_preview=${content:0:100}"
@@ -692,6 +802,154 @@ check_additional_persistence() {
     done
 }
 
+# Check common backdoor locations (inspired by Crackdown and DFIR research)
+check_common_backdoors() {
+    log_info "Checking common backdoor locations..."
+
+    # APT/YUM configuration files that can be abused
+    local pkg_mgr_configs=(
+        "/etc/apt/apt.conf.d"
+        "/usr/share/unattended-upgrades"
+        "/etc/yum.repos.d"
+        "/etc/yum.conf"
+    )
+
+    for config_dir in "${pkg_mgr_configs[@]}"; do
+        if [[ -e "$config_dir" ]]; then
+            if [[ -f "$config_dir" ]]; then
+                local hash=$(get_file_hash "$config_dir")
+                local metadata=$(get_file_metadata "$config_dir")
+                local content=$(cat "$config_dir" 2>/dev/null || echo "")
+
+                local confidence="LOW"
+                if check_suspicious_patterns "$content"; then
+                    confidence="HIGH"
+                    log_finding "Suspicious package manager config: $config_dir"
+                fi
+
+                add_finding "PackageManager" "Config" "pkg_config" "$config_dir" "Package manager configuration: $(basename "$config_dir")" "$confidence" "$hash" "$metadata" ""
+
+            elif [[ -d "$config_dir" ]]; then
+                while IFS= read -r -d '' config_file; do
+                    local hash=$(get_file_hash "$config_file")
+                    local metadata=$(get_file_metadata "$config_file")
+                    local content=$(head -50 "$config_file" 2>/dev/null || echo "")
+
+                    local confidence="LOW"
+                    if check_suspicious_patterns "$content"; then
+                        confidence="HIGH"
+                        log_finding "Suspicious package manager config: $config_file"
+                    fi
+
+                    add_finding "PackageManager" "Config" "pkg_config" "$config_file" "Package manager config: $(basename "$config_file")" "$confidence" "$hash" "$metadata" ""
+                done < <(find "$config_dir" -type f -print0 2>/dev/null)
+            fi
+        fi
+    done
+
+    # Check at.allow and at.deny
+    local at_files=(
+        "/etc/at.allow"
+        "/etc/at.deny"
+    )
+
+    for at_file in "${at_files[@]}"; do
+        if [[ -f "$at_file" ]]; then
+            local hash=$(get_file_hash "$at_file")
+            local metadata=$(get_file_metadata "$at_file")
+
+            add_finding "Scheduled" "AtAccess" "at_access" "$at_file" "At access control: $(basename "$at_file")" "MEDIUM" "$hash" "$metadata" ""
+        fi
+    done
+
+    # Check doas configuration (OpenBSD-style sudo alternative)
+    if [[ -f "/etc/doas.conf" ]]; then
+        local hash=$(get_file_hash "/etc/doas.conf")
+        local metadata=$(get_file_metadata "/etc/doas.conf")
+        local content=$(cat "/etc/doas.conf" 2>/dev/null || echo "")
+
+        local confidence="MEDIUM"
+        if echo "$content" | grep -qiE "(permit nopass|persist)"; then
+            confidence="HIGH"
+            log_finding "Potentially permissive doas configuration"
+        fi
+
+        add_finding "Privilege" "Doas" "doas_config" "/etc/doas.conf" "Doas privilege escalation config" "$confidence" "$hash" "$metadata" ""
+    fi
+
+    # Check for user git configs (can contain credential helpers or hooks)
+    if [[ $EUID_CHECK -eq 0 ]]; then
+        while IFS=: read -r username _ uid _ _ homedir _; do
+            if [[ $uid -ge 1000 ]] || [[ $uid -eq 0 ]]; then
+                local gitconfig="$homedir/.gitconfig"
+                if [[ -f "$gitconfig" ]]; then
+                    local hash=$(get_file_hash "$gitconfig")
+                    local metadata=$(get_file_metadata "$gitconfig")
+                    local content=$(cat "$gitconfig" 2>/dev/null || echo "")
+
+                    local confidence="LOW"
+                    if echo "$content" | grep -qiE "(credential.*helper|core.*pager|core.*editor.*sh)"; then
+                        confidence="MEDIUM"
+                    fi
+                    if check_suspicious_patterns "$content"; then
+                        confidence="HIGH"
+                        log_finding "Suspicious git config for user $username: $gitconfig"
+                    fi
+
+                    add_finding "GitConfig" "User" "git_config" "$gitconfig" "User git config for $username" "$confidence" "$hash" "$metadata" "user=$username"
+                fi
+            fi
+        done < /etc/passwd
+    else
+        if [[ -f "$HOME/.gitconfig" ]]; then
+            local hash=$(get_file_hash "$HOME/.gitconfig")
+            local metadata=$(get_file_metadata "$HOME/.gitconfig")
+
+            add_finding "GitConfig" "User" "git_config" "$HOME/.gitconfig" "Current user git config" "LOW" "$hash" "$metadata" "user=$(whoami)"
+        fi
+    fi
+
+    # Check web server directories for potential webshells
+    local web_dirs=(
+        "/var/www"
+        "/usr/share/nginx"
+        "/etc/nginx"
+        "/etc/apache2"
+        "/etc/httpd"
+    )
+
+    for web_dir in "${web_dirs[@]}"; do
+        if [[ -d "$web_dir" ]]; then
+            # Look for recently modified PHP/ASP files (last 30 days)
+            while IFS= read -r -d '' web_file; do
+                local hash=$(get_file_hash "$web_file")
+                local metadata=$(get_file_metadata "$web_file")
+
+                # Check modification time
+                local mod_time=$(stat -c %Y "$web_file" 2>/dev/null || stat -f %m "$web_file" 2>/dev/null || echo "0")
+                local current_time=$(date +%s)
+                local days_old=$(( (current_time - mod_time) / 86400 ))
+
+                local confidence="LOW"
+                if [[ $days_old -lt 30 ]]; then
+                    confidence="MEDIUM"
+
+                    # Check for webshell patterns
+                    local content=$(head -100 "$web_file" 2>/dev/null || echo "")
+                    if echo "$content" | grep -qiE "(eval|base64_decode|system\(|exec\(|shell_exec|passthru|proc_open|popen)"; then
+                        confidence="HIGH"
+                        log_finding "Potential webshell detected: $web_file (modified ${days_old} days ago)"
+                    fi
+                fi
+
+                if [[ $confidence != "LOW" ]]; then
+                    add_finding "WebShell" "Suspicious" "web_file" "$web_file" "Recently modified web file in $web_dir (${days_old} days old)" "$confidence" "$hash" "$metadata" "days_old=$days_old"
+                fi
+            done < <(find "$web_dir" -type f \( -name "*.php" -o -name "*.asp" -o -name "*.aspx" -o -name "*.jsp" \) -print0 2>/dev/null | head -100)
+        fi
+    done
+}
+
 ################################################################################
 # Main Execution
 ################################################################################
@@ -734,6 +992,9 @@ main() {
     echo
 
     check_additional_persistence
+    echo
+
+    check_common_backdoors
     echo
 
     # Summary
