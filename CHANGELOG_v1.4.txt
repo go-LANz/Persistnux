@@ -1,0 +1,23 @@
+## [1.4.0] - 2026-01-23
+
+### Changed
+- **NEW CSV/JSONL FORMAT**: Completely restructured output for better analysis
+  - **Old columns** (cramped): timestamp,category,subcategory,persistence_type,location,description,confidence,sha256,metadata,additional_info
+  - **New columns** (clean): timestamp,hostname,category,confidence,file_path,file_hash,file_owner,file_permissions,file_age_days,package_status,command,enabled_status,description
+
+### Added
+- **Dedicated command column**: ExecStart, cron commands, scripts directly visible
+- **Dedicated file_owner column**: Owner:Group format
+- **Dedicated file_permissions column**: Octal permissions
+- **Dedicated file_age_days column**: Days since modification
+- **Dedicated enabled_status column**: For systemd services
+- **Hostname in every row**: Multi-system scan support
+- JSON escaping function escape_json()
+- Wrapper function for backward compatibility
+
+### Improved
+- Excel/LibreOffice friendly: Each field is a separate column
+- No parsing required: Values directly accessible
+- Command visibility: Malicious commands immediately visible
+- Better SIEM integration: Structured format
+
