@@ -14,6 +14,9 @@ Persistnux is a bash-based tool designed to identify known Linux persistence mec
 - **Root and Non-Root**: Works with or without root privileges (with limited scope for non-root)
 - **DFIR-Ready**: Output formats compatible with common DFIR tools and workflows
 - **Suspicion Scoring**: Automatic confidence scoring (LOW, MEDIUM, HIGH, CRITICAL) based on indicators
+- **False Positive Reduction**: Package manager integration and known-good service whitelisting
+- **Time-Based Analysis**: Recently modified files receive higher confidence scores
+- **Pattern Matching**: Detects reverse shells, download-execute patterns, obfuscation techniques
 
 ## Persistence Mechanisms Detected
 
@@ -79,18 +82,44 @@ chmod +x persistnux.sh
 ### Basic Usage (Live Analysis)
 
 ```bash
-# Run with root privileges (recommended for complete analysis)
+# Run with default settings (shows only suspicious findings)
 sudo ./persistnux.sh
+
+# Show help and all options
+./persistnux.sh --help
 
 # Run as regular user (limited scope)
 ./persistnux.sh
+```
+
+### Filtering Options (v1.2+)
+
+By default, Persistnux shows only **suspicious findings** (MEDIUM, HIGH, CRITICAL confidence) to reduce noise and focus on actionable threats.
+
+```bash
+# Default: Show only suspicious findings
+sudo ./persistnux.sh
+
+# Show all findings including baseline (LOW confidence)
+sudo ./persistnux.sh --all
+# OR
+sudo FILTER_MODE=all ./persistnux.sh
+
+# Show only HIGH and CRITICAL confidence findings
+sudo MIN_CONFIDENCE=HIGH ./persistnux.sh
+
+# Combine filters: HIGH confidence only
+sudo ./persistnux.sh --min-confidence HIGH
 ```
 
 ### Custom Output Directory
 
 ```bash
 # Specify custom output directory
-OUTPUT_DIR=/path/to/output sudo ./persistnux.sh
+sudo OUTPUT_DIR=/tmp/evidence ./persistnux.sh
+
+# Combine with filtering
+sudo OUTPUT_DIR=/tmp/evidence MIN_CONFIDENCE=HIGH ./persistnux.sh
 ```
 
 ### Output Files
@@ -117,21 +146,46 @@ timestamp,category,subcategory,persistence_type,location,description,confidence,
 
 ## Confidence Scoring
 
-- **LOW**: Standard system configuration, low suspicion
+Persistnux uses intelligent confidence scoring to reduce false positives:
+
+- **LOW**: Standard system configuration, low suspicion (often package-managed files)
 - **MEDIUM**: Potentially suspicious but could be legitimate
-- **HIGH**: Suspicious patterns detected (e.g., curl/wget in cron, /tmp execution)
+- **HIGH**: Suspicious patterns detected (e.g., curl/wget in cron, /tmp execution, reverse shells)
 - **CRITICAL**: Highly suspicious, likely malicious (reserved for future advanced detection)
+
+### False Positive Reduction (v1.2+)
+
+Persistnux now includes several features to reduce false positives:
+
+1. **Package Manager Integration**: Files managed by `dpkg` (Debian/Ubuntu) or `rpm` (RedHat/CentOS) receive lower confidence scores
+2. **Known-Good Service Whitelist**: Common vendor services (systemd-*, dbus-*, snap.*, etc.) are automatically skipped
+3. **Time-Based Scoring**: Recently modified files (<7 days) receive higher confidence scores
+4. **Context-Aware Analysis**: Combines multiple indicators for more accurate detection
 
 ## Suspicious Indicators
 
 Persistnux automatically flags items with higher confidence when it detects:
 
-- Download tools: `curl`, `wget`
-- Network tools: `nc`, `netcat`
-- Execution from temporary directories: `/tmp`, `/dev/shm`
-- Encoding/obfuscation: `base64`, `eval`
-- Permission modifications: `chmod +x`
-- Suspicious shell invocations: `bash -c`, `sh -c`
+### Network-Based Patterns
+- Reverse shells: `bash -i >& /dev/tcp/`, `sh -i >& /dev/udp/`
+- Network tools: `nc`, `netcat`, `socat`, `telnet`
+- Socket operations in scripting languages: `python -c 'import socket'`
+
+### Download and Execute Patterns
+- Download tools: `curl | bash`, `wget | sh`
+- Download with execution: `curl URL -o /tmp/file && chmod +x`
+
+### Obfuscation Techniques
+- Encoding: `base64 -d | bash`, `eval $(echo BASE64)`
+- Dynamic execution: `eval`, `exec`
+
+### Suspicious Locations
+- Temporary directories: `/tmp`, `/dev/shm`, `/var/tmp`
+- Hidden directories and files
+
+### Permission Manipulation
+- Making files executable: `chmod +x`, `chmod 777`
+- SUID bit manipulation: `chmod u+s`
 
 ## Requirements
 

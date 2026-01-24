@@ -4,7 +4,7 @@
 # A comprehensive DFIR tool to detect known Linux persistence mechanisms
 # Author: DFIR Community Project
 # License: MIT
-# Version: 1.0.0
+# Version: 1.2.0
 ################################################################################
 
 set -euo pipefail
@@ -25,6 +25,10 @@ CSV_FILE="${OUTPUT_DIR}/persistnux_${HOSTNAME}_${TIMESTAMP}.csv"
 JSONL_FILE="${OUTPUT_DIR}/persistnux_${HOSTNAME}_${TIMESTAMP}.jsonl"
 TEMP_DATA="/tmp/persistnux_${TIMESTAMP}"
 FINDINGS_COUNT=0
+
+# Filter mode: "suspicious_only" (default) or "all"
+FILTER_MODE="${FILTER_MODE:-suspicious_only}"
+MIN_CONFIDENCE="${MIN_CONFIDENCE:-}"
 
 # Check if running as root
 EUID_CHECK=$(id -u)
@@ -86,6 +90,62 @@ declare -a SUSPICIOUS_FILES=(
     "authorized_keys"
 )
 
+################################################################################
+# False Positive Reduction - Known-Good Patterns
+################################################################################
+
+# Known legitimate systemd services (vendor/distribution managed)
+declare -a KNOWN_GOOD_SERVICES=(
+    "^systemd-"
+    "^dbus-"
+    "^snap\."
+    "^snapd\."
+    "^accounts-daemon"
+    "^anacron"
+    "^apparmor"
+    "^apport"
+    "^apt-"
+    "^atd"
+    "^avahi-"
+    "^bluetooth"
+    "^colord"
+    "^console-setup"
+    "^cron"
+    "^cups"
+    "^gdm"
+    "^getty@"
+    "^irqbalance"
+    "^keyboard-setup"
+    "^lightdm"
+    "^ModemManager"
+    "^networkd-"
+    "^NetworkManager"
+    "^packagekit"
+    "^polkit"
+    "^rsyslog"
+    "^rtkit-daemon"
+    "^serial-getty@"
+    "^ssh"
+    "^switcheroo-control"
+    "^udisks2"
+    "^ufw"
+    "^unattended-upgrades"
+    "^upower"
+    "^user@"
+    "^wpa_supplicant"
+    "^whoopsie"
+)
+
+# Known legitimate cron patterns
+declare -a KNOWN_GOOD_CRON_PATTERNS=(
+    "^#"  # Comments
+    "^[[:space:]]*$"  # Empty lines
+    "^SHELL="
+    "^PATH="
+    "^MAILTO="
+    "^HOME="
+)
+
 # Check if content matches suspicious patterns
 check_suspicious_patterns() {
     local content="$1"
@@ -134,6 +194,57 @@ check_suspicious_patterns() {
 # Utility Functions
 ################################################################################
 
+show_usage() {
+    cat << EOF
+Usage: sudo ./persistnux.sh [OPTIONS]
+
+Persistnux - Linux Persistence Detection Tool v1.2.0
+Comprehensive DFIR tool to detect Linux persistence mechanisms
+
+OPTIONS:
+  -h, --help              Show this help message
+  -a, --all               Show all findings (default: suspicious only)
+  -m, --min-confidence    Minimum confidence level (LOW|MEDIUM|HIGH)
+
+ENVIRONMENT VARIABLES:
+  OUTPUT_DIR              Custom output directory (default: ./persistnux_output)
+  FILTER_MODE             Filter mode: "suspicious_only" or "all" (default: suspicious_only)
+  MIN_CONFIDENCE          Minimum confidence filter (LOW|MEDIUM|HIGH)
+
+EXAMPLES:
+  # Show only suspicious findings (MEDIUM, HIGH, CRITICAL)
+  sudo ./persistnux.sh
+
+  # Show all findings including baseline (LOW confidence)
+  sudo ./persistnux.sh --all
+  # OR
+  sudo FILTER_MODE=all ./persistnux.sh
+
+  # Show only HIGH and CRITICAL confidence findings
+  sudo MIN_CONFIDENCE=HIGH ./persistnux.sh
+
+  # Custom output directory
+  sudo OUTPUT_DIR=/tmp/evidence ./persistnux.sh
+
+CONFIDENCE LEVELS:
+  LOW       - Baseline system configuration, package-managed files
+  MEDIUM    - Potentially suspicious, requires review
+  HIGH      - Suspicious patterns detected (reverse shells, download/execute)
+  CRITICAL  - Highly suspicious, likely malicious
+
+FALSE POSITIVE REDUCTION:
+  - Package-managed files (dpkg/rpm) receive lower confidence scores
+  - Known-good vendor services (systemd-*, dbus-*, snap.*) are skipped
+  - Time-based analysis: recent modifications (<7 days) increase confidence
+
+OUTPUT:
+  - CSV format: persistnux_<hostname>_<timestamp>.csv
+  - JSONL format: persistnux_<hostname>_<timestamp>.jsonl
+
+For more information, see README.md and DFIR_GUIDE.md
+EOF
+}
+
 print_banner() {
     echo -e "${BLUE}"
     cat << "EOF"
@@ -143,7 +254,7 @@ print_banner() {
  / ____/  __/ /  (__  ) (__  ) /_/ /_/ />  <_>  <
 /_/    \___/_/  /____/_/____/\__/\__,_/_/|_/_/|_|
 
-    Linux Persistence Detection Tool v1.0.0
+    Linux Persistence Detection Tool v1.2.0
     For DFIR Investigations
 EOF
     echo -e "${NC}"
@@ -186,6 +297,103 @@ get_file_metadata() {
     fi
 }
 
+# Check if file is managed by package manager (reduces false positives)
+is_package_managed() {
+    local file="$1"
+
+    # Check dpkg (Debian/Ubuntu)
+    if command -v dpkg &> /dev/null; then
+        if dpkg -S "$file" &>/dev/null; then
+            local package=$(dpkg -S "$file" 2>/dev/null | cut -d':' -f1 | head -n1)
+            echo "dpkg:$package"
+            return 0
+        fi
+    fi
+
+    # Check rpm (RedHat/CentOS/Fedora)
+    if command -v rpm &> /dev/null; then
+        if rpm -qf "$file" &>/dev/null; then
+            local package=$(rpm -qf "$file" 2>/dev/null | head -n1)
+            echo "rpm:$package"
+            return 0
+        fi
+    fi
+
+    # Not managed by package manager
+    echo "unmanaged"
+    return 1
+}
+
+# Check if service name matches known-good patterns
+is_known_good_service() {
+    local service_name="$1"
+
+    for pattern in "${KNOWN_GOOD_SERVICES[@]}"; do
+        if echo "$service_name" | grep -qE "$pattern"; then
+            return 0  # Known good
+        fi
+    done
+
+    return 1  # Unknown service
+}
+
+# Adjust confidence based on package management status
+adjust_confidence_for_package() {
+    local current_confidence="$1"
+    local package_status="$2"
+
+    # If file is package-managed and current confidence is HIGH, downgrade to MEDIUM
+    if [[ "$package_status" != "unmanaged" ]] && [[ "$current_confidence" == "HIGH" ]]; then
+        echo "MEDIUM"
+        return
+    fi
+
+    # If file is package-managed and current confidence is MEDIUM, downgrade to LOW
+    if [[ "$package_status" != "unmanaged" ]] && [[ "$current_confidence" == "MEDIUM" ]]; then
+        echo "LOW"
+        return
+    fi
+
+    # Otherwise keep original confidence
+    echo "$current_confidence"
+}
+
+# Check if finding should be included based on filter settings
+should_include_finding() {
+    local confidence="$1"
+    local has_suspicious_pattern="$2"  # "true" or "false"
+
+    # If MIN_CONFIDENCE is set, filter by confidence level
+    if [[ -n "$MIN_CONFIDENCE" ]]; then
+        case "$MIN_CONFIDENCE" in
+            "HIGH")
+                if [[ "$confidence" != "HIGH" ]] && [[ "$confidence" != "CRITICAL" ]]; then
+                    return 1  # Exclude
+                fi
+                ;;
+            "MEDIUM")
+                if [[ "$confidence" == "LOW" ]]; then
+                    return 1  # Exclude
+                fi
+                ;;
+            "LOW")
+                # Include all
+                ;;
+        esac
+    fi
+
+    # Apply suspicious_only filter
+    if [[ "$FILTER_MODE" == "suspicious_only" ]]; then
+        # Only include MEDIUM, HIGH, or CRITICAL confidence
+        # LOW confidence is considered baseline/non-suspicious
+        if [[ "$confidence" == "LOW" ]]; then
+            return 1  # Exclude
+        fi
+    fi
+
+    return 0  # Include
+}
+
 # Escape CSV fields
 escape_csv() {
     local field="$1"
@@ -208,6 +416,16 @@ add_finding() {
     local hash="$7"
     local metadata="$8"
     local additional_info="${9:-}"
+
+    # Check if this finding should be included based on filter settings
+    local has_suspicious="false"
+    if [[ "$confidence" == "HIGH" ]] || [[ "$confidence" == "CRITICAL" ]]; then
+        has_suspicious="true"
+    fi
+
+    if ! should_include_finding "$confidence" "$has_suspicious"; then
+        return 0  # Skip this finding
+    fi
 
     local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
@@ -266,6 +484,11 @@ check_systemd() {
                 local metadata=$(get_file_metadata "$service_file")
                 local service_name=$(basename "$service_file")
 
+                # Skip known-good vendor services
+                if is_known_good_service "$service_name"; then
+                    continue
+                fi
+
                 # Extract ExecStart from service file
                 local exec_start=""
                 if [[ -f "$service_file" ]]; then
@@ -297,7 +520,11 @@ check_systemd() {
                     log_finding "Recently created enabled systemd service: $service_file (${days_old} days old)"
                 fi
 
-                add_finding "Systemd" "Service" "systemd_service" "$service_file" "Service: $service_name | Status: $enabled_status | ExecStart: $exec_start" "$confidence" "$hash" "$metadata" "enabled=$enabled_status|days_old=$days_old"
+                # Check if file is package-managed and adjust confidence
+                local package_status=$(is_package_managed "$service_file")
+                confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+
+                add_finding "Systemd" "Service" "systemd_service" "$service_file" "Service: $service_name | Status: $enabled_status | ExecStart: $exec_start" "$confidence" "$hash" "$metadata" "enabled=$enabled_status|days_old=$days_old|package=$package_status"
 
             done < <(find "$path" -maxdepth 1 -type f \( -name "*.service" -o -name "*.timer" -o -name "*.socket" \) -print0 2>/dev/null)
         fi
@@ -364,7 +591,11 @@ check_cron() {
                         log_finding "Recently created cron job: $cron_file (${days_old} days old)"
                     fi
 
-                    add_finding "Cron" "System" "cron_script" "$cron_file" "Scheduled script: $(basename "$cron_file")" "$confidence" "$hash" "$metadata" "content_preview=${content:0:100}|days_old=$days_old"
+                    # Check if file is package-managed and adjust confidence
+                    local package_status=$(is_package_managed "$cron_file")
+                    confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+
+                    add_finding "Cron" "System" "cron_script" "$cron_file" "Scheduled script: $(basename "$cron_file")" "$confidence" "$hash" "$metadata" "content_preview=${content:0:100}|days_old=$days_old|package=$package_status"
 
                 done < <(find "$cron_path" -type f -print0 2>/dev/null)
             fi
@@ -444,7 +675,11 @@ check_shell_profiles() {
                     log_finding "Suspicious content in profile: $profile"
                 fi
 
-                add_finding "ShellProfile" "System" "profile_file" "$profile" "System shell profile" "$confidence" "$hash" "$metadata" "suspicious_lines=$(echo "$suspicious_content" | wc -l)"
+                # Check if file is package-managed and adjust confidence
+                local package_status=$(is_package_managed "$profile")
+                confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+
+                add_finding "ShellProfile" "System" "profile_file" "$profile" "System shell profile" "$confidence" "$hash" "$metadata" "suspicious_lines=$(echo "$suspicious_content" | wc -l)|package=$package_status"
 
             elif [[ -d "$profile" ]]; then
                 while IFS= read -r -d '' profile_file; do
@@ -458,7 +693,11 @@ check_shell_profiles() {
                         log_finding "Suspicious profile script: $profile_file"
                     fi
 
-                    add_finding "ShellProfile" "System" "profile_script" "$profile_file" "Profile.d script: $(basename "$profile_file")" "$confidence" "$hash" "$metadata" ""
+                    # Check if file is package-managed and adjust confidence
+                    local package_status=$(is_package_managed "$profile_file")
+                    confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+
+                    add_finding "ShellProfile" "System" "profile_script" "$profile_file" "Profile.d script: $(basename "$profile_file")" "$confidence" "$hash" "$metadata" "package=$package_status"
 
                 done < <(find "$profile" -type f -print0 2>/dev/null)
             fi
@@ -973,7 +1212,46 @@ check_common_backdoors() {
 ################################################################################
 
 main() {
+    # Parse command line arguments
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)
+                show_usage
+                exit 0
+                ;;
+            -a|--all)
+                FILTER_MODE="all"
+                shift
+                ;;
+            -m|--min-confidence)
+                if [[ -n "${2:-}" ]]; then
+                    MIN_CONFIDENCE="$2"
+                    shift 2
+                else
+                    echo "Error: --min-confidence requires a value (LOW|MEDIUM|HIGH)"
+                    exit 1
+                fi
+                ;;
+            *)
+                echo "Error: Unknown option: $1"
+                echo "Use --help for usage information"
+                exit 1
+                ;;
+        esac
+    done
+
     print_banner
+
+    # Show filter mode
+    if [[ "$FILTER_MODE" == "suspicious_only" ]]; then
+        log_info "Filter Mode: Suspicious only (MEDIUM/HIGH/CRITICAL)"
+    else
+        log_info "Filter Mode: All findings"
+    fi
+    if [[ -n "$MIN_CONFIDENCE" ]]; then
+        log_info "Minimum Confidence: $MIN_CONFIDENCE"
+    fi
+    echo
 
     # Check permissions
     if [[ $EUID_CHECK -ne 0 ]]; then
