@@ -4,7 +4,7 @@
 # A comprehensive DFIR tool to detect known Linux persistence mechanisms
 # Author: DFIR Community Project
 # License: MIT
-# Version: 1.3.0
+# Version: 1.4.0
 ################################################################################
 
 set -euo pipefail
@@ -195,7 +195,7 @@ show_usage() {
     cat << EOF
 Usage: sudo ./persistnux.sh [OPTIONS]
 
-Persistnux - Linux Persistence Detection Tool v1.3.0
+Persistnux - Linux Persistence Detection Tool v1.4.0
 Comprehensive DFIR tool to detect Linux persistence mechanisms
 
 OPTIONS:
@@ -251,7 +251,7 @@ print_banner() {
  / ____/  __/ /  (__  ) (__  ) /_/ /_/ />  <_>  <
 /_/    \___/_/  /____/_/____/\__/\__,_/_/|_/_/|_|
 
-    Linux Persistence Detection Tool v1.3.0
+    Linux Persistence Detection Tool v1.4.0
     For DFIR Investigations
 EOF
     echo -e "${NC}"
@@ -417,17 +417,43 @@ escape_csv() {
     fi
 }
 
-# Add finding to output
-add_finding() {
+# Escape JSON strings
+escape_json() {
+    local str="$1"
+    # Escape backslashes, quotes, newlines, tabs, carriage returns
+    str="${str//\\/\\\\}"      # \ -> \\
+    str="${str//\"/\\\"}"      # " -> \"
+    str="${str//$'\n'/\\n}"    # newline -> \n
+    str="${str//$'\t'/\\t}"    # tab -> \t
+    str="${str//$'\r'/\\r}"    # carriage return -> \r
+    echo "$str"
+}
+
+# Extract owner from metadata string
+get_owner_from_metadata() {
+    local metadata="$1"
+    echo "$metadata" | grep -oP 'owner:\K[^|]+' || echo "N/A"
+}
+
+# Extract permissions from metadata string
+get_permissions_from_metadata() {
+    local metadata="$1"
+    echo "$metadata" | grep -oP 'mode:\K[^|]+' || echo "N/A"
+}
+
+# Add finding to output (new structured format)
+add_finding_new() {
     local category="$1"
-    local subcategory="$2"
-    local persistence_type="$3"
-    local location="$4"
-    local description="$5"
-    local confidence="$6"  # LOW, MEDIUM, HIGH, CRITICAL
-    local hash="$7"
-    local metadata="$8"
-    local additional_info="${9:-}"
+    local confidence="$2"
+    local file_path="$3"
+    local file_hash="$4"
+    local file_owner="$5"
+    local file_permissions="$6"
+    local file_age_days="$7"
+    local package_status="$8"
+    local command="${9:-}"
+    local enabled_status="${10:-}"
+    local description="${11:-}"
 
     # Check if this finding should be included based on filter settings
     local has_suspicious="false"
@@ -441,13 +467,49 @@ add_finding() {
 
     local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    # CSV output
-    echo "$(escape_csv "$timestamp"),$(escape_csv "$category"),$(escape_csv "$subcategory"),$(escape_csv "$persistence_type"),$(escape_csv "$location"),$(escape_csv "$description"),$(escape_csv "$confidence"),$(escape_csv "$hash"),$(escape_csv "$metadata"),$(escape_csv "$additional_info")" >> "$CSV_FILE"
+    # CSV output (new structure)
+    echo "$(escape_csv "$timestamp"),$(escape_csv "$HOSTNAME"),$(escape_csv "$category"),$(escape_csv "$confidence"),$(escape_csv "$file_path"),$(escape_csv "$file_hash"),$(escape_csv "$file_owner"),$(escape_csv "$file_permissions"),$(escape_csv "$file_age_days"),$(escape_csv "$package_status"),$(escape_csv "$command"),$(escape_csv "$enabled_status"),$(escape_csv "$description")" >> "$CSV_FILE"
 
-    # JSONL output
+    # JSONL output (new structure with proper escaping)
     cat >> "$JSONL_FILE" << EOF
-{"timestamp":"$timestamp","hostname":"$HOSTNAME","category":"$category","subcategory":"$subcategory","persistence_type":"$persistence_type","location":"$location","description":"$description","confidence":"$confidence","sha256":"$hash","metadata":"$metadata","additional_info":"$additional_info"}
+{"timestamp":"$timestamp","hostname":"$HOSTNAME","category":"$(escape_json "$category")","confidence":"$confidence","file_path":"$(escape_json "$file_path")","file_hash":"$file_hash","file_owner":"$(escape_json "$file_owner")","file_permissions":"$file_permissions","file_age_days":"$file_age_days","package_status":"$(escape_json "$package_status")","command":"$(escape_json "$command")","enabled_status":"$(escape_json "$enabled_status")","description":"$(escape_json "$description")"}
 EOF
+}
+
+# Wrapper function for backward compatibility (converts old format to new)
+add_finding() {
+    local category="$1"
+    local subcategory="$2"
+    local persistence_type="$3"
+    local location="$4"
+    local description="$5"
+    local confidence="$6"
+    local hash="$7"
+    local metadata="$8"
+    local additional_info="${9:-}"
+
+    # Extract structured fields from metadata and additional_info
+    local owner=$(echo "$metadata" | grep -oP 'owner:\K[^|]+' | head -1 || echo "N/A")
+    local permissions=$(echo "$metadata" | grep -oP 'mode:\K[^|]+' | head -1 || echo "N/A")
+    local days_old=$(echo "$additional_info" | grep -oP 'days_old=\K[0-9]+' | head -1 || echo "N/A")
+    local package_status=$(echo "$additional_info" | grep -oP 'package=\K[^|]+' | head -1 || echo "unmanaged")
+    local enabled=$(echo "$additional_info" | grep -oP 'enabled=\K[^|]+' | head -1 || echo "")
+
+    # Try to extract command from description (ExecStart: or preview= patterns)
+    local command=""
+    if [[ "$description" =~ ExecStart:\ (.+)$ ]]; then
+        command="${BASH_REMATCH[1]}"
+    elif [[ "$additional_info" =~ preview=([^|]+) ]]; then
+        command="${BASH_REMATCH[1]}"
+    elif [[ "$additional_info" =~ content_preview=([^|]+) ]]; then
+        command="${BASH_REMATCH[1]}"
+    fi
+
+    # Build clean category name
+    local clean_category="$category $subcategory"
+
+    # Call new structured function
+    add_finding_new "$clean_category" "$confidence" "$location" "$hash" "$owner" "$permissions" "$days_old" "$package_status" "$command" "$enabled" "$persistence_type"
 }
 
 # Initialize output files
@@ -455,8 +517,8 @@ init_output() {
     mkdir -p "$OUTPUT_DIR"
     mkdir -p "$TEMP_DATA"
 
-    # CSV header
-    echo "timestamp,category,subcategory,persistence_type,location,description,confidence,sha256,metadata,additional_info" > "$CSV_FILE"
+    # CSV header (new structured format)
+    echo "timestamp,hostname,category,confidence,file_path,file_hash,file_owner,file_permissions,file_age_days,package_status,command,enabled_status,description" > "$CSV_FILE"
 
     # Clear JSONL file
     > "$JSONL_FILE"
@@ -545,7 +607,12 @@ check_systemd() {
                 local package_status=$(is_package_managed "$service_file")
                 confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
-                add_finding "Systemd" "Service" "systemd_service" "$service_file" "Service: $service_name | Status: $enabled_status | ExecStart: $exec_start" "$confidence" "$hash" "$metadata" "enabled=$enabled_status|days_old=$days_old|package=$package_status"
+                # Extract owner and permissions from metadata
+                local owner=$(get_owner_from_metadata "$metadata")
+                local permissions=$(get_permissions_from_metadata "$metadata")
+
+                # Use new structured format directly
+                add_finding_new "Systemd Service" "$confidence" "$service_file" "$hash" "$owner" "$permissions" "$days_old" "$package_status" "$exec_start" "$enabled_status" "$service_name"
 
             done < <(find "$path" -maxdepth 1 -type f \( -name "*.service" -o -name "*.timer" -o -name "*.socket" \) -print0 2>/dev/null)
         fi
