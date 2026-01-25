@@ -4,7 +4,7 @@
 # A comprehensive DFIR tool to detect known Linux persistence mechanisms
 # Author: DFIR Community Project
 # License: MIT
-# Version: 1.4.0
+# Version: 1.5.0
 ################################################################################
 
 set -euo pipefail
@@ -321,6 +321,96 @@ is_package_managed() {
     return 1
 }
 
+# Extract the first executable path from a command
+get_executable_from_command() {
+    local command="$1"
+
+    # Remove systemd prefixes (@, -, :, +, !)
+    command="${command#[@\-:+!]}"
+
+    # Extract first word (the executable)
+    local executable=$(echo "$command" | awk '{print $1}')
+
+    # Remove quotes if present
+    executable="${executable//\"/}"
+    executable="${executable//\'/}"
+
+    echo "$executable"
+}
+
+# Check if a file is a script (not binary/ELF)
+is_script() {
+    local file="$1"
+
+    # Check if file exists and is readable
+    if [[ ! -f "$file" ]] || [[ ! -r "$file" ]]; then
+        return 1  # Not a script
+    fi
+
+    # Use file command to check if it's a text/script file
+    local file_type=$(file -b "$file" 2>/dev/null)
+    if echo "$file_type" | grep -qiE "(shell script|python script|perl script|ruby script|text executable)"; then
+        return 0  # It's a script
+    fi
+
+    # Check for shebang as fallback
+    local first_line=$(head -n 1 "$file" 2>/dev/null)
+    if [[ "$first_line" =~ ^#! ]]; then
+        return 0  # Has shebang, it's a script
+    fi
+
+    return 1  # Not a script
+}
+
+# Analyze script content for suspicious patterns
+# Returns 0 if suspicious content found, 1 if clean
+analyze_script_content() {
+    local script_file="$1"
+
+    # Check if file exists and is readable
+    if [[ ! -f "$script_file" ]] || [[ ! -r "$script_file" ]]; then
+        return 1  # Cannot analyze, treat as clean
+    fi
+
+    # Read first 1000 lines of script (to avoid huge files)
+    local script_content=$(head -n 1000 "$script_file" 2>/dev/null)
+
+    # Check for dangerous patterns in NEVER_WHITELIST_PATTERNS
+    for pattern in "${NEVER_WHITELIST_PATTERNS[@]}"; do
+        if echo "$script_content" | grep -qiE "$pattern"; then
+            return 0  # SUSPICIOUS - found dangerous pattern
+        fi
+    done
+
+    # Check for additional script-specific suspicious patterns
+    local suspicious_script_patterns=(
+        "eval.*\$"                    # eval with variables
+        "exec.*\$"                    # exec with variables
+        "\$\(curl"                    # Command substitution with curl
+        "\$\(wget"                    # Command substitution with wget
+        "base64.*-d"                  # Base64 decode (potential obfuscation)
+        "openssl.*enc.*-d"            # Encrypted payload decryption
+        "mkfifo"                      # Named pipes (common in reverse shells)
+        "nc.*-l.*-p"                  # Netcat listener
+        "socat.*TCP"                  # Socat TCP connections
+        "python.*-c"                  # Python one-liners
+        "perl.*-e"                    # Perl one-liners
+        "ruby.*-e"                    # Ruby one-liners
+        "awk.*system"                 # AWK system calls
+        "/proc/self/exe"              # Self-execution tricks
+        "chmod.*\+x.*tmp"             # Making temp files executable
+        "chmod.*777"                  # Overly permissive permissions
+    )
+
+    for pattern in "${suspicious_script_patterns[@]}"; do
+        if echo "$script_content" | grep -qiE "$pattern"; then
+            return 0  # SUSPICIOUS - found dangerous script pattern
+        fi
+    done
+
+    return 1  # Clean - no suspicious patterns found
+}
+
 # Check if command is executing a known-safe system binary
 is_command_safe() {
     local command="$1"
@@ -345,6 +435,14 @@ is_command_safe() {
             return 0  # Safe - benign command
         fi
     done
+
+    # Fourth check: Is the executable itself package-managed?
+    local executable=$(get_executable_from_command "$command")
+    if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
+        if is_package_managed "$executable" &>/dev/null; then
+            return 0  # Safe - package-managed binary
+        fi
+    fi
 
     return 1  # Unknown/suspicious command
 }
@@ -603,6 +701,18 @@ check_systemd() {
                     confidence="MEDIUM"
                 fi
 
+                # Fifth: Check if ExecStart points to a script and analyze its content
+                local executable=$(get_executable_from_command "$exec_start")
+                if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
+                    if is_script "$executable"; then
+                        if analyze_script_content "$executable"; then
+                            # Script contains suspicious content - upgrade to HIGH
+                            confidence="HIGH"
+                            log_finding "Systemd service executes script with suspicious content: $service_file -> $executable"
+                        fi
+                    fi
+                fi
+
                 # Check if file is package-managed and adjust confidence
                 local package_status=$(is_package_managed "$service_file")
                 confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
@@ -652,6 +762,14 @@ check_cron() {
                     log_finding "Suspicious cron job (advanced patterns): $cron_path"
                 fi
 
+                # Check if cron file is a script and analyze its content
+                if is_script "$cron_path"; then
+                    if analyze_script_content "$cron_path"; then
+                        confidence="HIGH"
+                        log_finding "Cron file contains suspicious script content: $cron_path"
+                    fi
+                fi
+
                 add_finding "Cron" "System" "cron_file" "$cron_path" "Cron configuration file" "$confidence" "$hash" "$metadata" "entries=$(echo "$content" | wc -l)"
 
             elif [[ -d "$cron_path" ]]; then
@@ -677,6 +795,14 @@ check_cron() {
                     elif [[ $days_old -lt 7 ]]; then
                         confidence="HIGH"
                         log_finding "Recently created cron job: $cron_file (${days_old} days old)"
+                    fi
+
+                    # Check if cron job is a script and analyze its content
+                    if is_script "$cron_file"; then
+                        if analyze_script_content "$cron_file"; then
+                            confidence="HIGH"
+                            log_finding "Cron job script contains suspicious content: $cron_file"
+                        fi
                     fi
 
                     # Check if file is package-managed and adjust confidence

