@@ -4,7 +4,7 @@
 # A comprehensive DFIR tool to detect known Linux persistence mechanisms
 # Author: DFIR Community Project
 # License: MIT
-# Version: 1.5.0
+# Version: 1.7.1
 ################################################################################
 
 set -euo pipefail
@@ -105,6 +105,35 @@ declare -a KNOWN_GOOD_EXECUTABLE_PATHS=(
     "^/lib/"
     "^/lib/systemd/"
     "^/usr/lib/systemd/"
+)
+
+# Known interpreters that execute scripts via arguments
+# CRITICAL: When these are the executable, we must analyze the script argument, not the interpreter
+declare -a KNOWN_INTERPRETERS=(
+    "python"
+    "python2"
+    "python3"
+    "python2.7"
+    "python3.6"
+    "python3.7"
+    "python3.8"
+    "python3.9"
+    "python3.10"
+    "python3.11"
+    "python3.12"
+    "perl"
+    "perl5"
+    "ruby"
+    "bash"
+    "sh"
+    "dash"
+    "zsh"
+    "ksh"
+    "php"
+    "node"
+    "nodejs"
+    "java"
+    "lua"
 )
 
 # Known legitimate command patterns (safe operations)
@@ -302,6 +331,18 @@ is_package_managed() {
     if command -v dpkg &> /dev/null; then
         if dpkg -S "$file" &>/dev/null; then
             local package=$(dpkg -S "$file" 2>/dev/null | cut -d':' -f1 | head -n1)
+
+            # Verify file hasn't been tampered with
+            # dpkg --verify returns errors if file modified/missing
+            if command -v dpkg &> /dev/null; then
+                local verify_output=$(dpkg --verify "$package" 2>/dev/null | grep -F "$file")
+                if [[ -n "$verify_output" ]]; then
+                    # File has been modified - flag as compromised
+                    echo "dpkg:$package:MODIFIED"
+                    return 2  # Special return code for modified package file
+                fi
+            fi
+
             echo "dpkg:$package"
             return 0
         fi
@@ -311,6 +352,15 @@ is_package_managed() {
     if command -v rpm &> /dev/null; then
         if rpm -qf "$file" &>/dev/null; then
             local package=$(rpm -qf "$file" 2>/dev/null | head -n1)
+
+            # Verify file integrity using rpm -V
+            local verify_output=$(rpm -V "$package" 2>/dev/null | grep -F "$file")
+            if [[ -n "$verify_output" ]]; then
+                # File has been modified
+                echo "rpm:$package:MODIFIED"
+                return 2  # Special return code for modified package file
+            fi
+
             echo "rpm:$package"
             return 0
         fi
@@ -338,6 +388,76 @@ get_executable_from_command() {
     echo "$executable"
 }
 
+# Check if executable is a known interpreter (python, perl, bash, etc.)
+is_interpreter() {
+    local executable="$1"
+    local basename=$(basename "$executable")
+
+    for interpreter in "${KNOWN_INTERPRETERS[@]}"; do
+        if [[ "$basename" == "$interpreter" ]]; then
+            return 0  # Is an interpreter
+        fi
+    done
+
+    return 1  # Not an interpreter
+}
+
+# Extract the script file path from an interpreter command
+# Example: "/usr/bin/python3 /opt/app/malware.py --daemon" -> "/opt/app/malware.py"
+get_script_from_interpreter_command() {
+    local command="$1"
+
+    # Remove systemd prefixes
+    command="${command#[@\-:+!]}"
+
+    # Parse command into array of arguments
+    local -a args
+    eval "args=($command)"
+
+    # First arg is the interpreter
+    local interpreter="${args[0]}"
+
+    # Look through remaining arguments for the script file
+    for ((i=1; i<${#args[@]}; i++)); do
+        local arg="${args[i]}"
+
+        # Skip interpreter flags (start with -)
+        if [[ "$arg" =~ ^- ]]; then
+            # Special case: -c flag means inline code, not a file
+            if [[ "$arg" == "-c" ]]; then
+                # Next arg is inline code, not a file path
+                echo ""
+                return 1
+            fi
+            continue
+        fi
+
+        # Skip common module flags for Python
+        if [[ "$arg" == "-m" ]]; then
+            # Next arg is a module name, not a file
+            i=$((i+1))
+            continue
+        fi
+
+        # This looks like a file path (not a flag)
+        # Check if it's an absolute path or relative path
+        if [[ "$arg" =~ ^/ ]] || [[ "$arg" =~ ^\./ ]] || [[ "$arg" =~ ^\.\. ]] || [[ -f "$arg" ]]; then
+            # Clean up quotes
+            arg="${arg#\"}"
+            arg="${arg#\'}"
+            arg="${arg%\"}"
+            arg="${arg%\'}"
+
+            echo "$arg"
+            return 0
+        fi
+    done
+
+    # No script file found
+    echo ""
+    return 1
+}
+
 # Check if a file is a script (not binary/ELF)
 is_script() {
     local file="$1"
@@ -360,6 +480,93 @@ is_script() {
     fi
 
     return 1  # Not a script
+}
+
+# Calculate entropy using hybrid approach (gzip for long strings, AWK for short)
+# High entropy (>4.5) indicates random/encrypted/obfuscated data
+# Returns entropy as float (0.0-8.0)
+calculate_entropy() {
+    local data="$1"
+    local length=${#data}
+
+    # Return 0 for empty or very short strings (not enough data)
+    if [[ $length -lt 30 ]]; then
+        echo "0"
+        return
+    fi
+
+    # For longer strings (100+), use gzip compression ratio (faster)
+    if [[ $length -ge 100 ]]; then
+        local compressed_size=$(echo -n "$data" | gzip -c 2>/dev/null | wc -c)
+
+        # Handle gzip failure
+        if [[ -z "$compressed_size" ]] || [[ "$compressed_size" -eq 0 ]]; then
+            echo "0"
+            return
+        fi
+
+        # Subtract gzip header overhead (~18 bytes)
+        local adjusted_compressed=$((compressed_size - 18))
+        [[ $adjusted_compressed -lt 0 ]] && adjusted_compressed=0
+
+        # Calculate compression ratio
+        local ratio=$(awk "BEGIN {printf \"%.2f\", $adjusted_compressed / $length}")
+
+        # Convert ratio to approximate entropy
+        # Ratio 0.0-0.4 (highly compressible) → Entropy ~2.0-3.5 (low)
+        # Ratio 0.4-0.7 (normal text)        → Entropy ~3.5-4.5 (medium)
+        # Ratio 0.7-0.9 (base64/encoded)     → Entropy ~4.5-6.0 (high)
+        # Ratio 0.9-1.0+ (random/encrypted)  → Entropy ~6.0-8.0 (very high)
+        local entropy=$(awk "BEGIN {
+            ratio = $ratio
+            if (ratio < 0.4) entropy = 2.0 + (ratio / 0.4) * 1.5
+            else if (ratio < 0.7) entropy = 3.5 + ((ratio - 0.4) / 0.3) * 1.0
+            else if (ratio < 0.9) entropy = 4.5 + ((ratio - 0.7) / 0.2) * 1.5
+            else entropy = 6.0 + ((ratio - 0.9) / 0.1) * 2.0
+            printf \"%.2f\", entropy
+        }")
+
+        echo "$entropy"
+    else
+        # For shorter strings (30-99), use AWK Shannon entropy (more accurate)
+        # Gzip header overhead is too significant for short strings
+        local entropy=$(echo -n "$data" | fold -w1 | sort | uniq -c | awk -v len="$length" '
+            BEGIN { entropy = 0 }
+            {
+                freq = $1 / len
+                if (freq > 0) {
+                    entropy -= freq * log(freq) / log(2)
+                }
+            }
+            END { printf "%.2f", entropy }
+        ')
+
+        echo "$entropy"
+    fi
+}
+
+# Check if a line/string has suspiciously high entropy
+# Returns 0 if high entropy detected, 1 if normal
+is_high_entropy() {
+    local string="$1"
+    local threshold="${2:-4.5}"  # Default threshold 4.5 (base64 is ~6.0, random is ~7.9)
+    local length=${#string}
+
+    # Skip very short strings (not enough data)
+    if [[ $length -lt 30 ]]; then
+        return 1
+    fi
+
+    local entropy=$(calculate_entropy "$string")
+
+    # Use awk for float comparison
+    local is_high=$(awk -v e="$entropy" -v t="$threshold" 'BEGIN { print (e > t) ? 1 : 0 }')
+
+    if [[ "$is_high" -eq 1 ]]; then
+        return 0  # High entropy - suspicious
+    else
+        return 1  # Normal entropy
+    fi
 }
 
 # Analyze script content for suspicious patterns
@@ -408,6 +615,32 @@ analyze_script_content() {
         fi
     done
 
+    # Check for high-entropy strings (obfuscation detection)
+    # Look for long strings/variables with suspiciously high entropy
+    # This catches: variable substitution, high-ascii characters, encrypted payloads
+    while IFS= read -r line; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "$line" ]] && continue
+
+        # Extract variable assignments with long values (potential obfuscation)
+        # Look for patterns: variable=LONGSTRING or variable="LONGSTRING"
+        if [[ "$line" =~ =([^[:space:]]{30,}) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            # Remove surrounding quotes if present
+            value="${value#\"}"
+            value="${value#\'}"
+            value="${value%\"}"
+            value="${value%\'}"
+
+            # Check entropy of this value
+            if is_high_entropy "$value" 4.5; then
+                return 0  # SUSPICIOUS - high entropy indicates obfuscation
+            fi
+        fi
+
+    done <<< "$script_content"
+
     return 1  # Clean - no suspicious patterns found
 }
 
@@ -416,31 +649,57 @@ is_command_safe() {
     local command="$1"
 
     # First check: Does it contain NEVER_WHITELIST patterns?
+    # This check ALWAYS takes precedence - even package-managed files with dangerous patterns are flagged
     for pattern in "${NEVER_WHITELIST_PATTERNS[@]}"; do
         if echo "$command" | grep -qiE "$pattern"; then
             return 1  # DANGEROUS - never whitelist
         fi
     done
 
-    # Second check: Does it start with a known-good executable path?
+    # Extract executable for subsequent checks
+    local executable=$(get_executable_from_command "$command")
+
+    # Second check: Path-based validation (CRITICAL FIX)
+    # A path is only safe if it's BOTH in a standard location AND package-managed
+    # This prevents /usr/bin/evil_miner from being marked safe just because it's in /usr/bin
     for path in "${KNOWN_GOOD_EXECUTABLE_PATHS[@]}"; do
         if echo "$command" | grep -qE "$path"; then
-            return 0  # Safe - system binary
+            # Path matches known-good location, but we MUST verify it's package-managed
+            if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
+                local pkg_status=$(is_package_managed "$executable")
+                local pkg_return=$?
+
+                # Only trust if package-managed AND not modified
+                if [[ $pkg_return -eq 0 ]]; then
+                    return 0  # Safe - standard path AND package-managed
+                elif [[ $pkg_return -eq 2 ]]; then
+                    # Package file was MODIFIED - treat as dangerous
+                    return 1  # DANGEROUS - modified package file
+                fi
+                # If pkg_return=1 (unmanaged), fall through to continue checking
+            fi
+            # Path matched but file not package-managed - NOT automatically safe
+            # Continue to other checks
         fi
     done
 
     # Third check: Does it match known-good command patterns?
     for pattern in "${KNOWN_GOOD_COMMAND_PATTERNS[@]}"; do
         if echo "$command" | grep -qE "$pattern"; then
-            return 0  # Safe - benign command
+            return 0  # Safe - benign command pattern
         fi
     done
 
-    # Fourth check: Is the executable itself package-managed?
-    local executable=$(get_executable_from_command "$command")
+    # Fourth check: Is the executable itself package-managed (even if not in standard path)?
+    # Example: /opt/vendor/bin/tool that IS package-managed
     if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
-        if is_package_managed "$executable" &>/dev/null; then
+        local pkg_status=$(is_package_managed "$executable")
+        local pkg_return=$?
+
+        if [[ $pkg_return -eq 0 ]]; then
             return 0  # Safe - package-managed binary
+        elif [[ $pkg_return -eq 2 ]]; then
+            return 1  # DANGEROUS - modified package file
         fi
     fi
 
@@ -451,6 +710,13 @@ is_command_safe() {
 adjust_confidence_for_package() {
     local current_confidence="$1"
     local package_status="$2"
+
+    # CRITICAL: If package file was MODIFIED, upgrade to CRITICAL confidence
+    # This indicates potential rootkit/compromise of system packages
+    if [[ "$package_status" == *":MODIFIED"* ]]; then
+        echo "CRITICAL"
+        return
+    fi
 
     # If file is package-managed and current confidence is HIGH, downgrade to MEDIUM
     if [[ "$package_status" != "unmanaged" ]] && [[ "$current_confidence" == "HIGH" ]]; then
@@ -701,14 +967,61 @@ check_systemd() {
                     confidence="MEDIUM"
                 fi
 
-                # Fifth: Check if ExecStart points to a script and analyze its content
+                # Fifth: Check if ExecStart uses an interpreter (python/perl/bash/etc.)
+                # CRITICAL: Analyze the script argument, not the interpreter binary
                 local executable=$(get_executable_from_command "$exec_start")
+                local script_to_analyze=""
+
                 if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
-                    if is_script "$executable"; then
-                        if analyze_script_content "$executable"; then
-                            # Script contains suspicious content - upgrade to HIGH
-                            confidence="HIGH"
-                            log_finding "Systemd service executes script with suspicious content: $service_file -> $executable"
+                    # Check if executable is an interpreter
+                    if is_interpreter "$executable"; then
+                        # Extract the script file from arguments
+                        script_to_analyze=$(get_script_from_interpreter_command "$exec_start")
+
+                        if [[ -n "$script_to_analyze" ]] && [[ -f "$script_to_analyze" ]]; then
+                            log_finding "Systemd service uses interpreter: $service_file -> $executable $script_to_analyze"
+
+                            # Analyze the script file, not the interpreter
+                            if is_script "$script_to_analyze"; then
+                                if analyze_script_content "$script_to_analyze"; then
+                                    confidence="HIGH"
+                                    log_finding "Interpreter script contains suspicious content: $script_to_analyze"
+                                fi
+                            fi
+
+                            # Also check if the script itself is package-managed
+                            local script_pkg_status=$(is_package_managed "$script_to_analyze")
+                            local script_pkg_return=$?
+
+                            if [[ $script_pkg_return -eq 2 ]]; then
+                                # Script file was MODIFIED
+                                confidence="CRITICAL"
+                                log_finding "Interpreter script is modified package file: $script_to_analyze"
+                            elif [[ $script_pkg_return -eq 1 ]]; then
+                                # Script is unmanaged - suspicious if in unusual location
+                                if [[ "$script_to_analyze" =~ ^/(tmp|dev|shm|var/tmp) ]]; then
+                                    confidence="HIGH"
+                                    log_finding "Interpreter executing script from suspicious location: $script_to_analyze"
+                                elif [[ "$script_to_analyze" =~ ^/(opt|usr/local|home) ]]; then
+                                    # Common but unmanaged locations - keep MEDIUM
+                                    [[ "$confidence" == "LOW" ]] && confidence="MEDIUM"
+                                fi
+                            fi
+                        else
+                            # Interpreter with no file argument (inline code via -c flag)
+                            # This is inherently suspicious
+                            if [[ "$exec_start" =~ \ -c\  ]]; then
+                                confidence="HIGH"
+                                log_finding "Systemd service uses interpreter with inline code (-c flag): $service_file"
+                            fi
+                        fi
+                    else
+                        # Not an interpreter - check if it's a script directly
+                        if is_script "$executable"; then
+                            if analyze_script_content "$executable"; then
+                                confidence="HIGH"
+                                log_finding "Systemd service executes script with suspicious content: $service_file -> $executable"
+                            fi
                         fi
                     fi
                 fi
