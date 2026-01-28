@@ -1110,9 +1110,17 @@ check_systemd() {
                     fi
                 fi
 
-                # Check if service file itself is package-managed and adjust confidence
-                local package_status=$(is_package_managed "$service_file")
-                confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+                # Check package status: prioritize executable over service file
+                # The executable's package status is more security-relevant than the .service file
+                local package_status="unmanaged"
+                if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
+                    package_status=$(is_package_managed "$executable")
+                    confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+                else
+                    # Fallback: check if service file itself is package-managed
+                    package_status=$(is_package_managed "$service_file")
+                    confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+                fi
 
                 # Extract owner and permissions from metadata
                 local owner=$(get_owner_from_metadata "$metadata")
