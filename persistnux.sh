@@ -4,7 +4,7 @@
 # A comprehensive DFIR tool to detect known Linux persistence mechanisms
 # Author: DFIR Community Project
 # License: MIT
-# Version: 1.7.1
+# Version: 1.7.2
 ################################################################################
 
 set -euo pipefail
@@ -107,33 +107,28 @@ declare -a KNOWN_GOOD_EXECUTABLE_PATHS=(
     "^/usr/lib/systemd/"
 )
 
-# Known interpreters that execute scripts via arguments
+# Known interpreter patterns (regex-based for version flexibility)
 # CRITICAL: When these are the executable, we must analyze the script argument, not the interpreter
-declare -a KNOWN_INTERPRETERS=(
-    "python"
-    "python2"
-    "python3"
-    "python2.7"
-    "python3.6"
-    "python3.7"
-    "python3.8"
-    "python3.9"
-    "python3.10"
-    "python3.11"
-    "python3.12"
-    "perl"
-    "perl5"
-    "ruby"
-    "bash"
-    "sh"
-    "dash"
-    "zsh"
-    "ksh"
-    "php"
-    "node"
-    "nodejs"
-    "java"
-    "lua"
+# Using regex patterns instead of hardcoded versions for forward compatibility
+declare -a KNOWN_INTERPRETER_PATTERNS=(
+    "^python[0-9.]*$"      # python, python2, python3, python3.11, python3.13, pypy, pypy3
+    "^pypy[0-9]*$"         # pypy, pypy3
+    "^perl[0-9.]*$"        # perl, perl5, perl5.32
+    "^ruby[0-9.]*$"        # ruby, ruby2.7, ruby3.0
+    "^bash$"
+    "^sh$"
+    "^dash$"
+    "^zsh$"
+    "^ksh$"
+    "^ksh[0-9]*$"          # ksh93, ksh88
+    "^php[0-9.]*$"         # php, php7, php8
+    "^node$"
+    "^nodejs$"
+    "^java$"
+    "^lua[0-9.]*$"         # lua, lua5.1, lua5.4
+    "^awk$"
+    "^gawk$"
+    "^mawk$"
 )
 
 # Known legitimate command patterns (safe operations)
@@ -224,7 +219,7 @@ show_usage() {
     cat << EOF
 Usage: sudo ./persistnux.sh [OPTIONS]
 
-Persistnux - Linux Persistence Detection Tool v1.4.0
+Persistnux - Linux Persistence Detection Tool v1.7.2
 Comprehensive DFIR tool to detect Linux persistence mechanisms
 
 OPTIONS:
@@ -280,7 +275,7 @@ print_banner() {
  / ____/  __/ /  (__  ) (__  ) /_/ /_/ />  <_>  <
 /_/    \___/_/  /____/_/____/\__/\__,_/_/|_/_/|_|
 
-    Linux Persistence Detection Tool v1.4.0
+    Linux Persistence Detection Tool v1.7.2
     For DFIR Investigations
 EOF
     echo -e "${NC}"
@@ -389,12 +384,13 @@ get_executable_from_command() {
 }
 
 # Check if executable is a known interpreter (python, perl, bash, etc.)
+# Uses regex patterns for version flexibility (e.g., python3.13, pypy3)
 is_interpreter() {
     local executable="$1"
     local basename=$(basename "$executable")
 
-    for interpreter in "${KNOWN_INTERPRETERS[@]}"; do
-        if [[ "$basename" == "$interpreter" ]]; then
+    for pattern in "${KNOWN_INTERPRETER_PATTERNS[@]}"; do
+        if [[ "$basename" =~ $pattern ]]; then
             return 0  # Is an interpreter
         fi
     done
@@ -421,21 +417,22 @@ get_script_from_interpreter_command() {
     for ((i=1; i<${#args[@]}; i++)); do
         local arg="${args[i]}"
 
-        # Skip interpreter flags (start with -)
-        if [[ "$arg" =~ ^- ]]; then
-            # Special case: -c flag means inline code, not a file
-            if [[ "$arg" == "-c" ]]; then
-                # Next arg is inline code, not a file path
-                echo ""
-                return 1
-            fi
-            continue
+        # Special case: -c flag means inline code, not a file
+        if [[ "$arg" == "-c" ]]; then
+            # Next arg is inline code, not a file path
+            echo ""
+            return 1
         fi
 
-        # Skip common module flags for Python
+        # Special case: -m flag for Python modules
         if [[ "$arg" == "-m" ]]; then
             # Next arg is a module name, not a file
             i=$((i+1))
+            continue
+        fi
+
+        # Skip other interpreter flags (start with -)
+        if [[ "$arg" =~ ^- ]]; then
             continue
         fi
 
@@ -482,7 +479,10 @@ is_script() {
     return 1  # Not a script
 }
 
-# Calculate entropy using hybrid approach (gzip for long strings, AWK for short)
+# Calculate entropy using hybrid approach:
+# - Strings < 30 chars: Skip (too short)
+# - Strings 30-199 chars: Use AWK Shannon entropy (accurate for medium strings)
+# - Strings 200+ chars: Use gzip compression ratio (efficient for long strings)
 # High entropy (>4.5) indicates random/encrypted/obfuscated data
 # Returns entropy as float (0.0-8.0)
 calculate_entropy() {
@@ -495,13 +495,41 @@ calculate_entropy() {
         return
     fi
 
-    # For longer strings (100+), use gzip compression ratio (faster)
-    if [[ $length -ge 100 ]]; then
+    # For very long strings (200+), use gzip compression ratio
+    # Extended Shannon range (30-199) for better accuracy on medium-length strings
+    if [[ $length -ge 200 ]]; then
+        # Check if gzip is available
+        if ! command -v gzip &> /dev/null; then
+            # Fallback to AWK Shannon entropy if gzip not available
+            local entropy=$(echo -n "$data" | fold -w1 | sort | uniq -c | awk -v len="$length" '
+                BEGIN { entropy = 0 }
+                {
+                    freq = $1 / len
+                    if (freq > 0) {
+                        entropy -= freq * log(freq) / log(2)
+                    }
+                }
+                END { printf "%.2f", entropy }
+            ')
+            echo "$entropy"
+            return
+        fi
+
         local compressed_size=$(echo -n "$data" | gzip -c 2>/dev/null | wc -c)
 
-        # Handle gzip failure
+        # Handle gzip failure - fallback to AWK
         if [[ -z "$compressed_size" ]] || [[ "$compressed_size" -eq 0 ]]; then
-            echo "0"
+            local entropy=$(echo -n "$data" | fold -w1 | sort | uniq -c | awk -v len="$length" '
+                BEGIN { entropy = 0 }
+                {
+                    freq = $1 / len
+                    if (freq > 0) {
+                        entropy -= freq * log(freq) / log(2)
+                    }
+                }
+                END { printf "%.2f", entropy }
+            ')
+            echo "$entropy"
             return
         fi
 
@@ -528,8 +556,8 @@ calculate_entropy() {
 
         echo "$entropy"
     else
-        # For shorter strings (30-99), use AWK Shannon entropy (more accurate)
-        # Gzip header overhead is too significant for short strings
+        # For medium strings (30-199), use AWK Shannon entropy (more accurate)
+        # AWK is better for medium-length strings; gzip only efficient for very long strings
         local entropy=$(echo -n "$data" | fold -w1 | sort | uniq -c | awk -v len="$length" '
             BEGIN { entropy = 0 }
             {
@@ -624,10 +652,20 @@ analyze_script_content() {
         [[ -z "$line" ]] && continue
 
         # Extract variable assignments with long values (potential obfuscation)
-        # Look for patterns: variable=LONGSTRING or variable="LONGSTRING"
-        if [[ "$line" =~ =([^[:space:]]{30,}) ]]; then
+        # Patterns: variable=LONGSTRING or variable="LONGSTRING" or variable='LONGSTRING'
+
+        # Try to match quoted strings first (double or single quotes)
+        if [[ "$line" =~ =[\"\']([ -~]{30,})[\"\']] ]]; then
             local value="${BASH_REMATCH[1]}"
-            # Remove surrounding quotes if present
+
+            # Check entropy of this value
+            if is_high_entropy "$value" 4.5; then
+                return 0  # SUSPICIOUS - high entropy indicates obfuscation
+            fi
+        # Fall back to unquoted strings without spaces
+        elif [[ "$line" =~ =([^[:space:]]{30,}) ]]; then
+            local value="${BASH_REMATCH[1]}"
+            # Remove surrounding quotes if present (in case regex caught partial quotes)
             value="${value#\"}"
             value="${value#\'}"
             value="${value%\"}"
@@ -806,6 +844,7 @@ get_permissions_from_metadata() {
 }
 
 # Add finding to output (new structured format)
+# NOTE: file_hash can be "DEFER" to delay hash calculation until filtering
 add_finding_new() {
     local category="$1"
     local confidence="$2"
@@ -827,6 +866,11 @@ add_finding_new() {
 
     if ! should_include_finding "$confidence" "$has_suspicious"; then
         return 0  # Skip this finding
+    fi
+
+    # Compute hash only if needed (optimization: skip for filtered-out findings)
+    if [[ "$file_hash" == "DEFER" ]]; then
+        file_hash=$(get_file_hash "$file_path")
     fi
 
     local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
@@ -898,7 +942,7 @@ init_output() {
 
 # Check systemd services
 check_systemd() {
-    log_info "Checking systemd services..."
+    log_info "[1/8] Checking systemd services..."
 
     if ! command -v systemctl &> /dev/null; then
         log_warn "systemctl not found, skipping systemd checks"
@@ -918,7 +962,6 @@ check_systemd() {
     for path in "${systemd_paths[@]}"; do
         if [[ -d "$path" ]]; then
             while IFS= read -r -d '' service_file; do
-                local hash=$(get_file_hash "$service_file")
                 local metadata=$(get_file_metadata "$service_file")
                 local service_name=$(basename "$service_file")
 
@@ -975,6 +1018,22 @@ check_systemd() {
                 if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
                     # Check if executable is an interpreter
                     if is_interpreter "$executable"; then
+                        # First, verify the interpreter binary itself isn't compromised
+                        local interp_pkg_status=$(is_package_managed "$executable")
+                        local interp_pkg_return=$?
+
+                        if [[ $interp_pkg_return -eq 2 ]]; then
+                            # Interpreter binary itself was MODIFIED - CRITICAL
+                            confidence="CRITICAL"
+                            log_finding "Systemd service uses modified interpreter binary: $executable"
+                        elif [[ $interp_pkg_return -eq 1 ]]; then
+                            # Interpreter is unmanaged - very suspicious
+                            if [[ ! "$executable" =~ ^/(usr/bin|usr/local/bin|bin) ]]; then
+                                confidence="HIGH"
+                                log_finding "Systemd service uses unmanaged interpreter from unusual location: $executable"
+                            fi
+                        fi
+
                         # Extract the script file from arguments
                         script_to_analyze=$(get_script_from_interpreter_command "$exec_start")
 
@@ -1023,10 +1082,26 @@ check_systemd() {
                                 log_finding "Systemd service executes script with suspicious content: $service_file -> $executable"
                             fi
                         fi
+
+                        # Check if the executable itself is package-managed
+                        local exec_pkg_status=$(is_package_managed "$executable")
+                        local exec_pkg_return=$?
+
+                        if [[ $exec_pkg_return -eq 2 ]]; then
+                            # Executable file was MODIFIED
+                            confidence="CRITICAL"
+                            log_finding "Systemd service executes modified package file: $executable"
+                        elif [[ $exec_pkg_return -eq 1 ]]; then
+                            # Executable is unmanaged - suspicious if in unusual location
+                            if [[ "$executable" =~ ^/(tmp|dev|shm|var/tmp) ]]; then
+                                confidence="HIGH"
+                                log_finding "Systemd service executes file from suspicious location: $executable"
+                            fi
+                        fi
                     fi
                 fi
 
-                # Check if file is package-managed and adjust confidence
+                # Check if service file itself is package-managed and adjust confidence
                 local package_status=$(is_package_managed "$service_file")
                 confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
@@ -1034,8 +1109,8 @@ check_systemd() {
                 local owner=$(get_owner_from_metadata "$metadata")
                 local permissions=$(get_permissions_from_metadata "$metadata")
 
-                # Use new structured format directly
-                add_finding_new "Systemd Service" "$confidence" "$service_file" "$hash" "$owner" "$permissions" "$days_old" "$package_status" "$exec_start" "$enabled_status" "$service_name"
+                # Use new structured format directly (DEFER hash until filtering)
+                add_finding_new "Systemd Service" "$confidence" "$service_file" "DEFER" "$owner" "$permissions" "$days_old" "$package_status" "$exec_start" "$enabled_status" "$service_name"
 
             done < <(find "$path" -maxdepth 1 -type f \( -name "*.service" -o -name "*.timer" -o -name "*.socket" \) -print0 2>/dev/null)
         fi
@@ -1044,7 +1119,7 @@ check_systemd() {
 
 # Check cron jobs
 check_cron() {
-    log_info "Checking cron jobs and scheduled tasks..."
+    log_info "[2/8] Checking cron jobs and scheduled tasks..."
 
     # System crontabs
     local cron_files=(
@@ -1083,6 +1158,29 @@ check_cron() {
                     fi
                 fi
 
+                # Check if cron entries use interpreters
+                while IFS= read -r cron_line; do
+                    [[ -z "$cron_line" ]] && continue
+
+                    # Extract command from cron line (skip time/user fields)
+                    local cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}')
+                    local cron_executable=$(get_executable_from_command "$cron_command")
+
+                    if [[ -n "$cron_executable" ]] && [[ -f "$cron_executable" ]]; then
+                        if is_interpreter "$cron_executable"; then
+                            local cron_script=$(get_script_from_interpreter_command "$cron_command")
+                            if [[ -n "$cron_script" ]] && [[ -f "$cron_script" ]]; then
+                                if is_script "$cron_script"; then
+                                    if analyze_script_content "$cron_script"; then
+                                        confidence="HIGH"
+                                        log_finding "Cron entry uses interpreter with suspicious script: $cron_path -> $cron_script"
+                                    fi
+                                fi
+                            fi
+                        fi
+                    fi
+                done <<< "$content"
+
                 add_finding "Cron" "System" "cron_file" "$cron_path" "Cron configuration file" "$confidence" "$hash" "$metadata" "entries=$(echo "$content" | wc -l)"
 
             elif [[ -d "$cron_path" ]]; then
@@ -1117,6 +1215,29 @@ check_cron() {
                             log_finding "Cron job script contains suspicious content: $cron_file"
                         fi
                     fi
+
+                    # Check if cron entries use interpreters
+                    while IFS= read -r cron_line; do
+                        [[ -z "$cron_line" ]] && continue
+
+                        # Extract command from cron line
+                        local cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}')
+                        local cron_executable=$(get_executable_from_command "$cron_command")
+
+                        if [[ -n "$cron_executable" ]] && [[ -f "$cron_executable" ]]; then
+                            if is_interpreter "$cron_executable"; then
+                                local cron_script=$(get_script_from_interpreter_command "$cron_command")
+                                if [[ -n "$cron_script" ]] && [[ -f "$cron_script" ]]; then
+                                    if is_script "$cron_script"; then
+                                        if analyze_script_content "$cron_script"; then
+                                            confidence="HIGH"
+                                            log_finding "Cron entry uses interpreter with suspicious script: $cron_file -> $cron_script"
+                                        fi
+                                    fi
+                                fi
+                            fi
+                        fi
+                    done <<< "$content"
 
                     # Check if file is package-managed and adjust confidence
                     local package_status=$(is_package_managed "$cron_file")
@@ -1176,7 +1297,7 @@ check_cron() {
 
 # Check shell profiles and RC files
 check_shell_profiles() {
-    log_info "Checking shell profiles and RC files..."
+    log_info "[3/8] Checking shell profiles and RC files..."
 
     local profile_files=(
         "/etc/profile"
@@ -1287,7 +1408,7 @@ check_shell_profiles() {
 
 # Check SSH persistence
 check_ssh() {
-    log_info "Checking SSH persistence mechanisms..."
+    log_info "[4/8] Checking SSH persistence mechanisms..."
 
     # SSH authorized_keys
     if [[ $EUID_CHECK -eq 0 ]]; then
@@ -1348,7 +1469,7 @@ check_ssh() {
 
 # Check init scripts and rc.local
 check_init_scripts() {
-    log_info "Checking init scripts and rc.local..."
+    log_info "[5/8] Checking init scripts and rc.local..."
 
     local init_paths=(
         "/etc/rc.local"
@@ -1402,7 +1523,7 @@ check_init_scripts() {
 
 # Check kernel modules and library preloading
 check_kernel_and_preload() {
-    log_info "Checking kernel modules and library preloading..."
+    log_info "[6/8] Checking kernel modules and library preloading..."
 
     # LD_PRELOAD in environment and configs
     local preload_files=(
@@ -1486,7 +1607,7 @@ check_kernel_and_preload() {
 
 # Check additional persistence locations
 check_additional_persistence() {
-    log_info "Checking additional persistence mechanisms..."
+    log_info "[7/8] Checking additional persistence mechanisms..."
 
     # XDG autostart
     local autostart_dirs=(
@@ -1588,7 +1709,7 @@ check_additional_persistence() {
 
 # Check common backdoor locations (inspired by Crackdown and DFIR research)
 check_common_backdoors() {
-    log_info "Checking common backdoor locations..."
+    log_info "[8/8] Checking common backdoor locations..."
 
     # APT/YUM configuration files that can be abused
     local pkg_mgr_configs=(
@@ -1766,6 +1887,21 @@ main() {
                 ;;
         esac
     done
+
+    # Validate MIN_CONFIDENCE if set
+    if [[ -n "$MIN_CONFIDENCE" ]]; then
+        case "$MIN_CONFIDENCE" in
+            "LOW"|"MEDIUM"|"HIGH")
+                # Valid
+                ;;
+            *)
+                log_warn "Invalid MIN_CONFIDENCE value: '$MIN_CONFIDENCE'"
+                log_warn "Valid values are: LOW, MEDIUM, HIGH"
+                log_warn "Using default: MEDIUM"
+                MIN_CONFIDENCE="MEDIUM"
+                ;;
+        esac
+    fi
 
     print_banner
 

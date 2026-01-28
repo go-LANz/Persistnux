@@ -5,6 +5,108 @@ All notable changes to Persistnux will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.2] - 2026-01-28
+
+### Fixed
+- **#4: Interpreter Flag Parsing Bug**: Fixed unreachable code for `-m` flag (Python module flag)
+  - Previous: `-m` flag check was after general flag skip, making it unreachable
+  - Now: `-m` and `-c` checks happen before general flag skip
+  - Impact: Commands like `python3 -m http.server` no longer try to analyze "http.server" as a file
+
+- **#8: Variable Regex Enhancement**: Improved detection of quoted strings with spaces
+  - Previous: `=([^[:space:]]{30,})` only matched unquoted strings without spaces
+  - Now: Matches both `="quoted string"` and `='single quotes'` with spaces inside
+  - Impact: Catches obfuscated payloads like `payload="YmFz aCAt aSA+"` (base64 with spaces)
+
+### Added
+- **#6: Package Verification for ALL Executables**: Extended package checking beyond service files
+  - Now checks executables/scripts being executed, not just service files
+  - Detects modified package binaries: `/usr/bin/python3` tampered → CRITICAL confidence
+  - Flags unmanaged executables in suspicious locations: `/tmp/backdoor` → HIGH confidence
+
+- **#7: Interpreter Binary Verification**: Verifies interpreter binaries aren't compromised
+  - Checks if `/usr/bin/python3` itself is package-managed and unmodified
+  - Detects backdoored interpreters: Modified `/usr/bin/python3` → CRITICAL confidence
+  - Flags unmanaged interpreters: `/opt/custom/python3` → HIGH confidence
+
+- **#3: Regex-Based Interpreter Detection**: Replaced hardcoded array with regex patterns
+  - Previous: Hardcoded versions (python3.10, python3.11, python3.12)
+  - Now: Regex patterns (`^python[0-9.]*$`, `^pypy[0-9]*$`)
+  - Impact: Automatically detects python3.13, python3.14, pypy3, perl5.36, etc.
+  - Added support for: pypy, gawk, mawk, ksh93, lua5.4, php8
+
+- **#11: Interpreter Detection for Cron Jobs**: Extended interpreter analysis to cron
+  - Cron entries like `* * * * * root /usr/bin/python3 /tmp/backdoor.py` now analyzed
+  - Extracts script path from cron command and analyzes content
+  - Same detection logic as systemd: checks script content, package status, location
+
+- **#12: Progress Indicators**: Added [X/8] progress counters to detection modules
+  - Shows: `[1/8] Checking systemd services...`, `[2/8] Checking cron jobs...`, etc.
+  - Helps users track progress during long scans
+
+### Changed
+- **#9: Extended Shannon Entropy Range**: Adjusted hybrid entropy thresholds
+  - Previous: AWK for 30-99 chars, gzip for 100+ chars
+  - Now: AWK for 30-199 chars, gzip for 200+ chars
+  - Rationale: AWK is more accurate for medium-length strings; gzip better for very long strings
+  - Impact: Reduces false positives from normal text (100-150 chars) being analyzed with gzip
+
+- **#5: Gzip Fallback to AWK**: Added robustness for systems without gzip
+  - Checks if gzip exists before using compression method
+  - Falls back to AWK Shannon entropy if gzip unavailable or fails
+  - Ensures entropy calculation works on minimal systems
+
+- **#10: MIN_CONFIDENCE Validation**: Added input validation for confidence filter
+  - Valid values: LOW, MEDIUM, HIGH
+  - Invalid input: Shows warning, uses default (MEDIUM)
+  - Example: `MIN_CONFIDENCE=INVALID` → Warning + fallback to MEDIUM
+
+### Optimized
+- **#13: Selective Hashing**: Deferred hash calculation until after filtering
+  - Previous: Computed SHA256 hash for every file, even if filtered out
+  - Now: Uses "DEFER" placeholder, computes hash only for reported findings
+  - Impact: Significant performance improvement when using `MIN_CONFIDENCE=HIGH` filter
+
+### Security Impact
+
+**Attack Scenarios Now Detected**:
+
+1. **Backdoored System Binary**:
+   ```systemd
+   ExecStart=/usr/bin/python3 /opt/legitimate.py
+   # If /usr/bin/python3 was replaced with trojan → v1.7.2: CRITICAL
+   ```
+
+2. **Modified Package Executable**:
+   ```systemd
+   ExecStart=/usr/bin/curl https://example.com
+   # If /usr/bin/curl was tampered with → v1.7.2: CRITICAL
+   ```
+
+3. **Cron with Malicious Script**:
+   ```cron
+   * * * * * root /usr/bin/python3 /tmp/backdoor.py
+   # v1.7.2: Extracts /tmp/backdoor.py → Analyzes content → HIGH
+   ```
+
+4. **Obfuscated Payload with Spaces**:
+   ```bash
+   payload="YmFz aCAt aSA+"  # Base64 with spaces to evade detection
+   # v1.7.2: Improved regex catches quoted strings → HIGH entropy detected
+   ```
+
+### Migration Notes
+
+**For Users**:
+- No breaking changes
+- All fixes are backward compatible
+- Improved detection may increase findings (fewer false negatives)
+
+**For Analysts**:
+- Review CRITICAL findings first (modified package files)
+- Check for backdoored interpreters (`/usr/bin/python3` modified)
+- Validate cron-based interpreter persistence
+
 ## [1.7.1] - 2026-01-26
 
 ### Changed
