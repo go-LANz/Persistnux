@@ -464,20 +464,20 @@ is_script() {
         return 1  # Not a script
     fi
 
-    # Use file command to check if it's a text/script file
-    # Use -b for brief output, but pipe through strings to strip null bytes
-    local file_type=$(file -b "$file" 2>/dev/null | tr -d '\000')
-    if echo "$file_type" | grep -qiE "(shell script|python script|perl script|ruby script|text executable)"; then
-        return 0  # It's a script
-    fi
-
-    # Check for shebang as fallback
-    local first_line=$(head -n 1 "$file" 2>/dev/null | tr -d '\000')
-    if [[ "$first_line" =~ ^#! ]]; then
+    # First check: look for shebang (most reliable for scripts)
+    # Read first line and check for #! without using command substitution on binary files
+    if head -n 1 "$file" 2>/dev/null | grep -qm1 "^#!"; then
         return 0  # Has shebang, it's a script
     fi
 
-    return 1  # Not a script
+    # Second check: Use file command mime type (cleaner, no descriptive text with potential nulls)
+    # Check MIME type instead of description to avoid null bytes in output
+    local mime_type=$(file -b --mime-type "$file" 2>/dev/null)
+    if [[ "$mime_type" == text/* ]] || [[ "$mime_type" == application/x-shellscript ]] || [[ "$mime_type" == application/x-*script ]]; then
+        return 0  # It's a text/script file
+    fi
+
+    return 1  # Not a script (likely binary)
 }
 
 # Calculate entropy using hybrid approach:
