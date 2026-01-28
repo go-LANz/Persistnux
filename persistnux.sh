@@ -7,7 +7,7 @@
 # Version: 1.7.2
 ################################################################################
 
-set -euo pipefail
+set -eo pipefail
 
 # Colors for output
 RED='\033[0;31m'
