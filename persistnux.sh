@@ -980,10 +980,8 @@ check_systemd() {
                     exec_start=$(grep -E "^ExecStart=" "$service_file" 2>/dev/null | head -1 | cut -d'=' -f2- || echo "")
                 fi
 
-                # Skip if ExecStart is empty (not executable service)
-                if [[ -z "$exec_start" ]]; then
-                    continue
-                fi
+                # Note: We don't skip if ExecStart is empty - timers, sockets, and some services don't have it
+                # We still want to report these files for completeness
 
                 # Check if service is enabled
                 local enabled_status="disabled"
@@ -998,31 +996,35 @@ check_systemd() {
                 local current_time=$(date +%s)
                 local days_old=$(( (current_time - mod_time) / 86400 ))
 
-                # First: Check for explicitly dangerous patterns (HIGH confidence)
-                if echo "$exec_start" | grep -qiE "(curl.*\||wget.*\||nc -e|/dev/tcp/|/dev/udp/|bash -i|sh -i)"; then
-                    confidence="HIGH"
-                    log_finding "Dangerous command in systemd service: $service_file"
-                elif check_suspicious_patterns "$exec_start"; then
-                    confidence="HIGH"
-                    log_finding "Suspicious systemd service (advanced patterns): $service_file"
-                # Second: Check if command is safe (downgrade confidence)
-                elif is_command_safe "$exec_start"; then
-                    # Safe system binary execution
-                    confidence="LOW"
-                # Third: Unknown command + recent modification = suspicious
-                elif [[ $days_old -lt 7 ]] && [[ "$enabled_status" == "enabled" ]]; then
-                    confidence="HIGH"
-                    log_finding "Recently created enabled systemd service with unknown command: $service_file (${days_old} days old)"
-                # Fourth: Unknown command but old and package-managed = probably safe
-                else
-                    # Will be downgraded further if package-managed
-                    confidence="MEDIUM"
-                fi
-
-                # Fifth: Check if ExecStart uses an interpreter (python/perl/bash/etc.)
-                # CRITICAL: Analyze the script argument, not the interpreter binary
-                local executable=$(get_executable_from_command "$exec_start")
+                # Only analyze ExecStart if it exists
+                local executable=""
                 local script_to_analyze=""
+
+                if [[ -n "$exec_start" ]]; then
+                    # First: Check for explicitly dangerous patterns (HIGH confidence)
+                    if echo "$exec_start" | grep -qiE "(curl.*\||wget.*\||nc -e|/dev/tcp/|/dev/udp/|bash -i|sh -i)"; then
+                        confidence="HIGH"
+                        log_finding "Dangerous command in systemd service: $service_file"
+                    elif check_suspicious_patterns "$exec_start"; then
+                        confidence="HIGH"
+                        log_finding "Suspicious systemd service (advanced patterns): $service_file"
+                    # Second: Check if command is safe (downgrade confidence)
+                    elif is_command_safe "$exec_start"; then
+                        # Safe system binary execution
+                        confidence="LOW"
+                    # Third: Unknown command + recent modification = suspicious
+                    elif [[ $days_old -lt 7 ]] && [[ "$enabled_status" == "enabled" ]]; then
+                        confidence="HIGH"
+                        log_finding "Recently created enabled systemd service with unknown command: $service_file (${days_old} days old)"
+                    # Fourth: Unknown command but old and package-managed = probably safe
+                    else
+                        # Will be downgraded further if package-managed
+                        confidence="MEDIUM"
+                    fi
+
+                    # Fifth: Check if ExecStart uses an interpreter (python/perl/bash/etc.)
+                    # CRITICAL: Analyze the script argument, not the interpreter binary
+                    executable=$(get_executable_from_command "$exec_start")
 
                 if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
                     # Check if executable is an interpreter
@@ -1109,6 +1111,7 @@ check_systemd() {
                         fi
                     fi
                 fi
+                fi  # End of: if [[ -n "$exec_start" ]]
 
                 # Determine package status for reporting
                 # Use the executable's package status if available (already checked above)
