@@ -654,8 +654,16 @@ analyze_script_content() {
         # Extract variable assignments with long values (potential obfuscation)
         # Patterns: variable=LONGSTRING or variable="LONGSTRING" or variable='LONGSTRING'
 
-        # Try to match quoted strings first (double or single quotes)
-        if [[ "$line" =~ =[\"\']([ -~]{30,})[\"\']] ]]; then
+        # Try to match quoted strings first (double quotes)
+        if [[ "$line" =~ =\"([^\"]{30,})\" ]]; then
+            local value="${BASH_REMATCH[1]}"
+
+            # Check entropy of this value
+            if is_high_entropy "$value" 4.5; then
+                return 0  # SUSPICIOUS - high entropy indicates obfuscation
+            fi
+        # Try single quoted strings
+        elif [[ "$line" =~ =\'([^\']{30,})\' ]]; then
             local value="${BASH_REMATCH[1]}"
 
             # Check entropy of this value
