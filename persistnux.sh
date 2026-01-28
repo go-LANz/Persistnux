@@ -465,13 +465,14 @@ is_script() {
     fi
 
     # Use file command to check if it's a text/script file
-    local file_type=$(file -b "$file" 2>/dev/null)
+    # Use -b for brief output, but pipe through strings to strip null bytes
+    local file_type=$(file -b "$file" 2>/dev/null | tr -d '\000')
     if echo "$file_type" | grep -qiE "(shell script|python script|perl script|ruby script|text executable)"; then
         return 0  # It's a script
     fi
 
     # Check for shebang as fallback
-    local first_line=$(head -n 1 "$file" 2>/dev/null)
+    local first_line=$(head -n 1 "$file" 2>/dev/null | tr -d '\000')
     if [[ "$first_line" =~ ^#! ]]; then
         return 0  # Has shebang, it's a script
     fi
