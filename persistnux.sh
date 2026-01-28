@@ -1110,14 +1110,27 @@ check_systemd() {
                     fi
                 fi
 
-                # Check package status: prioritize executable over service file
-                # The executable's package status is more security-relevant than the .service file
+                # Determine package status for reporting
+                # Use the executable's package status if available (already checked above)
                 local package_status="unmanaged"
                 if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
-                    package_status=$(is_package_managed "$executable")
-                    confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+                    # Check if we already have package status from interpreter or exec checks
+                    if is_interpreter "$executable"; then
+                        # Reuse interp_pkg_status if it was an interpreter
+                        if [[ -n "${interp_pkg_status:-}" ]]; then
+                            package_status="$interp_pkg_status"
+                        else
+                            package_status=$(is_package_managed "$executable")
+                        fi
+                    elif [[ -n "${exec_pkg_status:-}" ]]; then
+                        # Reuse exec_pkg_status from non-interpreter checks
+                        package_status="$exec_pkg_status"
+                    else
+                        # This shouldn't happen but check anyway
+                        package_status=$(is_package_managed "$executable")
+                    fi
                 else
-                    # Fallback: check if service file itself is package-managed
+                    # No executable found, check if service file itself is package-managed
                     package_status=$(is_package_managed "$service_file")
                     confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
                 fi
