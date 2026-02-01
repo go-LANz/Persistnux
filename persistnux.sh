@@ -786,13 +786,11 @@ is_command_safe() {
     local executable=$(get_executable_from_command "$command")
 
     # Second check: Path-based validation
-    # If the executable path is in a known-good system location, consider it safe
-    # NOTE: We don't require the file to exist because in sandboxed/forensic environments,
-    # we may be analyzing service files where the actual binaries aren't present
+    # If the executable path is in a known-good system location AND is package-managed, it's safe
     for path_pattern in "${KNOWN_GOOD_EXECUTABLE_PATHS[@]}"; do
         if [[ -n "$executable" ]] && [[ "$executable" =~ $path_pattern ]]; then
             # Path matches known-good location (e.g., /usr/bin/, /lib/systemd/)
-            # If file exists, verify it's package-managed
+            # Verify the binary is package-managed (not a rogue binary placed in system dir)
             if [[ -f "$executable" ]]; then
                 local pkg_status=$(is_package_managed "$executable")
                 local pkg_return=$?
@@ -802,14 +800,12 @@ is_command_safe() {
                 elif [[ $pkg_return -eq 2 ]]; then
                     return 1  # DANGEROUS - modified package file
                 fi
-                # If unmanaged, fall through to continue checking
+                # If unmanaged binary in system path, fall through (suspicious)
             else
-                # File doesn't exist (sandboxed env) - trust the path pattern
-                # This is safe because:
-                # 1. Path matches system directories (/usr/bin, /lib/systemd, etc.)
-                # 2. Dangerous patterns were already checked above
-                # 3. The service file's package status is verified separately
-                return 0  # Likely safe - standard system path
+                # Binary path looks legitimate but file doesn't exist
+                # This could indicate a broken service or (less common) offline analysis
+                # Trust the path since dangerous patterns were already checked above
+                return 0
             fi
         fi
     done
