@@ -908,6 +908,7 @@ add_finding_new() {
     local command="${9:-}"
     local enabled_status="${10:-}"
     local description="${11:-}"
+    local detection_reason="${12:-}"
 
     # Check if this finding should be included based on filter settings
     local has_suspicious="false"
@@ -926,12 +927,12 @@ add_finding_new() {
 
     local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-    # CSV output (new structure)
-    echo "$(escape_csv "$timestamp"),$(escape_csv "$HOSTNAME"),$(escape_csv "$category"),$(escape_csv "$confidence"),$(escape_csv "$file_path"),$(escape_csv "$file_hash"),$(escape_csv "$file_owner"),$(escape_csv "$file_permissions"),$(escape_csv "$file_age_days"),$(escape_csv "$package_status"),$(escape_csv "$command"),$(escape_csv "$enabled_status"),$(escape_csv "$description")" >> "$CSV_FILE"
+    # CSV output (new structure with detection_reason)
+    echo "$(escape_csv "$timestamp"),$(escape_csv "$HOSTNAME"),$(escape_csv "$category"),$(escape_csv "$confidence"),$(escape_csv "$file_path"),$(escape_csv "$file_hash"),$(escape_csv "$file_owner"),$(escape_csv "$file_permissions"),$(escape_csv "$file_age_days"),$(escape_csv "$package_status"),$(escape_csv "$command"),$(escape_csv "$enabled_status"),$(escape_csv "$description"),$(escape_csv "$detection_reason")" >> "$CSV_FILE"
 
-    # JSONL output (new structure with proper escaping)
+    # JSONL output (new structure with detection_reason)
     cat >> "$JSONL_FILE" << EOF
-{"timestamp":"$timestamp","hostname":"$HOSTNAME","category":"$(escape_json "$category")","confidence":"$confidence","file_path":"$(escape_json "$file_path")","file_hash":"$file_hash","file_owner":"$(escape_json "$file_owner")","file_permissions":"$file_permissions","file_age_days":"$file_age_days","package_status":"$(escape_json "$package_status")","command":"$(escape_json "$command")","enabled_status":"$(escape_json "$enabled_status")","description":"$(escape_json "$description")"}
+{"timestamp":"$timestamp","hostname":"$HOSTNAME","category":"$(escape_json "$category")","confidence":"$confidence","file_path":"$(escape_json "$file_path")","file_hash":"$file_hash","file_owner":"$(escape_json "$file_owner")","file_permissions":"$file_permissions","file_age_days":"$file_age_days","package_status":"$(escape_json "$package_status")","command":"$(escape_json "$command")","enabled_status":"$(escape_json "$enabled_status")","description":"$(escape_json "$description")","detection_reason":"$(escape_json "$detection_reason")"}
 EOF
 }
 
@@ -946,6 +947,7 @@ add_finding() {
     local hash="$7"
     local metadata="$8"
     local additional_info="${9:-}"
+    local detection_reason="${10:-}"
 
     # Extract structured fields from metadata and additional_info
     local owner=$(echo "$metadata" | grep -oP 'owner:\K[^|]+' | head -1 || echo "N/A")
@@ -967,8 +969,8 @@ add_finding() {
     # Build clean category name
     local clean_category="$category $subcategory"
 
-    # Call new structured function
-    add_finding_new "$clean_category" "$confidence" "$location" "$hash" "$owner" "$permissions" "$days_old" "$package_status" "$command" "$enabled" "$persistence_type"
+    # Call new structured function with detection_reason
+    add_finding_new "$clean_category" "$confidence" "$location" "$hash" "$owner" "$permissions" "$days_old" "$package_status" "$command" "$enabled" "$persistence_type" "$detection_reason"
 }
 
 # Initialize output files
@@ -976,8 +978,8 @@ init_output() {
     mkdir -p "$OUTPUT_DIR"
     mkdir -p "$TEMP_DATA"
 
-    # CSV header (new structured format)
-    echo "timestamp,hostname,category,confidence,file_path,file_hash,file_owner,file_permissions,file_age_days,package_status,command,enabled_status,description" > "$CSV_FILE"
+    # CSV header (new structured format with detection_reason)
+    echo "timestamp,hostname,category,confidence,file_path,file_hash,file_owner,file_permissions,file_age_days,package_status,command,enabled_status,description,detection_reason" > "$CSV_FILE"
 
     # Clear JSONL file
     > "$JSONL_FILE"
@@ -1032,6 +1034,7 @@ check_systemd() {
                 fi
 
                 local confidence="MEDIUM"
+                local detection_reason=""
 
                 # Check modification time (recently modified = more suspicious)
                 local mod_time=$(stat -c %Y "$service_file" 2>/dev/null || stat -f %m "$service_file" 2>/dev/null || echo "0")
@@ -1046,22 +1049,27 @@ check_systemd() {
                     # First: Check for explicitly dangerous patterns (HIGH confidence)
                     if echo "$exec_start" | grep -qiE "(curl.*\||wget.*\||nc -e|/dev/tcp/|/dev/udp/|bash -i|sh -i)"; then
                         confidence="HIGH"
+                        detection_reason="Dangerous pattern in ExecStart: reverse shell or download-execute detected"
                         log_finding "Dangerous command in systemd service: $service_file"
                     elif check_suspicious_patterns "$exec_start"; then
                         confidence="HIGH"
+                        detection_reason="Suspicious pattern in ExecStart: matched advanced threat patterns"
                         log_finding "Suspicious systemd service (advanced patterns): $service_file"
                     # Second: Check if command is safe (downgrade confidence)
                     elif is_command_safe "$exec_start"; then
                         # Safe system binary execution
                         confidence="LOW"
+                        detection_reason="Safe: package-managed binary in standard location"
                     # Third: Unknown command + recent modification = suspicious
                     elif [[ $days_old -lt 7 ]] && [[ "$enabled_status" == "enabled" ]]; then
                         confidence="HIGH"
+                        detection_reason="Recently modified (${days_old} days) + enabled + unknown/unmanaged command"
                         log_finding "Recently created enabled systemd service with unknown command: $service_file (${days_old} days old)"
                     # Fourth: Unknown command but old and package-managed = probably safe
                     else
                         # Will be downgraded further if package-managed
                         confidence="MEDIUM"
+                        detection_reason="Unknown command, requires manual review"
                     fi
 
                     # Fifth: Check if ExecStart uses an interpreter (python/perl/bash/etc.)
@@ -1078,11 +1086,13 @@ check_systemd() {
                         if [[ $interp_pkg_return -eq 2 ]]; then
                             # Interpreter binary itself was MODIFIED - CRITICAL
                             confidence="CRITICAL"
+                            detection_reason="CRITICAL: Interpreter binary ($executable) modified from package version"
                             log_finding "Systemd service uses modified interpreter binary: $executable"
                         elif [[ $interp_pkg_return -eq 1 ]]; then
                             # Interpreter is unmanaged - very suspicious
                             if [[ ! "$executable" =~ ^/(usr/bin|usr/local/bin|bin) ]]; then
                                 confidence="HIGH"
+                                detection_reason="Unmanaged interpreter from unusual location: $executable"
                                 log_finding "Systemd service uses unmanaged interpreter from unusual location: $executable"
                             fi
                         fi
@@ -1091,12 +1101,11 @@ check_systemd() {
                         script_to_analyze=$(get_script_from_interpreter_command "$exec_start")
 
                         if [[ -n "$script_to_analyze" ]] && [[ -f "$script_to_analyze" ]]; then
-                            log_finding "Systemd service uses interpreter: $service_file -> $executable $script_to_analyze"
-
                             # Analyze the script file, not the interpreter
                             if is_script "$script_to_analyze"; then
                                 if analyze_script_content "$script_to_analyze"; then
                                     confidence="HIGH"
+                                    detection_reason="Script content analysis: suspicious patterns found in $script_to_analyze"
                                     log_finding "Interpreter script contains suspicious content: $script_to_analyze"
                                 fi
                             fi
@@ -1108,15 +1117,20 @@ check_systemd() {
                             if [[ $script_pkg_return -eq 2 ]]; then
                                 # Script file was MODIFIED
                                 confidence="CRITICAL"
+                                detection_reason="CRITICAL: Script file ($script_to_analyze) modified from package version"
                                 log_finding "Interpreter script is modified package file: $script_to_analyze"
                             elif [[ $script_pkg_return -eq 1 ]]; then
                                 # Script is unmanaged - suspicious if in unusual location
                                 if [[ "$script_to_analyze" =~ ^/(tmp|dev|shm|var/tmp) ]]; then
                                     confidence="HIGH"
+                                    detection_reason="Script executed from suspicious location: $script_to_analyze"
                                     log_finding "Interpreter executing script from suspicious location: $script_to_analyze"
                                 elif [[ "$script_to_analyze" =~ ^/(opt|usr/local|home) ]]; then
                                     # Common but unmanaged locations - keep MEDIUM
-                                    [[ "$confidence" == "LOW" ]] && confidence="MEDIUM"
+                                    if [[ "$confidence" == "LOW" ]]; then
+                                        confidence="MEDIUM"
+                                        detection_reason="Unmanaged script in user/local directory: $script_to_analyze"
+                                    fi
                                 fi
                             fi
                         else
@@ -1124,6 +1138,7 @@ check_systemd() {
                             # This is inherently suspicious
                             if [[ "$exec_start" =~ \ -c\  ]]; then
                                 confidence="HIGH"
+                                detection_reason="Interpreter with inline code (-c flag): potential obfuscation"
                                 log_finding "Systemd service uses interpreter with inline code (-c flag): $service_file"
                             fi
                         fi
@@ -1132,6 +1147,7 @@ check_systemd() {
                         if is_script "$executable"; then
                             if analyze_script_content "$executable"; then
                                 confidence="HIGH"
+                                detection_reason="Script content analysis: suspicious patterns found in $executable"
                                 log_finding "Systemd service executes script with suspicious content: $service_file -> $executable"
                             fi
                         fi
@@ -1143,16 +1159,21 @@ check_systemd() {
                         if [[ $exec_pkg_return -eq 2 ]]; then
                             # Executable file was MODIFIED
                             confidence="CRITICAL"
+                            detection_reason="CRITICAL: Executable ($executable) modified from package version"
                             log_finding "Systemd service executes modified package file: $executable"
                         elif [[ $exec_pkg_return -eq 1 ]]; then
                             # Executable is unmanaged - suspicious if in unusual location
                             if [[ "$executable" =~ ^/(tmp|dev|shm|var/tmp) ]]; then
                                 confidence="HIGH"
+                                detection_reason="Executable in suspicious location: $executable"
                                 log_finding "Systemd service executes file from suspicious location: $executable"
                             fi
                         fi
                     fi
                 fi
+                else
+                    # No ExecStart - could be a timer, socket, or incomplete service
+                    detection_reason="No ExecStart directive (timer/socket/target or incomplete service)"
                 fi  # End of: if [[ -n "$exec_start" ]]
 
                 # Determine package status for reporting
@@ -1177,7 +1198,15 @@ check_systemd() {
                 else
                     # No executable found, check if service file itself is package-managed
                     package_status=$(is_package_managed "$service_file")
+                    local old_confidence="$confidence"
                     confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+                    if [[ "$old_confidence" != "$confidence" ]]; then
+                        if [[ "$package_status" == *":MODIFIED"* ]]; then
+                            detection_reason="CRITICAL: Service file modified from package version"
+                        else
+                            detection_reason="Safe: service file is package-managed ($package_status)"
+                        fi
+                    fi
                 fi
 
                 # Extract owner and permissions from metadata
@@ -1185,7 +1214,7 @@ check_systemd() {
                 local permissions=$(get_permissions_from_metadata "$metadata")
 
                 # Use new structured format directly (DEFER hash until filtering)
-                add_finding_new "Systemd Service" "$confidence" "$service_file" "DEFER" "$owner" "$permissions" "$days_old" "$package_status" "$exec_start" "$enabled_status" "$service_name"
+                add_finding_new "Systemd Service" "$confidence" "$service_file" "DEFER" "$owner" "$permissions" "$days_old" "$package_status" "$exec_start" "$enabled_status" "$service_name" "$detection_reason"
 
             done < <(find "$path" -maxdepth 1 -type f \( -name "*.service" -o -name "*.timer" -o -name "*.socket" \) -print0 2>/dev/null)
         fi
@@ -1217,11 +1246,14 @@ check_cron() {
                 local content=$(grep -Ev "^#|^$" "$cron_path" 2>/dev/null | head -20 || echo "")
 
                 local confidence="MEDIUM"
+                local detection_reason="System cron file, requires review"
                 if echo "$content" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|/dev/tcp|/dev/udp|base64)"; then
                     confidence="HIGH"
+                    detection_reason="Suspicious keywords in cron: curl/wget/nc/base64/tmp paths detected"
                     log_finding "Suspicious cron job in: $cron_path"
                 elif check_suspicious_patterns "$content"; then
                     confidence="HIGH"
+                    detection_reason="Advanced threat pattern matched in cron content"
                     log_finding "Suspicious cron job (advanced patterns): $cron_path"
                 fi
 
@@ -1229,6 +1261,7 @@ check_cron() {
                 if is_script "$cron_path"; then
                     if analyze_script_content "$cron_path"; then
                         confidence="HIGH"
+                        detection_reason="Script content analysis: suspicious patterns in cron file"
                         log_finding "Cron file contains suspicious script content: $cron_path"
                     fi
                 fi
@@ -1248,6 +1281,7 @@ check_cron() {
                                 if is_script "$cron_script"; then
                                     if analyze_script_content "$cron_script"; then
                                         confidence="HIGH"
+                                        detection_reason="Interpreter script analysis: suspicious content in $cron_script"
                                         log_finding "Cron entry uses interpreter with suspicious script: $cron_path -> $cron_script"
                                     fi
                                 fi
@@ -1256,7 +1290,7 @@ check_cron() {
                     fi
                 done <<< "$content"
 
-                add_finding "Cron" "System" "cron_file" "$cron_path" "Cron configuration file" "$confidence" "$hash" "$metadata" "entries=$(echo "$content" | wc -l)"
+                add_finding "Cron" "System" "cron_file" "$cron_path" "Cron configuration file" "$confidence" "$hash" "$metadata" "entries=$(echo "$content" | wc -l)" "$detection_reason"
 
             elif [[ -d "$cron_path" ]]; then
                 # Directory of cron jobs
@@ -1266,6 +1300,7 @@ check_cron() {
                     local content=$(grep -Ev "^#|^$" "$cron_file" 2>/dev/null | head -10 || echo "")
 
                     local confidence="MEDIUM"
+                    local detection_reason="Cron script in $cron_path, requires review"
 
                     # Check modification time
                     local mod_time=$(stat -c %Y "$cron_file" 2>/dev/null || stat -f %m "$cron_file" 2>/dev/null || echo "0")
@@ -1274,12 +1309,15 @@ check_cron() {
 
                     if echo "$content" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|/dev/tcp|/dev/udp|base64|chmod \+x)"; then
                         confidence="HIGH"
+                        detection_reason="Suspicious keywords: curl/wget/nc/base64/chmod/tmp paths detected"
                         log_finding "Suspicious cron job: $cron_file"
                     elif check_suspicious_patterns "$content"; then
                         confidence="HIGH"
+                        detection_reason="Advanced threat pattern matched in cron script"
                         log_finding "Suspicious cron job (advanced patterns): $cron_file"
                     elif [[ $days_old -lt 7 ]]; then
                         confidence="HIGH"
+                        detection_reason="Recently created (${days_old} days old), requires investigation"
                         log_finding "Recently created cron job: $cron_file (${days_old} days old)"
                     fi
 
@@ -1287,6 +1325,7 @@ check_cron() {
                     if is_script "$cron_file"; then
                         if analyze_script_content "$cron_file"; then
                             confidence="HIGH"
+                            detection_reason="Script content analysis: suspicious patterns detected"
                             log_finding "Cron job script contains suspicious content: $cron_file"
                         fi
                     fi
@@ -1306,6 +1345,7 @@ check_cron() {
                                     if is_script "$cron_script"; then
                                         if analyze_script_content "$cron_script"; then
                                             confidence="HIGH"
+                                            detection_reason="Interpreter script analysis: suspicious content in $cron_script"
                                             log_finding "Cron entry uses interpreter with suspicious script: $cron_file -> $cron_script"
                                         fi
                                     fi
@@ -1316,9 +1356,17 @@ check_cron() {
 
                     # Check if file is package-managed and adjust confidence
                     local package_status=$(is_package_managed "$cron_file")
+                    local old_confidence="$confidence"
                     confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+                    if [[ "$old_confidence" != "$confidence" ]]; then
+                        if [[ "$package_status" == *":MODIFIED"* ]]; then
+                            detection_reason="CRITICAL: Package-managed file modified"
+                        else
+                            detection_reason="Safe: package-managed cron script ($package_status)"
+                        fi
+                    fi
 
-                    add_finding "Cron" "System" "cron_script" "$cron_file" "Scheduled script: $(basename "$cron_file")" "$confidence" "$hash" "$metadata" "content_preview=${content:0:100}|days_old=$days_old|package=$package_status"
+                    add_finding "Cron" "System" "cron_script" "$cron_file" "Scheduled script: $(basename "$cron_file")" "$confidence" "$hash" "$metadata" "content_preview=${content:0:100}|days_old=$days_old|package=$package_status" "$detection_reason"
 
                 done < <(find "$cron_path" -type f -print0 2>/dev/null)
             fi
@@ -1332,12 +1380,14 @@ check_cron() {
                 local user_cron=$(crontab -u "$username" -l 2>/dev/null || echo "")
                 if [[ -n "$user_cron" ]]; then
                     local confidence="MEDIUM"
+                    local detection_reason="User crontab exists, review entries"
                     if echo "$user_cron" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|/dev/tcp|/dev/udp|base64)"; then
                         confidence="HIGH"
+                        detection_reason="Suspicious keywords in user crontab: curl/wget/nc/base64/tmp"
                         log_finding "Suspicious user crontab for: $username"
                     fi
 
-                    add_finding "Cron" "User" "user_crontab" "/var/spool/cron/crontabs/$username" "User $username crontab entries" "$confidence" "N/A" "user=$username" "preview=${user_cron:0:100}"
+                    add_finding "Cron" "User" "user_crontab" "/var/spool/cron/crontabs/$username" "User $username crontab entries" "$confidence" "N/A" "user=$username" "preview=${user_cron:0:100}" "$detection_reason"
                 fi
             fi
         done < /etc/passwd
@@ -1345,7 +1395,7 @@ check_cron() {
         # Non-root: check only current user
         local user_cron=$(crontab -l 2>/dev/null || echo "")
         if [[ -n "$user_cron" ]]; then
-            add_finding "Cron" "User" "user_crontab" "~/.crontab" "Current user crontab" "MEDIUM" "N/A" "user=$(whoami)" "preview=${user_cron:0:100}"
+            add_finding "Cron" "User" "user_crontab" "~/.crontab" "Current user crontab" "MEDIUM" "N/A" "user=$(whoami)" "preview=${user_cron:0:100}" "Current user crontab exists, review entries"
         fi
     fi
 
@@ -1359,12 +1409,14 @@ check_cron() {
                 local job_details=$(at -c "$job_id" 2>/dev/null | tail -20 || echo "")
 
                 local confidence="LOW"
+                local detection_reason="Scheduled at job, review content"
                 if echo "$job_details" | grep -qiE "(curl|wget|nc|netcat)"; then
                     confidence="HIGH"
+                    detection_reason="Suspicious keywords in at job: curl/wget/nc detected"
                     log_finding "Suspicious at job: $job_id"
                 fi
 
-                add_finding "Scheduled" "At" "at_job" "/var/spool/cron/atjobs/$job_id" "At job $job_id" "$confidence" "N/A" "$job_line" "job_id=$job_id"
+                add_finding "Scheduled" "At" "at_job" "/var/spool/cron/atjobs/$job_id" "At job $job_id" "$confidence" "N/A" "$job_line" "job_id=$job_id" "$detection_reason"
             done <<< "$at_jobs"
         fi
     fi
@@ -1393,16 +1445,22 @@ check_shell_profiles() {
                 local suspicious_content=$(grep -iE "(curl|wget|nc |netcat|eval|base64.*decode|chmod \+x)" "$profile" 2>/dev/null || echo "")
 
                 local confidence="LOW"
+                local detection_reason="System shell profile, no suspicious patterns"
                 if [[ -n "$suspicious_content" ]]; then
                     confidence="HIGH"
+                    detection_reason="Suspicious keywords in profile: curl/wget/nc/eval/base64 detected"
                     log_finding "Suspicious content in profile: $profile"
                 fi
 
                 # Check if file is package-managed and adjust confidence
                 local package_status=$(is_package_managed "$profile")
+                local old_confidence="$confidence"
                 confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+                if [[ "$old_confidence" != "$confidence" ]] && [[ "$package_status" != "unmanaged" ]]; then
+                    detection_reason="Safe: package-managed profile ($package_status)"
+                fi
 
-                add_finding "ShellProfile" "System" "profile_file" "$profile" "System shell profile" "$confidence" "$hash" "$metadata" "suspicious_lines=$(echo "$suspicious_content" | wc -l)|package=$package_status"
+                add_finding "ShellProfile" "System" "profile_file" "$profile" "System shell profile" "$confidence" "$hash" "$metadata" "suspicious_lines=$(echo "$suspicious_content" | wc -l)|package=$package_status" "$detection_reason"
 
             elif [[ -d "$profile" ]]; then
                 while IFS= read -r -d '' profile_file; do
@@ -1411,16 +1469,22 @@ check_shell_profiles() {
                     local suspicious_content=$(grep -iE "(curl|wget|nc |netcat|eval|base64.*decode)" "$profile_file" 2>/dev/null || echo "")
 
                     local confidence="LOW"
+                    local detection_reason="Profile.d script, no suspicious patterns"
                     if [[ -n "$suspicious_content" ]]; then
                         confidence="HIGH"
+                        detection_reason="Suspicious keywords in profile.d: curl/wget/nc/eval/base64 detected"
                         log_finding "Suspicious profile script: $profile_file"
                     fi
 
                     # Check if file is package-managed and adjust confidence
                     local package_status=$(is_package_managed "$profile_file")
+                    local old_confidence="$confidence"
                     confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+                    if [[ "$old_confidence" != "$confidence" ]] && [[ "$package_status" != "unmanaged" ]]; then
+                        detection_reason="Safe: package-managed profile script ($package_status)"
+                    fi
 
-                    add_finding "ShellProfile" "System" "profile_script" "$profile_file" "Profile.d script: $(basename "$profile_file")" "$confidence" "$hash" "$metadata" "package=$package_status"
+                    add_finding "ShellProfile" "System" "profile_script" "$profile_file" "Profile.d script: $(basename "$profile_file")" "$confidence" "$hash" "$metadata" "package=$package_status" "$detection_reason"
 
                 done < <(find "$profile" -type f -print0 2>/dev/null)
             fi
@@ -1451,12 +1515,14 @@ check_shell_profiles() {
                         local suspicious_content=$(grep -iE "(curl|wget|nc |netcat|eval|base64.*decode|chmod \+x)" "$profile_path" 2>/dev/null || echo "")
 
                         local confidence="LOW"
+                        local detection_reason="User profile exists, no suspicious patterns"
                         if [[ -n "$suspicious_content" ]]; then
                             confidence="HIGH"
+                            detection_reason="Suspicious keywords in user profile: curl/wget/nc/eval/base64 detected"
                             log_finding "Suspicious user profile: $profile_path (user: $username)"
                         fi
 
-                        add_finding "ShellProfile" "User" "user_profile" "$profile_path" "User profile for $username" "$confidence" "$hash" "$metadata" "user=$username"
+                        add_finding "ShellProfile" "User" "user_profile" "$profile_path" "User profile for $username" "$confidence" "$hash" "$metadata" "user=$username" "$detection_reason"
                     fi
                 done
             fi
@@ -1471,11 +1537,13 @@ check_shell_profiles() {
                 local suspicious_content=$(grep -iE "(curl|wget|nc |netcat|eval|base64.*decode)" "$profile_path" 2>/dev/null || echo "")
 
                 local confidence="LOW"
+                local detection_reason="User profile exists, no suspicious patterns"
                 if [[ -n "$suspicious_content" ]]; then
                     confidence="MEDIUM"
+                    detection_reason="Suspicious keywords in user profile: curl/wget/nc/eval/base64 detected"
                 fi
 
-                add_finding "ShellProfile" "User" "user_profile" "$profile_path" "Current user profile" "$confidence" "$hash" "$metadata" "user=$(whoami)"
+                add_finding "ShellProfile" "User" "user_profile" "$profile_path" "Current user profile" "$confidence" "$hash" "$metadata" "user=$(whoami)" "$detection_reason"
             fi
         done
     fi
@@ -1497,7 +1565,7 @@ check_ssh() {
                         local metadata=$(get_file_metadata "$ssh_dir/authorized_keys")
                         local key_count=$(grep -c "^ssh-" "$ssh_dir/authorized_keys" 2>/dev/null || echo "0")
 
-                        add_finding "SSH" "AuthorizedKeys" "ssh_authorized_keys" "$ssh_dir/authorized_keys" "User $username has $key_count SSH authorized keys" "MEDIUM" "$hash" "$metadata" "user=$username|keys=$key_count"
+                        add_finding "SSH" "AuthorizedKeys" "ssh_authorized_keys" "$ssh_dir/authorized_keys" "User $username has $key_count SSH authorized keys" "MEDIUM" "$hash" "$metadata" "user=$username|keys=$key_count" "SSH authorized_keys: $key_count keys allow passwordless login"
                     fi
 
                     # Check for suspicious SSH config
@@ -1507,11 +1575,13 @@ check_ssh() {
                         local suspicious_config=$(grep -iE "(ProxyCommand|LocalForward|RemoteForward|DynamicForward)" "$ssh_dir/config" 2>/dev/null || echo "")
 
                         local confidence="LOW"
+                        local detection_reason="SSH config exists, no tunneling/proxy commands"
                         if [[ -n "$suspicious_config" ]]; then
                             confidence="MEDIUM"
+                            detection_reason="SSH config contains tunneling/proxy directives: ProxyCommand, LocalForward, etc."
                         fi
 
-                        add_finding "SSH" "Config" "ssh_config" "$ssh_dir/config" "User SSH config for $username" "$confidence" "$hash" "$metadata" "user=$username"
+                        add_finding "SSH" "Config" "ssh_config" "$ssh_dir/config" "User SSH config for $username" "$confidence" "$hash" "$metadata" "user=$username" "$detection_reason"
                     fi
                 fi
             fi
@@ -1523,7 +1593,7 @@ check_ssh() {
             local metadata=$(get_file_metadata "$HOME/.ssh/authorized_keys")
             local key_count=$(grep -c "^ssh-" "$HOME/.ssh/authorized_keys" 2>/dev/null || echo "0")
 
-            add_finding "SSH" "AuthorizedKeys" "ssh_authorized_keys" "$HOME/.ssh/authorized_keys" "Current user has $key_count SSH authorized keys" "MEDIUM" "$hash" "$metadata" "keys=$key_count"
+            add_finding "SSH" "AuthorizedKeys" "ssh_authorized_keys" "$HOME/.ssh/authorized_keys" "Current user has $key_count SSH authorized keys" "MEDIUM" "$hash" "$metadata" "keys=$key_count" "SSH authorized_keys: $key_count keys allow passwordless login"
         fi
     fi
 
@@ -1534,11 +1604,13 @@ check_ssh() {
         local suspicious_sshd=$(grep -iE "(PermitRootLogin yes|PasswordAuthentication yes|PermitEmptyPasswords yes|AuthorizedKeysFile)" /etc/ssh/sshd_config 2>/dev/null | grep -v "^#" || echo "")
 
         local confidence="LOW"
+        local detection_reason="SSHD config present, standard configuration"
         if echo "$suspicious_sshd" | grep -qiE "(PermitRootLogin yes|PermitEmptyPasswords yes)"; then
             confidence="MEDIUM"
+            detection_reason="Weak SSHD settings: PermitRootLogin=yes or PermitEmptyPasswords=yes"
         fi
 
-        add_finding "SSH" "SystemConfig" "sshd_config" "/etc/ssh/sshd_config" "SSH daemon configuration" "$confidence" "$hash" "$metadata" ""
+        add_finding "SSH" "SystemConfig" "sshd_config" "/etc/ssh/sshd_config" "SSH daemon configuration" "$confidence" "$hash" "$metadata" "" "$detection_reason"
     fi
 }
 
@@ -1561,12 +1633,14 @@ check_init_scripts() {
                 local content=$(grep -Ev "^#|^$" "$init_path" 2>/dev/null | head -20 || echo "")
 
                 local confidence="MEDIUM"
+                local detection_reason="rc.local/init script exists, runs at boot"
                 if echo "$content" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm)"; then
                     confidence="HIGH"
+                    detection_reason="Suspicious keywords in init script: curl/wget/nc/tmp paths detected"
                     log_finding "Suspicious init script: $init_path"
                 fi
 
-                add_finding "Init" "Script" "init_script" "$init_path" "Init script: $(basename "$init_path")" "$confidence" "$hash" "$metadata" ""
+                add_finding "Init" "Script" "init_script" "$init_path" "Init script: $(basename "$init_path")" "$confidence" "$hash" "$metadata" "" "$detection_reason"
 
             elif [[ -d "$init_path" ]]; then
                 while IFS= read -r -d '' init_file; do
@@ -1583,12 +1657,14 @@ check_init_scripts() {
                     local content=$(grep -Ev "^#|^$" "$init_file" 2>/dev/null | head -10 || echo "")
 
                     local confidence="LOW"
+                    local detection_reason="SysV init script, no suspicious patterns"
                     if echo "$content" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm)"; then
                         confidence="HIGH"
+                        detection_reason="Suspicious keywords in init script: curl/wget/nc/tmp paths detected"
                         log_finding "Suspicious init script: $init_file"
                     fi
 
-                    add_finding "Init" "Script" "init_script" "$init_file" "Init script: $(basename "$init_file")" "$confidence" "$hash" "$metadata" "dir=$(dirname "$init_file")"
+                    add_finding "Init" "Script" "init_script" "$init_file" "Init script: $(basename "$init_file")" "$confidence" "$hash" "$metadata" "dir=$(dirname "$init_file")" "$detection_reason"
 
                 done < <(find "$init_path" -maxdepth 1 -type f -print0 2>/dev/null)
             fi
@@ -1616,9 +1692,9 @@ check_kernel_and_preload() {
 
                 if [[ -n "$content" ]] && [[ "$content" != "" ]]; then
                     log_finding "LD_PRELOAD configuration found: $preload_file"
-                    add_finding "Preload" "LDPreload" "ld_preload" "$preload_file" "LD_PRELOAD config with content" "HIGH" "$hash" "$metadata" "content=$content"
+                    add_finding "Preload" "LDPreload" "ld_preload" "$preload_file" "LD_PRELOAD config with content" "HIGH" "$hash" "$metadata" "content=$content" "LD_PRELOAD file contains libraries: potential library hijacking"
                 else
-                    add_finding "Preload" "LDPreload" "ld_preload" "$preload_file" "LD_PRELOAD config (empty)" "LOW" "$hash" "$metadata" ""
+                    add_finding "Preload" "LDPreload" "ld_preload" "$preload_file" "LD_PRELOAD config (empty)" "LOW" "$hash" "$metadata" "" "LD_PRELOAD file exists but empty"
                 fi
 
             elif [[ -d "$preload_file" ]]; then
@@ -1626,7 +1702,7 @@ check_kernel_and_preload() {
                     local hash=$(get_file_hash "$conf_file")
                     local metadata=$(get_file_metadata "$conf_file")
 
-                    add_finding "Preload" "LDConfig" "ld_config" "$conf_file" "LD configuration: $(basename "$conf_file")" "LOW" "$hash" "$metadata" ""
+                    add_finding "Preload" "LDConfig" "ld_config" "$conf_file" "LD configuration: $(basename "$conf_file")" "LOW" "$hash" "$metadata" "" "LD library path configuration file"
                 done < <(find "$preload_file" -type f -print0 2>/dev/null)
             fi
         fi
@@ -1650,7 +1726,7 @@ check_kernel_and_preload() {
                 metadata=$(get_file_metadata "$module_path")
             fi
 
-            add_finding "Kernel" "Module" "kernel_module" "$module_path" "Loaded module: $module_name (size: $module_size, used: $module_used)" "LOW" "$hash" "$metadata" "module=$module_name"
+            add_finding "Kernel" "Module" "kernel_module" "$module_path" "Loaded module: $module_name (size: $module_size, used: $module_used)" "LOW" "$hash" "$metadata" "module=$module_name" "Kernel module currently loaded in memory"
         done < <(lsmod | tail -n +2)
     fi
 
@@ -1666,14 +1742,14 @@ check_kernel_and_preload() {
                 local hash=$(get_file_hash "$mod_config")
                 local metadata=$(get_file_metadata "$mod_config")
 
-                add_finding "Kernel" "ModuleConfig" "module_config" "$mod_config" "Kernel module auto-load config" "MEDIUM" "$hash" "$metadata" ""
+                add_finding "Kernel" "ModuleConfig" "module_config" "$mod_config" "Kernel module auto-load config" "MEDIUM" "$hash" "$metadata" "" "Module auto-load config: modules loaded at boot"
 
             elif [[ -d "$mod_config" ]]; then
                 while IFS= read -r -d '' conf_file; do
                     local hash=$(get_file_hash "$conf_file")
                     local metadata=$(get_file_metadata "$conf_file")
 
-                    add_finding "Kernel" "ModuleConfig" "module_config" "$conf_file" "Module config: $(basename "$conf_file")" "MEDIUM" "$hash" "$metadata" ""
+                    add_finding "Kernel" "ModuleConfig" "module_config" "$conf_file" "Module config: $(basename "$conf_file")" "MEDIUM" "$hash" "$metadata" "" "Module auto-load config: modules loaded at boot"
                 done < <(find "$mod_config" -type f -print0 2>/dev/null)
             fi
         fi
@@ -1698,12 +1774,14 @@ check_additional_persistence() {
                 local exec_line=$(grep "^Exec=" "$desktop_file" 2>/dev/null | cut -d'=' -f2- || echo "")
 
                 local confidence="LOW"
+                local detection_reason="XDG autostart entry, runs at user login"
                 if echo "$exec_line" | grep -qiE "(curl|wget|nc|netcat|/tmp|/dev/shm|bash -c|sh -c)"; then
                     confidence="HIGH"
+                    detection_reason="Suspicious Exec command: curl/wget/nc/tmp/shell detected"
                     log_finding "Suspicious XDG autostart: $desktop_file"
                 fi
 
-                add_finding "Autostart" "XDG" "xdg_autostart" "$desktop_file" "XDG autostart: $(basename "$desktop_file") | Exec: $exec_line" "$confidence" "$hash" "$metadata" ""
+                add_finding "Autostart" "XDG" "xdg_autostart" "$desktop_file" "XDG autostart: $(basename "$desktop_file") | Exec: $exec_line" "$confidence" "$hash" "$metadata" "" "$detection_reason"
             done < <(find "$autostart_dir" -type f -name "*.desktop" -print0 2>/dev/null)
         fi
     done
@@ -1715,12 +1793,14 @@ check_additional_persistence() {
         local suspicious_env=$(grep -iE "(LD_PRELOAD|LD_LIBRARY_PATH)" /etc/environment 2>/dev/null || echo "")
 
         local confidence="LOW"
+        local detection_reason="System environment file, no library hijacking variables"
         if [[ -n "$suspicious_env" ]]; then
             confidence="HIGH"
+            detection_reason="LD_PRELOAD or LD_LIBRARY_PATH set: potential library hijacking"
             log_finding "Suspicious environment variables in /etc/environment"
         fi
 
-        add_finding "Environment" "System" "environment_file" "/etc/environment" "System environment file" "$confidence" "$hash" "$metadata" ""
+        add_finding "Environment" "System" "environment_file" "/etc/environment" "System environment file" "$confidence" "$hash" "$metadata" "" "$detection_reason"
     fi
 
     # Check sudoers for persistence
@@ -1729,7 +1809,7 @@ check_additional_persistence() {
             local hash=$(get_file_hash "/etc/sudoers")
             local metadata=$(get_file_metadata "/etc/sudoers")
 
-            add_finding "Privilege" "Sudoers" "sudoers_file" "/etc/sudoers" "Sudoers configuration" "LOW" "$hash" "$metadata" ""
+            add_finding "Privilege" "Sudoers" "sudoers_file" "/etc/sudoers" "Sudoers configuration" "LOW" "$hash" "$metadata" "" "Main sudoers file, controls sudo access"
         fi
 
         if [[ -d "/etc/sudoers.d" ]]; then
@@ -1737,7 +1817,7 @@ check_additional_persistence() {
                 local hash=$(get_file_hash "$sudoers_file")
                 local metadata=$(get_file_metadata "$sudoers_file")
 
-                add_finding "Privilege" "Sudoers" "sudoers_drop_in" "$sudoers_file" "Sudoers drop-in: $(basename "$sudoers_file")" "MEDIUM" "$hash" "$metadata" ""
+                add_finding "Privilege" "Sudoers" "sudoers_drop_in" "$sudoers_file" "Sudoers drop-in: $(basename "$sudoers_file")" "MEDIUM" "$hash" "$metadata" "" "Sudoers drop-in file: can grant elevated privileges"
             done < <(find /etc/sudoers.d -type f -print0 2>/dev/null)
         fi
     fi
@@ -1750,11 +1830,13 @@ check_additional_persistence() {
             local suspicious_pam=$(grep -v "^#" "$pam_file" 2>/dev/null | grep -E "pam_.*\.so" | grep -vE "(pam_unix|pam_systemd|pam_permit|pam_deny|pam_env|pam_limits)" || echo "")
 
             local confidence="LOW"
+            local detection_reason="Standard PAM config, common modules only"
             if [[ -n "$suspicious_pam" ]]; then
                 confidence="MEDIUM"
+                detection_reason="Non-standard PAM modules detected: review for backdoors"
             fi
 
-            add_finding "PAM" "Config" "pam_config" "$pam_file" "PAM config: $(basename "$pam_file")" "$confidence" "$hash" "$metadata" ""
+            add_finding "PAM" "Config" "pam_config" "$pam_file" "PAM config: $(basename "$pam_file")" "$confidence" "$hash" "$metadata" "" "$detection_reason"
         done < <(find /etc/pam.d -type f -print0 2>/dev/null)
     fi
 
@@ -1771,12 +1853,14 @@ check_additional_persistence() {
                 local metadata=$(get_file_metadata "$motd_script")
 
                 local confidence="LOW"
+                local detection_reason="MOTD script, runs at login"
                 if grep -qiE "(curl|wget|nc|netcat|base64)" "$motd_script" 2>/dev/null; then
                     confidence="HIGH"
+                    detection_reason="Suspicious keywords in MOTD: curl/wget/nc/base64 detected"
                     log_finding "Suspicious MOTD script: $motd_script"
                 fi
 
-                add_finding "MOTD" "Script" "motd_script" "$motd_script" "MOTD script: $(basename "$motd_script")" "$confidence" "$hash" "$metadata" ""
+                add_finding "MOTD" "Script" "motd_script" "$motd_script" "MOTD script: $(basename "$motd_script")" "$confidence" "$hash" "$metadata" "" "$detection_reason"
             done < <(find "$motd_dir" -type f -print0 2>/dev/null)
         fi
     done
@@ -1802,12 +1886,14 @@ check_common_backdoors() {
                 local content=$(cat "$config_dir" 2>/dev/null || echo "")
 
                 local confidence="LOW"
+                local detection_reason="Package manager config, no suspicious patterns"
                 if check_suspicious_patterns "$content"; then
                     confidence="HIGH"
+                    detection_reason="Suspicious patterns in package manager config: potential APT/YUM hook abuse"
                     log_finding "Suspicious package manager config: $config_dir"
                 fi
 
-                add_finding "PackageManager" "Config" "pkg_config" "$config_dir" "Package manager configuration: $(basename "$config_dir")" "$confidence" "$hash" "$metadata" ""
+                add_finding "PackageManager" "Config" "pkg_config" "$config_dir" "Package manager configuration: $(basename "$config_dir")" "$confidence" "$hash" "$metadata" "" "$detection_reason"
 
             elif [[ -d "$config_dir" ]]; then
                 while IFS= read -r -d '' config_file; do
@@ -1816,12 +1902,14 @@ check_common_backdoors() {
                     local content=$(head -50 "$config_file" 2>/dev/null || echo "")
 
                     local confidence="LOW"
+                    local detection_reason="Package manager config file, no suspicious patterns"
                     if check_suspicious_patterns "$content"; then
                         confidence="HIGH"
+                        detection_reason="Suspicious patterns in package manager config: potential hook abuse"
                         log_finding "Suspicious package manager config: $config_file"
                     fi
 
-                    add_finding "PackageManager" "Config" "pkg_config" "$config_file" "Package manager config: $(basename "$config_file")" "$confidence" "$hash" "$metadata" ""
+                    add_finding "PackageManager" "Config" "pkg_config" "$config_file" "Package manager config: $(basename "$config_file")" "$confidence" "$hash" "$metadata" "" "$detection_reason"
                 done < <(find "$config_dir" -type f -print0 2>/dev/null)
             fi
         fi
@@ -1838,7 +1926,7 @@ check_common_backdoors() {
             local hash=$(get_file_hash "$at_file")
             local metadata=$(get_file_metadata "$at_file")
 
-            add_finding "Scheduled" "AtAccess" "at_access" "$at_file" "At access control: $(basename "$at_file")" "MEDIUM" "$hash" "$metadata" ""
+            add_finding "Scheduled" "AtAccess" "at_access" "$at_file" "At access control: $(basename "$at_file")" "MEDIUM" "$hash" "$metadata" "" "At job access control file: controls who can schedule at jobs"
         fi
     done
 
@@ -1849,12 +1937,14 @@ check_common_backdoors() {
         local content=$(cat "/etc/doas.conf" 2>/dev/null || echo "")
 
         local confidence="MEDIUM"
+        local detection_reason="Doas config exists, review privilege escalation rules"
         if echo "$content" | grep -qiE "(permit nopass|persist)"; then
             confidence="HIGH"
+            detection_reason="Permissive doas rules: nopass or persist allows passwordless escalation"
             log_finding "Potentially permissive doas configuration"
         fi
 
-        add_finding "Privilege" "Doas" "doas_config" "/etc/doas.conf" "Doas privilege escalation config" "$confidence" "$hash" "$metadata" ""
+        add_finding "Privilege" "Doas" "doas_config" "/etc/doas.conf" "Doas privilege escalation config" "$confidence" "$hash" "$metadata" "" "$detection_reason"
     fi
 
     # Check for user git configs (can contain credential helpers or hooks)
@@ -1868,15 +1958,18 @@ check_common_backdoors() {
                     local content=$(cat "$gitconfig" 2>/dev/null || echo "")
 
                     local confidence="LOW"
+                    local detection_reason="Git config exists, no suspicious settings"
                     if echo "$content" | grep -qiE "(credential.*helper|core.*pager|core.*editor.*sh)"; then
                         confidence="MEDIUM"
+                        detection_reason="Git config has credential helper or custom pager/editor: review for abuse"
                     fi
                     if check_suspicious_patterns "$content"; then
                         confidence="HIGH"
+                        detection_reason="Suspicious patterns in git config: potential code execution via hooks"
                         log_finding "Suspicious git config for user $username: $gitconfig"
                     fi
 
-                    add_finding "GitConfig" "User" "git_config" "$gitconfig" "User git config for $username" "$confidence" "$hash" "$metadata" "user=$username"
+                    add_finding "GitConfig" "User" "git_config" "$gitconfig" "User git config for $username" "$confidence" "$hash" "$metadata" "user=$username" "$detection_reason"
                 fi
             fi
         done < /etc/passwd
@@ -1885,7 +1978,7 @@ check_common_backdoors() {
             local hash=$(get_file_hash "$HOME/.gitconfig")
             local metadata=$(get_file_metadata "$HOME/.gitconfig")
 
-            add_finding "GitConfig" "User" "git_config" "$HOME/.gitconfig" "Current user git config" "LOW" "$hash" "$metadata" "user=$(whoami)"
+            add_finding "GitConfig" "User" "git_config" "$HOME/.gitconfig" "Current user git config" "LOW" "$hash" "$metadata" "user=$(whoami)" "Git config exists, no suspicious patterns detected"
         fi
     fi
 
@@ -1919,19 +2012,22 @@ check_common_backdoors() {
                 local days_old=$(( (current_time - mod_time) / 86400 ))
 
                 local confidence="LOW"
+                local detection_reason=""
                 if [[ $days_old -lt 30 ]]; then
                     confidence="MEDIUM"
+                    detection_reason="Recently modified web file (${days_old} days old)"
 
                     # Check for webshell patterns
                     local content=$(head -100 "$web_file" 2>/dev/null || echo "")
                     if echo "$content" | grep -qiE "(eval|base64_decode|system\(|exec\(|shell_exec|passthru|proc_open|popen)"; then
                         confidence="HIGH"
+                        detection_reason="Webshell indicators: eval/system/exec/shell_exec functions + recently modified (${days_old} days)"
                         log_finding "Potential webshell detected: $web_file (modified ${days_old} days ago)"
                     fi
                 fi
 
                 if [[ $confidence != "LOW" ]]; then
-                    add_finding "WebShell" "Suspicious" "web_file" "$web_file" "Recently modified web file in $web_dir (${days_old} days old)" "$confidence" "$hash" "$metadata" "days_old=$days_old"
+                    add_finding "WebShell" "Suspicious" "web_file" "$web_file" "Recently modified web file in $web_dir (${days_old} days old)" "$confidence" "$hash" "$metadata" "days_old=$days_old" "$detection_reason"
                 fi
             done < <(find "$web_dir" -type f \( -name "*.php" -o -name "*.asp" -o -name "*.aspx" -o -name "*.jsp" \) -print0 2>/dev/null)
         fi
