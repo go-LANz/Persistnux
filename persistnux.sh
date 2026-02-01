@@ -32,6 +32,9 @@ FINDINGS_COUNT=0
 FILTER_MODE="${FILTER_MODE:-suspicious_only}"
 MIN_CONFIDENCE="${MIN_CONFIDENCE:-}"
 
+# Debug mode: set DEBUG=1 to trace is_command_safe() decisions
+DEBUG="${DEBUG:-0}"
+
 # Check if running as root
 EUID_CHECK=$(id -u)
 
@@ -128,6 +131,8 @@ declare -a KNOWN_GOOD_EXECUTABLE_PATHS=(
     "^/lib/"
     "^/lib/systemd/"
     "^/usr/lib/systemd/"
+    "^/usr/libexec/"
+    "^/libexec/"
 )
 
 # Known interpreter patterns (regex-based for version flexibility)
@@ -779,32 +784,41 @@ is_command_safe() {
     # This check ALWAYS takes precedence - even package-managed files with dangerous patterns are flagged
     # Performance: Use combined pattern (single grep instead of 17 individual calls)
     if echo "$command" | grep -qiE "$COMBINED_NEVER_WHITELIST"; then
+        [[ $DEBUG -eq 1 ]] && echo "[DEBUG] is_command_safe: NEVER_WHITELIST match for: $command" >&2
         return 1  # DANGEROUS - never whitelist
     fi
 
     # Extract executable for subsequent checks
     local executable=$(get_executable_from_command "$command")
+    [[ $DEBUG -eq 1 ]] && echo "[DEBUG] is_command_safe: executable='$executable' from command='$command'" >&2
 
     # Second check: Path-based validation
     # If the executable path is in a known-good system location AND is package-managed, it's safe
     for path_pattern in "${KNOWN_GOOD_EXECUTABLE_PATHS[@]}"; do
         if [[ -n "$executable" ]] && [[ "$executable" =~ $path_pattern ]]; then
+            [[ $DEBUG -eq 1 ]] && echo "[DEBUG] is_command_safe: path matches '$path_pattern'" >&2
             # Path matches known-good location (e.g., /usr/bin/, /lib/systemd/)
             # Verify the binary is package-managed (not a rogue binary placed in system dir)
             if [[ -f "$executable" ]]; then
-                local pkg_status=$(is_package_managed "$executable")
+                local pkg_status
+                pkg_status=$(is_package_managed "$executable")
                 local pkg_return=$?
+                [[ $DEBUG -eq 1 ]] && echo "[DEBUG] is_command_safe: is_package_managed returned '$pkg_status' (code=$pkg_return)" >&2
 
                 if [[ $pkg_return -eq 0 ]]; then
+                    [[ $DEBUG -eq 1 ]] && echo "[DEBUG] is_command_safe: SAFE - package-managed in standard path" >&2
                     return 0  # Safe - standard path AND package-managed
                 elif [[ $pkg_return -eq 2 ]]; then
+                    [[ $DEBUG -eq 1 ]] && echo "[DEBUG] is_command_safe: DANGEROUS - modified package" >&2
                     return 1  # DANGEROUS - modified package file
                 fi
+                [[ $DEBUG -eq 1 ]] && echo "[DEBUG] is_command_safe: unmanaged in standard path, continuing..." >&2
                 # If unmanaged binary in system path, fall through (suspicious)
             else
                 # Binary path looks legitimate but file doesn't exist
                 # This could indicate a broken service or (less common) offline analysis
                 # Trust the path since dangerous patterns were already checked above
+                [[ $DEBUG -eq 1 ]] && echo "[DEBUG] is_command_safe: file doesn't exist, trusting path" >&2
                 return 0
             fi
         fi
@@ -813,22 +827,27 @@ is_command_safe() {
     # Third check: Does it match known-good command patterns?
     # Performance: Use combined pattern (single grep instead of 9 individual calls)
     if echo "$command" | grep -qE "$COMBINED_GOOD_COMMAND"; then
+        [[ $DEBUG -eq 1 ]] && echo "[DEBUG] is_command_safe: SAFE - matches good command pattern" >&2
         return 0  # Safe - benign command pattern
     fi
 
     # Fourth check: Is the executable itself package-managed (even if not in standard path)?
     # Example: /opt/vendor/bin/tool that IS package-managed
     if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
-        local pkg_status=$(is_package_managed "$executable")
+        local pkg_status
+        pkg_status=$(is_package_managed "$executable")
         local pkg_return=$?
+        [[ $DEBUG -eq 1 ]] && echo "[DEBUG] is_command_safe: fourth check - is_package_managed returned '$pkg_status' (code=$pkg_return)" >&2
 
         if [[ $pkg_return -eq 0 ]]; then
+            [[ $DEBUG -eq 1 ]] && echo "[DEBUG] is_command_safe: SAFE - package-managed (non-standard path)" >&2
             return 0  # Safe - package-managed binary
         elif [[ $pkg_return -eq 2 ]]; then
             return 1  # DANGEROUS - modified package file
         fi
     fi
 
+    [[ $DEBUG -eq 1 ]] && echo "[DEBUG] is_command_safe: UNKNOWN - returning 1" >&2
     return 1  # Unknown/suspicious command
 }
 
