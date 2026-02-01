@@ -35,6 +35,15 @@ MIN_CONFIDENCE="${MIN_CONFIDENCE:-}"
 # Check if running as root
 EUID_CHECK=$(id -u)
 
+# Performance: Cache package manager availability (checked once at startup)
+HAS_DPKG=0
+HAS_RPM=0
+command -v dpkg &>/dev/null && HAS_DPKG=1
+command -v rpm &>/dev/null && HAS_RPM=1
+
+# Performance: Cache for package management queries (avoid repeated dpkg -S calls)
+declare -A PACKAGE_CACHE
+
 ################################################################################
 # Suspicious Pattern Definitions
 ################################################################################
@@ -92,6 +101,18 @@ declare -a SUSPICIOUS_FILES=(
     "authorized_keys"
 )
 
+# Performance: Pre-compiled combined regex patterns (single grep instead of loop)
+# Join array elements with | to create alternation pattern
+join_patterns() {
+    local IFS='|'
+    echo "$*"
+}
+COMBINED_NETWORK_PATTERN=$(join_patterns "${SUSPICIOUS_NETWORK_PATTERNS[@]}")
+COMBINED_COMMAND_PATTERN=$(join_patterns "${SUSPICIOUS_COMMANDS[@]}")
+COMBINED_LOCATION_PATTERN=$(join_patterns "${SUSPICIOUS_LOCATIONS[@]}")
+COMBINED_FILE_PATTERN=$(join_patterns "${SUSPICIOUS_FILES[@]}")
+COMBINED_ALL_SUSPICIOUS="($COMBINED_NETWORK_PATTERN|$COMBINED_COMMAND_PATTERN|$COMBINED_LOCATION_PATTERN|$COMBINED_FILE_PATTERN)"
+
 ################################################################################
 # False Positive Reduction - Known-Good Executable Paths
 ################################################################################
@@ -147,6 +168,9 @@ declare -a KNOWN_GOOD_COMMAND_PATTERNS=(
     "^!"                           # systemd special prefix
 )
 
+# Performance: Combined KNOWN_GOOD_COMMAND pattern for single-pass check
+COMBINED_GOOD_COMMAND=$(join_patterns "${KNOWN_GOOD_COMMAND_PATTERNS[@]}")
+
 # Dangerous command patterns that should NEVER be whitelisted
 # These override any known-good path checks
 declare -a NEVER_WHITELIST_PATTERNS=(
@@ -169,46 +193,65 @@ declare -a NEVER_WHITELIST_PATTERNS=(
     "mknod.*backpipe"
 )
 
+# Performance: Combined NEVER_WHITELIST pattern for single-pass check
+COMBINED_NEVER_WHITELIST=$(join_patterns "${NEVER_WHITELIST_PATTERNS[@]}")
+
+# Performance: Combined script-specific suspicious patterns (used in analyze_script_content)
+# These are patterns that indicate malicious script behavior
+COMBINED_SCRIPT_PATTERNS=$(join_patterns \
+    'eval.*\$' \
+    'exec.*\$' \
+    '\$\(curl' \
+    '\$\(wget' \
+    'base64.*-d' \
+    'openssl.*enc.*-d' \
+    'mkfifo' \
+    'nc.*-l.*-p' \
+    'socat.*TCP' \
+    'python.*-c' \
+    'perl.*-e' \
+    'ruby.*-e' \
+    'awk.*system' \
+    '/proc/self/exe' \
+    'chmod.*\+x.*tmp' \
+    'chmod.*777' \
+)
+
 # Check if content matches suspicious patterns
+# Performance: Uses pre-compiled combined regex patterns (single grep instead of 39+ loops)
 check_suspicious_patterns() {
     local content="$1"
     local pattern_type="${2:-all}"  # all, network, command, location, file
 
-    # Network-based patterns
-    if [[ "$pattern_type" == "all" ]] || [[ "$pattern_type" == "network" ]]; then
-        for pattern in "${SUSPICIOUS_NETWORK_PATTERNS[@]}"; do
-            if echo "$content" | grep -qE "$pattern" 2>/dev/null; then
-                return 0  # Found suspicious pattern
+    # Use combined patterns for single grep call (massive performance improvement)
+    case "$pattern_type" in
+        "all")
+            # Single grep with all patterns combined
+            if echo "$content" | grep -qE "$COMBINED_ALL_SUSPICIOUS" 2>/dev/null; then
+                return 0
             fi
-        done
-    fi
-
-    # Command-based patterns
-    if [[ "$pattern_type" == "all" ]] || [[ "$pattern_type" == "command" ]]; then
-        for pattern in "${SUSPICIOUS_COMMANDS[@]}"; do
-            if echo "$content" | grep -qE "$pattern" 2>/dev/null; then
-                return 0  # Found suspicious pattern
+            ;;
+        "network")
+            if echo "$content" | grep -qE "$COMBINED_NETWORK_PATTERN" 2>/dev/null; then
+                return 0
             fi
-        done
-    fi
-
-    # Location-based patterns
-    if [[ "$pattern_type" == "all" ]] || [[ "$pattern_type" == "location" ]]; then
-        for pattern in "${SUSPICIOUS_LOCATIONS[@]}"; do
-            if echo "$content" | grep -qE "$pattern" 2>/dev/null; then
-                return 0  # Found suspicious pattern
+            ;;
+        "command")
+            if echo "$content" | grep -qE "$COMBINED_COMMAND_PATTERN" 2>/dev/null; then
+                return 0
             fi
-        done
-    fi
-
-    # File-based patterns
-    if [[ "$pattern_type" == "all" ]] || [[ "$pattern_type" == "file" ]]; then
-        for pattern in "${SUSPICIOUS_FILES[@]}"; do
-            if echo "$content" | grep -qE "$pattern" 2>/dev/null; then
-                return 0  # Found suspicious pattern
+            ;;
+        "location")
+            if echo "$content" | grep -qE "$COMBINED_LOCATION_PATTERN" 2>/dev/null; then
+                return 0
             fi
-        done
-    fi
+            ;;
+        "file")
+            if echo "$content" | grep -qE "$COMBINED_FILE_PATTERN" 2>/dev/null; then
+                return 0
+            fi
+            ;;
+    esac
 
     return 1  # No suspicious patterns found
 }
@@ -324,48 +367,66 @@ get_file_metadata() {
 is_package_managed() {
     local file="$1"
 
-    # Check dpkg (Debian/Ubuntu)
-    if command -v dpkg &> /dev/null; then
+    # Performance: Check cache first (avoid repeated dpkg -S / rpm -qf calls)
+    if [[ -n "${PACKAGE_CACHE[$file]+isset}" ]]; then
+        local cached="${PACKAGE_CACHE[$file]}"
+        echo "${cached%:*}"  # Return cached status string
+        return "${cached##*:}"  # Return cached exit code
+    fi
+
+    local result=""
+    local retcode=1
+
+    # Check dpkg (Debian/Ubuntu) - use cached availability check
+    if [[ $HAS_DPKG -eq 1 ]]; then
         if dpkg -S "$file" &>/dev/null; then
             local package=$(dpkg -S "$file" 2>/dev/null | cut -d':' -f1 | head -n1)
 
             # Verify file hasn't been tampered with
-            # dpkg --verify returns errors if file modified/missing
-            if command -v dpkg &> /dev/null; then
-                local verify_output=$(dpkg --verify "$package" 2>/dev/null | grep -F "$file" || true)
-                if [[ -n "$verify_output" ]]; then
-                    # File has been modified - flag as compromised
-                    echo "dpkg:$package:MODIFIED"
-                    return 2  # Special return code for modified package file
-                fi
+            local verify_output=$(dpkg --verify "$package" 2>/dev/null | grep -F "$file" || true)
+            if [[ -n "$verify_output" ]]; then
+                result="dpkg:$package:MODIFIED"
+                retcode=2
+            else
+                result="dpkg:$package"
+                retcode=0
             fi
 
-            echo "dpkg:$package"
-            return 0
+            # Cache the result
+            PACKAGE_CACHE[$file]="$result:$retcode"
+            echo "$result"
+            return $retcode
         fi
     fi
 
-    # Check rpm (RedHat/CentOS/Fedora)
-    if command -v rpm &> /dev/null; then
+    # Check rpm (RedHat/CentOS/Fedora) - use cached availability check
+    if [[ $HAS_RPM -eq 1 ]]; then
         if rpm -qf "$file" &>/dev/null; then
             local package=$(rpm -qf "$file" 2>/dev/null | head -n1)
 
             # Verify file integrity using rpm -V
             local verify_output=$(rpm -V "$package" 2>/dev/null | grep -F "$file" || true)
             if [[ -n "$verify_output" ]]; then
-                # File has been modified
-                echo "rpm:$package:MODIFIED"
-                return 2  # Special return code for modified package file
+                result="rpm:$package:MODIFIED"
+                retcode=2
+            else
+                result="rpm:$package"
+                retcode=0
             fi
 
-            echo "rpm:$package"
-            return 0
+            # Cache the result
+            PACKAGE_CACHE[$file]="$result:$retcode"
+            echo "$result"
+            return $retcode
         fi
     fi
 
-    # Not managed by package manager
-    echo "unmanaged"
-    return 1
+    # Not managed by package manager - cache this too
+    result="unmanaged"
+    retcode=1
+    PACKAGE_CACHE[$file]="$result:$retcode"
+    echo "$result"
+    return $retcode
 }
 
 # Extract the first executable path from a command
@@ -653,38 +714,15 @@ analyze_script_content() {
     # Read first 1000 lines of script (to avoid huge files)
     local script_content=$(head -n 1000 "$script_file" 2>/dev/null)
 
-    # Check for dangerous patterns in NEVER_WHITELIST_PATTERNS
-    for pattern in "${NEVER_WHITELIST_PATTERNS[@]}"; do
-        if echo "$script_content" | grep -qiE "$pattern"; then
-            return 0  # SUSPICIOUS - found dangerous pattern
-        fi
-    done
+    # Performance: Use combined pattern instead of loop (single grep for 17 patterns)
+    if echo "$script_content" | grep -qiE "$COMBINED_NEVER_WHITELIST"; then
+        return 0  # SUSPICIOUS - found dangerous pattern
+    fi
 
-    # Check for additional script-specific suspicious patterns
-    local suspicious_script_patterns=(
-        "eval.*\$"                    # eval with variables
-        "exec.*\$"                    # exec with variables
-        "\$\(curl"                    # Command substitution with curl
-        "\$\(wget"                    # Command substitution with wget
-        "base64.*-d"                  # Base64 decode (potential obfuscation)
-        "openssl.*enc.*-d"            # Encrypted payload decryption
-        "mkfifo"                      # Named pipes (common in reverse shells)
-        "nc.*-l.*-p"                  # Netcat listener
-        "socat.*TCP"                  # Socat TCP connections
-        "python.*-c"                  # Python one-liners
-        "perl.*-e"                    # Perl one-liners
-        "ruby.*-e"                    # Ruby one-liners
-        "awk.*system"                 # AWK system calls
-        "/proc/self/exe"              # Self-execution tricks
-        "chmod.*\+x.*tmp"             # Making temp files executable
-        "chmod.*777"                  # Overly permissive permissions
-    )
-
-    for pattern in "${suspicious_script_patterns[@]}"; do
-        if echo "$script_content" | grep -qiE "$pattern"; then
-            return 0  # SUSPICIOUS - found dangerous script pattern
-        fi
-    done
+    # Performance: Use combined script patterns (single grep for 16 patterns)
+    if echo "$script_content" | grep -qiE "$COMBINED_SCRIPT_PATTERNS"; then
+        return 0  # SUSPICIOUS - found dangerous script pattern
+    fi
 
     # Check for high-entropy strings (obfuscation detection)
     # Look for long strings/variables with suspiciously high entropy
@@ -739,11 +777,10 @@ is_command_safe() {
 
     # First check: Does it contain NEVER_WHITELIST patterns?
     # This check ALWAYS takes precedence - even package-managed files with dangerous patterns are flagged
-    for pattern in "${NEVER_WHITELIST_PATTERNS[@]}"; do
-        if echo "$command" | grep -qiE "$pattern"; then
-            return 1  # DANGEROUS - never whitelist
-        fi
-    done
+    # Performance: Use combined pattern (single grep instead of 17 individual calls)
+    if echo "$command" | grep -qiE "$COMBINED_NEVER_WHITELIST"; then
+        return 1  # DANGEROUS - never whitelist
+    fi
 
     # Extract executable for subsequent checks
     local executable=$(get_executable_from_command "$command")
@@ -778,11 +815,10 @@ is_command_safe() {
     done
 
     # Third check: Does it match known-good command patterns?
-    for pattern in "${KNOWN_GOOD_COMMAND_PATTERNS[@]}"; do
-        if echo "$command" | grep -qE "$pattern"; then
-            return 0  # Safe - benign command pattern
-        fi
-    done
+    # Performance: Use combined pattern (single grep instead of 9 individual calls)
+    if echo "$command" | grep -qE "$COMBINED_GOOD_COMMAND"; then
+        return 0  # Safe - benign command pattern
+    fi
 
     # Fourth check: Is the executable itself package-managed (even if not in standard path)?
     # Example: /opt/vendor/bin/tool that IS package-managed
