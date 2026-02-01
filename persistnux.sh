@@ -7,7 +7,9 @@
 # Version: 1.7.2
 ################################################################################
 
-set -eo pipefail
+# Note: Using set -o pipefail but NOT set -e, as many commands (grep, stat, etc.)
+# return non-zero exit codes in normal operation which would prematurely terminate the script
+set -o pipefail
 
 # Colors for output
 RED='\033[0;31m'
@@ -330,7 +332,7 @@ is_package_managed() {
             # Verify file hasn't been tampered with
             # dpkg --verify returns errors if file modified/missing
             if command -v dpkg &> /dev/null; then
-                local verify_output=$(dpkg --verify "$package" 2>/dev/null | grep -F "$file")
+                local verify_output=$(dpkg --verify "$package" 2>/dev/null | grep -F "$file" || true)
                 if [[ -n "$verify_output" ]]; then
                     # File has been modified - flag as compromised
                     echo "dpkg:$package:MODIFIED"
@@ -349,7 +351,7 @@ is_package_managed() {
             local package=$(rpm -qf "$file" 2>/dev/null | head -n1)
 
             # Verify file integrity using rpm -V
-            local verify_output=$(rpm -V "$package" 2>/dev/null | grep -F "$file")
+            local verify_output=$(rpm -V "$package" 2>/dev/null | grep -F "$file" || true)
             if [[ -n "$verify_output" ]]; then
                 # File has been modified
                 echo "rpm:$package:MODIFIED"
@@ -406,16 +408,62 @@ get_script_from_interpreter_command() {
     # Remove systemd prefixes
     command="${command#[@\-:+!]}"
 
-    # Parse command into array of arguments
-    local -a args
-    eval "args=($command)"
+    # Safe argument parsing without eval
+    # We'll manually tokenize respecting quotes
+    local -a args=()
+    local current_arg=""
+    local in_single_quote=0
+    local in_double_quote=0
+    local i=0
+    local len=${#command}
+    local char=""
 
-    # First arg is the interpreter
-    local interpreter="${args[0]}"
+    while [[ $i -lt $len ]]; do
+        char="${command:$i:1}"
+
+        if [[ $in_single_quote -eq 1 ]]; then
+            if [[ "$char" == "'" ]]; then
+                in_single_quote=0
+            else
+                current_arg+="$char"
+            fi
+        elif [[ $in_double_quote -eq 1 ]]; then
+            if [[ "$char" == '"' ]]; then
+                in_double_quote=0
+            else
+                current_arg+="$char"
+            fi
+        elif [[ "$char" == "'" ]]; then
+            in_single_quote=1
+        elif [[ "$char" == '"' ]]; then
+            in_double_quote=1
+        elif [[ "$char" == " " ]] || [[ "$char" == $'\t' ]]; then
+            if [[ -n "$current_arg" ]]; then
+                args+=("$current_arg")
+                current_arg=""
+            fi
+        else
+            current_arg+="$char"
+        fi
+
+        i=$((i + 1))
+    done
+
+    # Add last argument if present
+    if [[ -n "$current_arg" ]]; then
+        args+=("$current_arg")
+    fi
+
+    # Need at least interpreter + one more arg
+    if [[ ${#args[@]} -lt 2 ]]; then
+        echo ""
+        return 1
+    fi
 
     # Look through remaining arguments for the script file
+    local arg=""
     for ((i=1; i<${#args[@]}; i++)); do
-        local arg="${args[i]}"
+        arg="${args[i]}"
 
         # Special case: -c flag means inline code, not a file
         if [[ "$arg" == "-c" ]]; then
@@ -439,12 +487,6 @@ get_script_from_interpreter_command() {
         # This looks like a file path (not a flag)
         # Check if it's an absolute path or relative path
         if [[ "$arg" =~ ^/ ]] || [[ "$arg" =~ ^\./ ]] || [[ "$arg" =~ ^\.\. ]] || [[ -f "$arg" ]]; then
-            # Clean up quotes
-            arg="${arg#\"}"
-            arg="${arg#\'}"
-            arg="${arg%\"}"
-            arg="${arg%\'}"
-
             echo "$arg"
             return 0
         fi
@@ -1859,7 +1901,15 @@ check_common_backdoors() {
     for web_dir in "${web_dirs[@]}"; do
         if [[ -d "$web_dir" ]]; then
             # Look for recently modified PHP/ASP files (last 30 days)
+            # Limit to 100 files to avoid excessive processing
+            local web_file_count=0
             while IFS= read -r -d '' web_file; do
+                # Limit number of files processed
+                web_file_count=$((web_file_count + 1))
+                if [[ $web_file_count -gt 100 ]]; then
+                    break
+                fi
+
                 local hash=$(get_file_hash "$web_file")
                 local metadata=$(get_file_metadata "$web_file")
 
@@ -1883,7 +1933,7 @@ check_common_backdoors() {
                 if [[ $confidence != "LOW" ]]; then
                     add_finding "WebShell" "Suspicious" "web_file" "$web_file" "Recently modified web file in $web_dir (${days_old} days old)" "$confidence" "$hash" "$metadata" "days_old=$days_old"
                 fi
-            done < <(find "$web_dir" -type f \( -name "*.php" -o -name "*.asp" -o -name "*.aspx" -o -name "*.jsp" \) -print0 2>/dev/null | head -100)
+            done < <(find "$web_dir" -type f \( -name "*.php" -o -name "*.asp" -o -name "*.aspx" -o -name "*.jsp" \) -print0 2>/dev/null)
         fi
     done
 }
