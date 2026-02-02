@@ -1091,6 +1091,27 @@ check_systemd() {
 
                 local confidence="MEDIUM"
                 local detection_reason=""
+                local skip_deep_analysis=0
+
+                # OPTIMIZATION: Skip disabled services that are package-managed
+                # Disabled services are not active persistence threats
+                if [[ "$enabled_status" == "disabled" ]]; then
+                    local service_pkg=$(is_package_managed "$service_file")
+                    local service_pkg_return=$?
+                    if [[ $service_pkg_return -eq 0 ]]; then
+                        # Disabled + package-managed = skip entirely (not reported)
+                        continue
+                    elif [[ $service_pkg_return -eq 2 ]]; then
+                        # Disabled but MODIFIED - still report as critical
+                        confidence="CRITICAL"
+                        detection_reason="CRITICAL: Disabled service file modified from package version"
+                    else
+                        # Disabled + unmanaged = LOW priority, minimal analysis
+                        confidence="LOW"
+                        detection_reason="Disabled unmanaged service (low priority)"
+                        skip_deep_analysis=1
+                    fi
+                fi
 
                 # Check modification time (recently modified = more suspicious)
                 local mod_time=$(stat -c %Y "$service_file" 2>/dev/null || stat -f %m "$service_file" 2>/dev/null || echo "0")
@@ -1113,9 +1134,10 @@ check_systemd() {
                         log_finding "Suspicious systemd service (advanced patterns): $service_file"
                     # Second: Check if command is safe (downgrade confidence)
                     elif is_command_safe "$exec_start"; then
-                        # Safe system binary execution
+                        # Safe system binary execution - SKIP further analysis
                         confidence="LOW"
                         detection_reason="Safe: package-managed binary in standard location"
+                        skip_deep_analysis=1
                     # Third: Unknown command + recent modification = suspicious
                     elif [[ $days_old -lt 7 ]] && [[ "$enabled_status" == "enabled" ]]; then
                         confidence="HIGH"
@@ -1132,7 +1154,8 @@ check_systemd() {
                     # CRITICAL: Analyze the script argument, not the interpreter binary
                     executable=$(get_executable_from_command "$exec_start")
 
-                if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
+                # OPTIMIZATION: Skip deep analysis if already verified safe
+                if [[ $skip_deep_analysis -eq 0 ]] && [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
                     # Check if executable is an interpreter
                     if is_interpreter "$executable"; then
                         # First, verify the interpreter binary itself isn't compromised
