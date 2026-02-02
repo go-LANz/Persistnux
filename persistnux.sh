@@ -469,8 +469,10 @@ is_package_managed() {
 get_executable_from_command() {
     local command="$1"
 
-    # Remove systemd prefixes (@, -, :, +, !)
-    command="${command#[@\-:+!]}"
+    # Remove ALL systemd prefixes (@, -, :, +, !) - can be multiple like !!
+    while [[ "$command" =~ ^[@:+!\-] ]]; do
+        command="${command#?}"
+    done
 
     # Extract first word (the executable)
     local executable=$(echo "$command" | awk '{print $1}')
@@ -478,6 +480,15 @@ get_executable_from_command() {
     # Remove quotes if present
     executable="${executable//\"/}"
     executable="${executable//\'/}"
+
+    # If it's not an absolute path, try to resolve it using PATH
+    if [[ -n "$executable" ]] && [[ "$executable" != /* ]]; then
+        local resolved
+        resolved=$(command -v "$executable" 2>/dev/null) || true
+        if [[ -n "$resolved" ]]; then
+            executable="$resolved"
+        fi
+    fi
 
     echo "$executable"
 }
@@ -1156,6 +1167,12 @@ check_systemd() {
                                         # Common but unmanaged locations
                                         [[ "$confidence" == "LOW" ]] && confidence="MEDIUM"
                                     fi
+
+                                    # Default reason if no specific pattern found
+                                    if [[ -z "$finding_matched_pattern" ]]; then
+                                        finding_matched_pattern="unmanaged_script"
+                                        finding_matched_string="$script_to_analyze"
+                                    fi
                                 fi
                             else
                                 # Interpreter with no file argument - check for inline code
@@ -1164,8 +1181,11 @@ check_systemd() {
                                     finding_matched_pattern="inline_code"
                                     finding_matched_string="-c/-e flag"
                                     log_finding "Systemd service uses interpreter with inline code: $service_file"
+                                else
+                                    # Interactive shell or command without script
+                                    finding_matched_pattern="interpreter_interactive"
+                                    finding_matched_string="$executable"
                                 fi
-                                # No script to analyze - keep default MEDIUM confidence
                             fi
 
                         else
@@ -1232,6 +1252,12 @@ check_systemd() {
                                     finding_matched_string="${days_old} days old"
                                     log_finding "Recently created enabled service with unknown command: $service_file"
                                 fi
+
+                                # Default reason if no specific pattern found
+                                if [[ -z "$finding_matched_pattern" ]]; then
+                                    finding_matched_pattern="unmanaged_binary"
+                                    finding_matched_string="$executable"
+                                fi
                             fi
                         fi
 
@@ -1239,12 +1265,16 @@ check_systemd() {
                         # Executable doesn't exist or isn't a file
                         # Can't verify - keep default MEDIUM confidence
                         package_status="unmanaged"
+                        finding_matched_pattern="unresolved_executable"
+                        finding_matched_string="$executable"
                     fi
 
                 else
                     # No ExecStart found - can't verify anything
                     # Keep default MEDIUM confidence
                     package_status="no_execstart"
+                    finding_matched_pattern="no_execstart"
+                    finding_matched_string="service has no ExecStart"
                 fi
 
                 # Extract owner and permissions from metadata
