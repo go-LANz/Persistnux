@@ -1081,9 +1081,6 @@ check_systemd() {
                     exec_start=$(grep -E "^ExecStart=" "$service_file" 2>/dev/null | head -1 | cut -d'=' -f2- || echo "")
                 fi
 
-                # Note: We don't skip if ExecStart is empty - timers, sockets, and some services don't have it
-                # We still want to report these files for completeness
-
                 # Check if service is enabled
                 local enabled_status="disabled"
                 if systemctl is-enabled "$service_name" &>/dev/null; then
@@ -1096,40 +1093,10 @@ check_systemd() {
                 local package_status="unmanaged"
                 local skip_pattern_analysis=false
 
-                # Check modification time
+                # Check modification time of service file
                 local mod_time=$(stat -c %Y "$service_file" 2>/dev/null || stat -f %m "$service_file" 2>/dev/null || echo "0")
                 local current_time=$(date +%s)
                 local days_old=$(( (current_time - mod_time) / 86400 ))
-
-                # ═══════════════════════════════════════════════════════════════
-                # STEP 1: ALWAYS check the .service FILE itself first
-                # An unmanaged .service file is inherently interesting -
-                # legitimate services come from packages
-                # ═══════════════════════════════════════════════════════════════
-                # NOTE: We check the output string, not return code, because
-                # bash's `local var=$(cmd)` masks the exit code (always 0)
-                local svc_file_pkg_status
-                svc_file_pkg_status=$(is_package_managed "$service_file") || true
-                local svc_file_is_packaged=false
-
-                if [[ "$svc_file_pkg_status" == *":MODIFIED" ]]; then
-                    # .service file itself was MODIFIED - CRITICAL
-                    confidence="CRITICAL"
-                    finding_matched_pattern="modified_service_file"
-                    finding_matched_string="$service_file"
-                    package_status="$svc_file_pkg_status"
-                    log_finding "Systemd service FILE is modified package: $service_file"
-                elif [[ "$svc_file_pkg_status" == "unmanaged" ]]; then
-                    # .service file is UNMANAGED - this is interesting!
-                    # Could be attacker-created, custom service, or third-party software
-                    # Keep MEDIUM confidence minimum, analyze further
-                    package_status="unmanaged"
-                else
-                    # .service file is package-managed and verified
-                    package_status="$svc_file_pkg_status"
-                    svc_file_is_packaged=true
-                    # Can potentially skip deeper analysis if ExecStart binary is also verified
-                fi
 
                 # Only analyze ExecStart if it exists
                 local executable=""
@@ -1137,8 +1104,9 @@ check_systemd() {
 
                 if [[ -n "$exec_start" ]]; then
                     # ═══════════════════════════════════════════════════════════
-                    # STEP 2: Analyze the ExecStart command/binary
-                    # Only skip detailed analysis if BOTH service file AND binary are verified
+                    # FOCUS: Only check the ExecStart target (binary/script)
+                    # The .service file is just config - the forensic artifact
+                    # is what actually gets executed
                     # ═══════════════════════════════════════════════════════════
 
                     executable=$(get_executable_from_command "$exec_start")
@@ -1147,27 +1115,9 @@ check_systemd() {
 
                         # BRANCH 1: Is it an interpreter? (python, perl, bash, etc.)
                         if is_interpreter "$executable"; then
-                            # For interpreters, we MUST analyze the script, not the interpreter binary
-                            # The interpreter itself being package-managed doesn't matter - the script could be malicious
-
-                            local interp_pkg_status
-                            interp_pkg_status=$(is_package_managed "$executable") || true
-
-                            # Check if interpreter binary itself is compromised
-                            if [[ "$interp_pkg_status" == *":MODIFIED" ]]; then
-                                confidence="CRITICAL"
-                                finding_matched_pattern="modified_package"
-                                finding_matched_string="$executable"
-                                log_finding "Systemd service uses modified interpreter binary: $executable"
-                            elif [[ "$interp_pkg_status" == "unmanaged" ]] && [[ ! "$executable" =~ ^/(usr/bin|usr/local/bin|bin) ]]; then
-                                confidence="HIGH"
-                                finding_matched_pattern="unmanaged_interpreter"
-                                finding_matched_string="$executable"
-                                log_finding "Systemd service uses unmanaged interpreter from unusual location: $executable"
-                            fi
-
+                            # For interpreters, analyze the SCRIPT, not the interpreter binary
                             # Extract and analyze the SCRIPT (this is the key forensic artifact)
-                            script_to_analyze=$(get_script_from_interpreter_command "$exec_start")
+                            script_to_analyze=$(get_script_from_interpreter_command "$exec_start") || true
 
                             if [[ -n "$script_to_analyze" ]] && [[ -f "$script_to_analyze" ]]; then
                                 # Check script's package status
@@ -1181,17 +1131,10 @@ check_systemd() {
                                     finding_matched_pattern="modified_script"
                                     finding_matched_string="$script_to_analyze"
                                     log_finding "Interpreter script is modified package file: $script_to_analyze"
-                                elif [[ "$script_pkg_status" != "unmanaged" ]] && [[ "$svc_file_is_packaged" == true ]]; then
-                                    # BOTH .service file AND script are verified - LOW, skip analysis
+                                elif [[ "$script_pkg_status" != "unmanaged" ]]; then
+                                    # Script is package-managed and verified - LOW, skip analysis
                                     confidence="LOW"
                                     skip_pattern_analysis=true
-                                elif [[ "$script_pkg_status" != "unmanaged" ]] && [[ "$svc_file_is_packaged" == false ]]; then
-                                    # Script is verified but .service file is UNMANAGED
-                                    # Someone created a custom service to run a system script - interesting
-                                    confidence="MEDIUM"
-                                    finding_matched_pattern="unmanaged_service_file"
-                                    finding_matched_string="$service_file (runs verified script)"
-                                    log_finding "Unmanaged service running verified script: $service_file → $script_to_analyze"
                                 else
                                     # Script is UNMANAGED - analyze content
                                     if is_script "$script_to_analyze"; then
@@ -1222,12 +1165,12 @@ check_systemd() {
                                     finding_matched_string="-c/-e flag"
                                     log_finding "Systemd service uses interpreter with inline code: $service_file"
                                 fi
-                                package_status="$interp_pkg_status"
+                                # No script to analyze - keep default MEDIUM confidence
                             fi
 
                         else
                             # BRANCH 2: Not an interpreter - direct binary execution
-                            # Check package status - but only skip analysis if BOTH service AND binary verified
+                            # Only check the ExecStart target (binary), not the .service file
 
                             local exec_pkg_status
                             exec_pkg_status=$(is_package_managed "$executable") || true
@@ -1240,21 +1183,11 @@ check_systemd() {
                                 package_status="$exec_pkg_status"
                                 log_finding "Systemd service executes modified package file: $executable"
 
-                            elif [[ "$exec_pkg_status" != "unmanaged" ]] && [[ "$svc_file_is_packaged" == true ]]; then
-                                # BOTH .service file AND binary are package-managed and verified
-                                # This is a legitimate system service - LOW, skip analysis
+                            elif [[ "$exec_pkg_status" != "unmanaged" ]]; then
+                                # Binary is package-managed and verified - LOW, skip analysis
                                 confidence="LOW"
                                 skip_pattern_analysis=true
-                                # Keep the service file's package status (more relevant for reporting)
-
-                            elif [[ "$exec_pkg_status" != "unmanaged" ]] && [[ "$svc_file_is_packaged" == false ]]; then
-                                # Binary is verified, but .service file is UNMANAGED
-                                # This is suspicious - someone created a custom service pointing to a system binary
-                                # Example: /etc/systemd/system/evil.service → /usr/sbin/sshd
-                                confidence="MEDIUM"
-                                finding_matched_pattern="unmanaged_service_file"
-                                finding_matched_string="$service_file (runs verified binary)"
-                                log_finding "Unmanaged service file running verified binary: $service_file → $executable"
+                                package_status="$exec_pkg_status"
 
                             else
                                 # UNMANAGED binary - need pattern analysis
@@ -1304,19 +1237,14 @@ check_systemd() {
 
                     else
                         # Executable doesn't exist or isn't a file
-                        # Use the service file package status we already checked in STEP 1
-                        if [[ "$svc_file_is_packaged" == true ]]; then
-                            confidence="LOW"
-                        fi
-                        # If modified or unmanaged, keep the confidence already set in STEP 1
+                        # Can't verify - keep default MEDIUM confidence
+                        package_status="unmanaged"
                     fi
 
                 else
-                    # No ExecStart - use the service file package status from STEP 1
-                    if [[ "$svc_file_is_packaged" == true ]]; then
-                        confidence="LOW"
-                    fi
-                    # If modified/unmanaged, the confidence was already set in STEP 1
+                    # No ExecStart found - can't verify anything
+                    # Keep default MEDIUM confidence
+                    package_status="no_execstart"
                 fi
 
                 # Extract owner and permissions from metadata
@@ -1388,7 +1316,8 @@ check_cron() {
 
                     if [[ -n "$cron_executable" ]] && [[ -f "$cron_executable" ]]; then
                         if is_interpreter "$cron_executable"; then
-                            local cron_script=$(get_script_from_interpreter_command "$cron_command")
+                            local cron_script
+                            cron_script=$(get_script_from_interpreter_command "$cron_command") || true
                             if [[ -n "$cron_script" ]] && [[ -f "$cron_script" ]]; then
                                 if is_script "$cron_script"; then
                                     if analyze_script_content "$cron_script"; then
@@ -1446,7 +1375,8 @@ check_cron() {
 
                         if [[ -n "$cron_executable" ]] && [[ -f "$cron_executable" ]]; then
                             if is_interpreter "$cron_executable"; then
-                                local cron_script=$(get_script_from_interpreter_command "$cron_command")
+                                local cron_script
+                            cron_script=$(get_script_from_interpreter_command "$cron_command") || true
                                 if [[ -n "$cron_script" ]] && [[ -f "$cron_script" ]]; then
                                     if is_script "$cron_script"; then
                                         if analyze_script_content "$cron_script"; then
