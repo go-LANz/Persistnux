@@ -84,31 +84,29 @@ Detection Modules:
 
 ---
 
-## Module 1: Systemd Services Detection Tree
+## Module 1: Systemd Services Detection Tree (OPTIMIZED)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │              SYSTEMD SERVICE ANALYSIS (v1.8.0)                  │
 │         Only scans .service files (not .socket/.timer)          │
+│                                                                 │
+│  OPTIMIZATION: Package verification FIRST, skip analysis if OK │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ SCAN PATHS:                                                     │
-│   /etc/systemd/system                                           │
-│   /usr/lib/systemd/system                                       │
-│   /lib/systemd/system                                           │
-│   /run/systemd/system                                           │
-│   /etc/systemd/user                                             │
-│   ~/.config/systemd/user                                        │
+│   /etc/systemd/system     /usr/lib/systemd/system               │
+│   /lib/systemd/system     /run/systemd/system                   │
+│   /etc/systemd/user       ~/.config/systemd/user                │
 └─────────────────────────────────────────────────────────────────┘
                               │
                               ▼
               ┌───────────────────────────────┐
               │   For each .service file:     │
               │   Extract: ExecStart=<cmd>    │
-              │   Check: systemctl is-enabled │
-              │   Get: modification time      │
+              │   Get: enabled status, age    │
               └───────────────────────────────┘
                               │
                               ▼
@@ -118,155 +116,163 @@ Detection Modules:
                      │              │
                     YES            NO
                      │              │
-                     ▼              ▼
-         ┌─────────────────┐   ┌──────────────────┐
-         │ Analyze Command │   │ Check if service │
-         │                 │   │ file is pkg-mgd  │
-         └─────────────────┘   │ Confidence: MED  │
-                 │             └──────────────────┘
-                 ▼
+                     │              ▼
+                     │    ┌────────────────────────┐
+                     │    │ Check service file     │
+                     │    │ package status:        │
+                     │    │ • Verified → LOW       │
+                     │    │ • Modified → CRITICAL  │
+                     │    │ • Unmanaged → MEDIUM   │
+                     │    └────────────────────────┘
+                     │
+                     ▼
+         ┌──────────────────────────────────┐
+         │     Extract executable from       │
+         │     ExecStart command             │
+         └──────────────────────────────────┘
+                     │
+                     ▼
     ┌────────────────────────────────────────┐
-    │ STEP 1: Check Dangerous Patterns       │
-    │                                        │
-    │ Patterns checked:                      │
-    │   • curl.*| or wget.*|   (download+exec)│
-    │   • nc -e               (netcat shell) │
-    │   • /dev/tcp/ or /dev/udp/ (bash net) │
-    │   • bash -i or sh -i    (interactive)  │
-    │                                        │
-    │ Match? → HIGH confidence               │
-    │ Sets: matched_pattern, matched_string  │
+    │   Is executable an INTERPRETER?        │
+    │   (python, perl, ruby, bash, sh, etc.) │
     └────────────────────────────────────────┘
-                 │
-            No Match
-                 │
-                 ▼
+           │                        │
+          YES                       NO
+           │                        │
+           ▼                        ▼
+┌─────────────────────┐   ┌─────────────────────────────┐
+│  INTERPRETER PATH   │   │  DIRECT BINARY PATH         │
+│  (must analyze the  │   │  (can skip if verified)     │
+│  script, not the    │   │                             │
+│  interpreter)       │   │                             │
+└─────────────────────┘   └─────────────────────────────┘
+           │                        │
+           ▼                        ▼
+
+
+═══════════════════════════════════════════════════════════════════
+                    INTERPRETER PATH
+═══════════════════════════════════════════════════════════════════
+
     ┌────────────────────────────────────────┐
-    │ STEP 2: Check Suspicious Patterns      │
+    │ 1. Check interpreter binary itself     │
     │                                        │
-    │ Categories checked (in order):         │
-    │   1. NETWORK patterns (reverse shells) │
-    │   2. COMMAND patterns (obfuscation)    │
-    │   3. LOCATION patterns (/tmp, /dev/shm)│
-    │   4. FILE patterns (sensitive files)   │
-    │                                        │
-    │ Match? → HIGH confidence               │
-    │ Sets: matched_pattern, matched_string  │
-    │        matched_category                │
+    │ Is /usr/bin/python3 compromised?       │
+    │   • Modified package → CRITICAL        │
+    │   • Unmanaged from odd path → HIGH     │
     └────────────────────────────────────────┘
-                 │
-            No Match
-                 │
-                 ▼
+                     │
+                     ▼
     ┌────────────────────────────────────────┐
-    │ STEP 3: Check if Command is Safe       │
+    │ 2. Extract script path from args       │
     │                                        │
-    │ Safe if ALL conditions met:            │
-    │   • No NEVER_WHITELIST patterns        │
-    │   • Executable in known-good path      │
-    │   • Executable is package-managed      │
-    │   • Package file not modified          │
-    │                                        │
-    │ Safe? → LOW confidence                 │
+    │ ExecStart=/usr/bin/python3 /opt/app.py │
+    │                              ▲          │
+    │                              │          │
+    │               THIS is what we analyze  │
     └────────────────────────────────────────┘
-                 │
-              Not Safe
-                 │
-                 ▼
+                     │
+         ┌───────────┴───────────┐
+         │                       │
+    Script found            No script (inline -c)
+         │                       │
+         ▼                       ▼
+    ┌────────────────┐    ┌─────────────────┐
+    │ Check SCRIPT's │    │ Inline code     │
+    │ package status │    │ python -c "..." │
+    │ FIRST!         │    │ → HIGH          │
+    └────────────────┘    └─────────────────┘
+         │
+    ┌────┴────┬──────────────┐
+    │         │              │
+ Verified  Modified     Unmanaged
+    │         │              │
+    ▼         ▼              ▼
+┌──────┐  ┌────────┐  ┌──────────────────┐
+│ LOW  │  │CRITICAL│  │ Analyze content: │
+│ DONE │  │ DONE   │  │ • socket ops     │
+│ SKIP │  │        │  │ • base64 decode  │
+│ REST │  │        │  │ • high entropy   │
+└──────┘  └────────┘  │ • location check │
+                      │                  │
+                      │ Suspicious →HIGH │
+                      └──────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════
+                    DIRECT BINARY PATH
+═══════════════════════════════════════════════════════════════════
+
     ┌────────────────────────────────────────┐
-    │ STEP 4: Check Recent + Enabled         │
+    │ 1. Check package status FIRST          │
+    │    (This is the key optimization!)     │
     │                                        │
-    │ If:                                    │
-    │   • Modified < 7 days ago AND          │
-    │   • Service is enabled                 │
-    │                                        │
-    │ → HIGH confidence (suspicious timing)  │
+    │    dpkg -S /usr/sbin/sshd              │
+    │    dpkg --verify openssh-server        │
     └────────────────────────────────────────┘
-                 │
-               Else
-                 │
-                 ▼
-    ┌────────────────────────────────────────┐
-    │ STEP 5: Interpreter Detection          │
-    │                                        │
-    │ Is executable an interpreter?          │
-    │   python*, perl*, ruby*, bash, sh,     │
-    │   php*, node*, java, lua*, awk, etc.   │
-    │                                        │
-    │ YES → Extract script argument          │
-    │       Analyze script content           │
-    └────────────────────────────────────────┘
-                 │
-                 ▼
-    ┌────────────────────────────────────────┐
-    │ STEP 5a: Interpreter Binary Check      │
-    │                                        │
-    │ Is interpreter itself compromised?     │
-    │   • Modified package file → CRITICAL   │
-    │   • Unmanaged from unusual path → HIGH │
-    └────────────────────────────────────────┘
-                 │
-                 ▼
-    ┌────────────────────────────────────────┐
-    │ STEP 5b: Script Content Analysis       │
-    │                                        │
-    │ For script file, check:                │
-    │   • NEVER_WHITELIST patterns           │
-    │   • eval/exec with variables           │
-    │   • $(curl) or $(wget) substitution    │
-    │   • base64 decode, openssl decrypt     │
-    │   • mkfifo, nc listeners, socat        │
-    │   • High-entropy strings (obfuscation) │
-    │                                        │
-    │ Suspicious content? → HIGH confidence  │
-    └────────────────────────────────────────┘
-                 │
-                 ▼
-    ┌────────────────────────────────────────┐
-    │ STEP 5c: Inline Code Detection         │
-    │                                        │
-    │ Interpreter with -c flag?              │
-    │   python -c "code"                     │
-    │   perl -e "code"                       │
-    │                                        │
-    │ → HIGH confidence (inherently risky)   │
-    └────────────────────────────────────────┘
-                 │
-                 ▼
-    ┌────────────────────────────────────────┐
-    │ STEP 6: Script Location Check          │
-    │                                        │
-    │ Script in suspicious location?         │
-    │   • /tmp, /dev/shm, /var/tmp → HIGH    │
-    │   • /opt, /usr/local, /home → MEDIUM   │
-    │                                        │
-    │ Script is modified package? → CRITICAL │
-    └────────────────────────────────────────┘
-                 │
-                 ▼
-    ┌────────────────────────────────────────┐
-    │ STEP 7: Package Manager Adjustment     │
-    │                                        │
-    │ If executable is package-managed:      │
-    │   • HIGH → MEDIUM                      │
-    │   • MEDIUM → LOW                       │
-    │                                        │
-    │ If package file MODIFIED:              │
-    │   • Any → CRITICAL                     │
-    └────────────────────────────────────────┘
-                 │
-                 ▼
-    ┌────────────────────────────────────────┐
-    │ OUTPUT: Add Finding                    │
-    │                                        │
-    │ CSV/JSONL fields:                      │
-    │   • category: "Systemd Service"        │
-    │   • confidence: LOW/MED/HIGH/CRITICAL  │
-    │   • file_path: /path/to/file.service   │
-    │   • command: ExecStart value           │
-    │   • matched_pattern: regex that hit    │
-    │   • matched_string: actual match       │
-    └────────────────────────────────────────┘
+                     │
+    ┌────────────────┼────────────────┐
+    │                │                │
+ Verified        Modified        Unmanaged
+    │                │                │
+    ▼                ▼                ▼
+┌──────────┐   ┌──────────┐   ┌───────────────────┐
+│   LOW    │   │ CRITICAL │   │ Continue with     │
+│   DONE   │   │   DONE   │   │ full analysis...  │
+│          │   │          │   │                   │
+│ ★ SKIP   │   │          │   │                   │
+│ ALL      │   │          │   │                   │
+│ PATTERN  │   │          │   │                   │
+│ ANALYSIS │   │          │   │                   │
+└──────────┘   └──────────┘   └───────────────────┘
+                                      │
+                                      ▼
+                   ┌──────────────────────────────────┐
+                   │ 2. Location check               │
+                   │    /tmp, /dev/shm → HIGH        │
+                   └──────────────────────────────────┘
+                                      │
+                                      ▼
+                   ┌──────────────────────────────────┐
+                   │ 3. If script, analyze content   │
+                   │    Suspicious patterns → HIGH   │
+                   └──────────────────────────────────┘
+                                      │
+                                      ▼
+                   ┌──────────────────────────────────┐
+                   │ 4. Pattern match on ExecStart   │
+                   │    curl|bash, /dev/tcp → HIGH   │
+                   └──────────────────────────────────┘
+                                      │
+                                      ▼
+                   ┌──────────────────────────────────┐
+                   │ 5. Time-based check             │
+                   │    Recent + enabled → HIGH      │
+                   └──────────────────────────────────┘
+
+
+═══════════════════════════════════════════════════════════════════
+                    PERFORMANCE IMPACT
+═══════════════════════════════════════════════════════════════════
+
+BEFORE (old flow):
+  For EVERY service file:
+    1. grep dangerous patterns     ← subprocess
+    2. grep suspicious patterns    ← 4+ subprocess calls
+    3. check is_command_safe       ← package check here (late!)
+    4. more analysis...
+
+AFTER (optimized):
+  For EVERY service file:
+    1. Extract executable
+    2. Check package status        ← EARLY EXIT if verified
+       └─ Verified? → LOW, DONE    ← Skip all grep calls!
+
+  Typical system: ~200 services, ~180 are package-managed
+  BEFORE: 200 × (5+ grep calls) = 1000+ subprocesses
+  AFTER:  200 × (1 dpkg call) + 20 × (5 grep calls) = 300 calls
+
+  ≈ 70% reduction in subprocess spawning!
 ```
 
 ---
