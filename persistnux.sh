@@ -1093,8 +1093,10 @@ check_systemd() {
                 local confidence="MEDIUM"
                 local finding_matched_pattern=""
                 local finding_matched_string=""
+                local package_status="unmanaged"
+                local skip_pattern_analysis=false
 
-                # Check modification time (recently modified = more suspicious)
+                # Check modification time
                 local mod_time=$(stat -c %Y "$service_file" 2>/dev/null || stat -f %m "$service_file" 2>/dev/null || echo "0")
                 local current_time=$(date +%s)
                 local days_old=$(( (current_time - mod_time) / 86400 ))
@@ -1104,146 +1106,176 @@ check_systemd() {
                 local script_to_analyze=""
 
                 if [[ -n "$exec_start" ]]; then
-                    # First: Check for explicitly dangerous patterns (HIGH confidence)
-                    local dangerous_match=$(echo "$exec_start" | grep -oiE "(curl.*\||wget.*\||nc -e|/dev/tcp/|/dev/udp/|bash -i|sh -i)" | head -1)
-                    if [[ -n "$dangerous_match" ]]; then
-                        confidence="HIGH"
-                        finding_matched_pattern="dangerous_command"
-                        finding_matched_string="$dangerous_match"
-                        log_finding "Dangerous command in systemd service: $service_file"
-                    elif check_suspicious_patterns "$exec_start"; then
-                        confidence="HIGH"
-                        finding_matched_pattern="$MATCHED_PATTERN"
-                        finding_matched_string="$MATCHED_STRING"
-                        log_finding "Suspicious systemd service (pattern: $MATCHED_CATEGORY): $service_file [matched: $MATCHED_STRING]"
-                    # Second: Check if command is safe (downgrade confidence)
-                    elif is_command_safe "$exec_start"; then
-                        # Safe system binary execution
-                        confidence="LOW"
-                    # Third: Unknown command + recent modification = suspicious
-                    elif [[ $days_old -lt 7 ]] && [[ "$enabled_status" == "enabled" ]]; then
-                        confidence="HIGH"
-                        log_finding "Recently created enabled systemd service with unknown command: $service_file (${days_old} days old)"
-                    # Fourth: Unknown command but old and package-managed = probably safe
-                    else
-                        # Will be downgraded further if package-managed
-                        confidence="MEDIUM"
-                    fi
+                    # OPTIMIZED FLOW: Check package management FIRST to avoid unnecessary pattern analysis
+                    # Exception: Interpreters need script analysis regardless of package status
 
-                    # Fifth: Check if ExecStart uses an interpreter (python/perl/bash/etc.)
-                    # CRITICAL: Analyze the script argument, not the interpreter binary
                     executable=$(get_executable_from_command "$exec_start")
 
-                if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
-                    # Check if executable is an interpreter
-                    if is_interpreter "$executable"; then
-                        # First, verify the interpreter binary itself isn't compromised
-                        local interp_pkg_status=$(is_package_managed "$executable")
-                        local interp_pkg_return=$?
+                    if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
 
-                        if [[ $interp_pkg_return -eq 2 ]]; then
-                            # Interpreter binary itself was MODIFIED - CRITICAL
-                            confidence="CRITICAL"
-                            log_finding "Systemd service uses modified interpreter binary: $executable"
-                        elif [[ $interp_pkg_return -eq 1 ]]; then
-                            # Interpreter is unmanaged - very suspicious
-                            if [[ ! "$executable" =~ ^/(usr/bin|usr/local/bin|bin) ]]; then
+                        # BRANCH 1: Is it an interpreter? (python, perl, bash, etc.)
+                        if is_interpreter "$executable"; then
+                            # For interpreters, we MUST analyze the script, not the interpreter binary
+                            # The interpreter itself being package-managed doesn't matter - the script could be malicious
+
+                            local interp_pkg_status=$(is_package_managed "$executable")
+                            local interp_pkg_return=$?
+
+                            # Check if interpreter binary itself is compromised
+                            if [[ $interp_pkg_return -eq 2 ]]; then
+                                confidence="CRITICAL"
+                                finding_matched_pattern="modified_package"
+                                finding_matched_string="$executable"
+                                log_finding "Systemd service uses modified interpreter binary: $executable"
+                            elif [[ $interp_pkg_return -eq 1 ]] && [[ ! "$executable" =~ ^/(usr/bin|usr/local/bin|bin) ]]; then
                                 confidence="HIGH"
+                                finding_matched_pattern="unmanaged_interpreter"
+                                finding_matched_string="$executable"
                                 log_finding "Systemd service uses unmanaged interpreter from unusual location: $executable"
                             fi
-                        fi
 
-                        # Extract the script file from arguments
-                        script_to_analyze=$(get_script_from_interpreter_command "$exec_start")
+                            # Extract and analyze the SCRIPT (this is the key forensic artifact)
+                            script_to_analyze=$(get_script_from_interpreter_command "$exec_start")
 
-                        if [[ -n "$script_to_analyze" ]] && [[ -f "$script_to_analyze" ]]; then
-                            log_finding "Systemd service uses interpreter: $service_file -> $executable $script_to_analyze"
+                            if [[ -n "$script_to_analyze" ]] && [[ -f "$script_to_analyze" ]]; then
+                                # Check script's package status FIRST
+                                local script_pkg_status=$(is_package_managed "$script_to_analyze")
+                                local script_pkg_return=$?
+                                package_status="$script_pkg_status"
 
-                            # Analyze the script file, not the interpreter
-                            if is_script "$script_to_analyze"; then
-                                if analyze_script_content "$script_to_analyze"; then
-                                    confidence="HIGH"
-                                    log_finding "Interpreter script contains suspicious content: $script_to_analyze"
+                                if [[ $script_pkg_return -eq 2 ]]; then
+                                    # Script file was MODIFIED - CRITICAL
+                                    confidence="CRITICAL"
+                                    finding_matched_pattern="modified_package"
+                                    finding_matched_string="$script_to_analyze"
+                                    log_finding "Interpreter script is modified package file: $script_to_analyze"
+                                elif [[ $script_pkg_return -eq 0 ]]; then
+                                    # Script is package-managed and verified - LOW, skip content analysis
+                                    confidence="LOW"
+                                    skip_pattern_analysis=true
+                                else
+                                    # Script is UNMANAGED - analyze content
+                                    if is_script "$script_to_analyze"; then
+                                        if analyze_script_content "$script_to_analyze"; then
+                                            confidence="HIGH"
+                                            finding_matched_pattern="suspicious_script_content"
+                                            finding_matched_string="$script_to_analyze"
+                                            log_finding "Interpreter script contains suspicious content: $script_to_analyze"
+                                        fi
+                                    fi
+
+                                    # Check location-based suspicion
+                                    if [[ "$script_to_analyze" =~ ^/(tmp|dev/shm|var/tmp) ]]; then
+                                        confidence="HIGH"
+                                        finding_matched_pattern="suspicious_location"
+                                        finding_matched_string="$script_to_analyze"
+                                        log_finding "Interpreter executing script from suspicious location: $script_to_analyze"
+                                    elif [[ "$script_to_analyze" =~ ^/(opt|usr/local|home) ]]; then
+                                        # Common but unmanaged locations
+                                        [[ "$confidence" == "LOW" ]] && confidence="MEDIUM"
+                                    fi
                                 fi
+                            else
+                                # Interpreter with no file argument - check for inline code
+                                if [[ "$exec_start" =~ \ -[ce]\  ]] || [[ "$exec_start" =~ \ -[ce]$ ]]; then
+                                    confidence="HIGH"
+                                    finding_matched_pattern="inline_code"
+                                    finding_matched_string="-c/-e flag"
+                                    log_finding "Systemd service uses interpreter with inline code: $service_file"
+                                fi
+                                package_status="$interp_pkg_status"
                             fi
 
-                            # Also check if the script itself is package-managed
-                            local script_pkg_status=$(is_package_managed "$script_to_analyze")
-                            local script_pkg_return=$?
+                        else
+                            # BRANCH 2: Not an interpreter - direct binary execution
+                            # Check package status FIRST - if verified, skip all pattern analysis
 
-                            if [[ $script_pkg_return -eq 2 ]]; then
-                                # Script file was MODIFIED
+                            local exec_pkg_status=$(is_package_managed "$executable")
+                            local exec_pkg_return=$?
+                            package_status="$exec_pkg_status"
+
+                            if [[ $exec_pkg_return -eq 2 ]]; then
+                                # Executable was MODIFIED - CRITICAL
                                 confidence="CRITICAL"
-                                log_finding "Interpreter script is modified package file: $script_to_analyze"
-                            elif [[ $script_pkg_return -eq 1 ]]; then
-                                # Script is unmanaged - suspicious if in unusual location
-                                if [[ "$script_to_analyze" =~ ^/(tmp|dev|shm|var/tmp) ]]; then
+                                finding_matched_pattern="modified_package"
+                                finding_matched_string="$executable"
+                                log_finding "Systemd service executes modified package file: $executable"
+
+                            elif [[ $exec_pkg_return -eq 0 ]]; then
+                                # Package-managed and VERIFIED - LOW confidence, skip pattern analysis
+                                confidence="LOW"
+                                skip_pattern_analysis=true
+
+                            else
+                                # UNMANAGED binary - need pattern analysis
+                                # Check location first
+                                if [[ "$executable" =~ ^/(tmp|dev/shm|var/tmp) ]]; then
                                     confidence="HIGH"
-                                    log_finding "Interpreter executing script from suspicious location: $script_to_analyze"
-                                elif [[ "$script_to_analyze" =~ ^/(opt|usr/local|home) ]]; then
-                                    # Common but unmanaged locations - keep MEDIUM
-                                    [[ "$confidence" == "LOW" ]] && confidence="MEDIUM"
+                                    finding_matched_pattern="suspicious_location"
+                                    finding_matched_string="$executable"
+                                    log_finding "Systemd service executes file from suspicious location: $executable"
+                                fi
+
+                                # If it's a script file, analyze content
+                                if is_script "$executable"; then
+                                    if analyze_script_content "$executable"; then
+                                        confidence="HIGH"
+                                        finding_matched_pattern="suspicious_script_content"
+                                        finding_matched_string="$executable"
+                                        log_finding "Systemd service script contains suspicious content: $executable"
+                                    fi
+                                fi
+
+                                # Pattern analysis on ExecStart command
+                                if [[ "$skip_pattern_analysis" != true ]] && [[ "$confidence" != "HIGH" ]]; then
+                                    local dangerous_match=$(echo "$exec_start" | grep -oiE "(curl.*\||wget.*\||nc -e|/dev/tcp/|/dev/udp/|bash -i|sh -i)" | head -1)
+                                    if [[ -n "$dangerous_match" ]]; then
+                                        confidence="HIGH"
+                                        finding_matched_pattern="dangerous_command"
+                                        finding_matched_string="$dangerous_match"
+                                        log_finding "Dangerous command in systemd service: $service_file"
+                                    elif check_suspicious_patterns "$exec_start"; then
+                                        confidence="HIGH"
+                                        finding_matched_pattern="$MATCHED_PATTERN"
+                                        finding_matched_string="$MATCHED_STRING"
+                                        log_finding "Suspicious pattern in ExecStart: $service_file [matched: $MATCHED_STRING]"
+                                    fi
+                                fi
+
+                                # Recent + enabled + unknown = suspicious
+                                if [[ "$confidence" == "MEDIUM" ]] && [[ $days_old -lt 7 ]] && [[ "$enabled_status" == "enabled" ]]; then
+                                    confidence="HIGH"
+                                    finding_matched_pattern="recent_unknown"
+                                    finding_matched_string="${days_old} days old"
+                                    log_finding "Recently created enabled service with unknown command: $service_file"
                                 fi
                             fi
-                        else
-                            # Interpreter with no file argument (inline code via -c flag)
-                            # This is inherently suspicious
-                            if [[ "$exec_start" =~ \ -c\  ]]; then
-                                confidence="HIGH"
-                                log_finding "Systemd service uses interpreter with inline code (-c flag): $service_file"
-                            fi
                         fi
+
                     else
-                        # Not an interpreter - check if it's a script directly
-                        if is_script "$executable"; then
-                            if analyze_script_content "$executable"; then
-                                confidence="HIGH"
-                                log_finding "Systemd service executes script with suspicious content: $service_file -> $executable"
-                            fi
-                        fi
-
-                        # Check if the executable itself is package-managed
-                        local exec_pkg_status=$(is_package_managed "$executable")
-                        local exec_pkg_return=$?
-
-                        if [[ $exec_pkg_return -eq 2 ]]; then
-                            # Executable file was MODIFIED
+                        # Executable doesn't exist or isn't a file - check service file package status
+                        package_status=$(is_package_managed "$service_file")
+                        local svc_pkg_return=$?
+                        if [[ $svc_pkg_return -eq 0 ]]; then
+                            confidence="LOW"
+                        elif [[ $svc_pkg_return -eq 2 ]]; then
                             confidence="CRITICAL"
-                            log_finding "Systemd service executes modified package file: $executable"
-                        elif [[ $exec_pkg_return -eq 1 ]]; then
-                            # Executable is unmanaged - suspicious if in unusual location
-                            if [[ "$executable" =~ ^/(tmp|dev|shm|var/tmp) ]]; then
-                                confidence="HIGH"
-                                log_finding "Systemd service executes file from suspicious location: $executable"
-                            fi
+                            finding_matched_pattern="modified_package"
+                            finding_matched_string="$service_file"
                         fi
                     fi
-                fi
-                fi  # End of: if [[ -n "$exec_start" ]]
 
-                # Determine package status for reporting
-                # Use the executable's package status if available (already checked above)
-                local package_status="unmanaged"
-                if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
-                    # Check if we already have package status from interpreter or exec checks
-                    if is_interpreter "$executable"; then
-                        # Reuse interp_pkg_status if it was an interpreter
-                        if [[ -n "${interp_pkg_status:-}" ]]; then
-                            package_status="$interp_pkg_status"
-                        else
-                            package_status=$(is_package_managed "$executable")
-                        fi
-                    elif [[ -n "${exec_pkg_status:-}" ]]; then
-                        # Reuse exec_pkg_status from non-interpreter checks
-                        package_status="$exec_pkg_status"
-                    else
-                        # This shouldn't happen but check anyway
-                        package_status=$(is_package_managed "$executable")
-                    fi
                 else
-                    # No executable found, check if service file itself is package-managed
+                    # No ExecStart - check service file package status
                     package_status=$(is_package_managed "$service_file")
-                    confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+                    local svc_pkg_return=$?
+                    if [[ $svc_pkg_return -eq 0 ]]; then
+                        confidence="LOW"
+                    elif [[ $svc_pkg_return -eq 2 ]]; then
+                        confidence="CRITICAL"
+                        finding_matched_pattern="modified_package"
+                        finding_matched_string="$service_file"
+                    fi
                 fi
 
                 # Extract owner and permissions from metadata
