@@ -1134,10 +1134,11 @@ check_systemd() {
                         log_finding "Suspicious systemd service (advanced patterns): $service_file"
                     # Second: Check if command is safe (downgrade confidence)
                     elif is_command_safe "$exec_start"; then
-                        # Safe system binary execution - SKIP further analysis
+                        # Safe system binary execution
                         confidence="LOW"
                         detection_reason="Safe: package-managed binary in standard location"
-                        skip_deep_analysis=1
+                        # NOTE: Don't set skip_deep_analysis here - if it's an interpreter,
+                        # we still need to analyze the script argument (e.g., /opt/script.py)
                     # Third: Unknown command + recent modification = suspicious
                     elif [[ $days_old -lt 7 ]] && [[ "$enabled_status" == "enabled" ]]; then
                         confidence="HIGH"
@@ -1154,9 +1155,11 @@ check_systemd() {
                     # CRITICAL: Analyze the script argument, not the interpreter binary
                     executable=$(get_executable_from_command "$exec_start")
 
-                # OPTIMIZATION: Skip deep analysis if already verified safe
-                if [[ $skip_deep_analysis -eq 0 ]] && [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
+                # Deep analysis of executable and scripts
+                if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
                     # Check if executable is an interpreter
+                    # NOTE: For interpreters, ALWAYS analyze the script even if interpreter is verified
+                    # because /usr/bin/python3 might be safe but /opt/malware.py is not
                     if is_interpreter "$executable"; then
                         # First, verify the interpreter binary itself isn't compromised
                         local interp_pkg_status=$(is_package_managed "$executable")
@@ -1222,26 +1225,30 @@ check_systemd() {
                             fi
                         fi
                     else
-                        # Not an interpreter - check if it's a script directly
-                        if is_script "$executable"; then
-                            if analyze_script_content "$executable"; then
-                                confidence="HIGH"
-                                detection_reason="Script content analysis: suspicious patterns found in $executable"
-                                log_finding "Systemd service executes script with suspicious content: $service_file -> $executable"
-                            fi
-                        fi
-
-                        # Check if the executable itself is package-managed
+                        # Not an interpreter - check if executable is package-managed FIRST
                         local exec_pkg_status=$(is_package_managed "$executable")
                         local exec_pkg_return=$?
 
-                        if [[ $exec_pkg_return -eq 2 ]]; then
-                            # Executable file was MODIFIED
+                        if [[ $exec_pkg_return -eq 0 ]]; then
+                            # OPTIMIZATION: Binary is verified (dpkg --verify passed)
+                            # Skip further analysis - it's a trusted package binary
+                            : # Do nothing, already marked as LOW/safe
+                        elif [[ $exec_pkg_return -eq 2 ]]; then
+                            # Executable file was MODIFIED - CRITICAL
                             confidence="CRITICAL"
                             detection_reason="CRITICAL: Executable ($executable) modified from package version"
                             log_finding "Systemd service executes modified package file: $executable"
-                        elif [[ $exec_pkg_return -eq 1 ]]; then
-                            # Executable is unmanaged - suspicious if in unusual location
+                        else
+                            # Unmanaged binary - do full analysis
+                            if is_script "$executable"; then
+                                if analyze_script_content "$executable"; then
+                                    confidence="HIGH"
+                                    detection_reason="Script content analysis: suspicious patterns found in $executable"
+                                    log_finding "Systemd service executes script with suspicious content: $service_file -> $executable"
+                                fi
+                            fi
+
+                            # Check location for suspicious paths
                             if [[ "$executable" =~ ^/(tmp|dev|shm|var/tmp) ]]; then
                                 confidence="HIGH"
                                 detection_reason="Executable in suspicious location: $executable"
