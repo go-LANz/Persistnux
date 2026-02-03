@@ -605,9 +605,25 @@ get_script_from_interpreter_command() {
     # Remove systemd prefixes
     command="${command#[@\-:+!]}"
 
-    # Parse command into array of arguments
+    # Parse command into array of arguments safely (avoid eval)
+    # Use read with IFS to split, handling the command safely
     local -a args
-    eval "args=($command)"
+
+    # Simple word splitting - handles most cases without eval dangers
+    # First, normalize whitespace
+    command=$(echo "$command" | tr -s '[:space:]' ' ')
+
+    # Read into array using simple word splitting
+    read -ra args <<< "$command" 2>/dev/null || {
+        # If read fails, try basic splitting
+        IFS=' ' read -ra args <<< "$command"
+    }
+
+    # If no args parsed, return failure
+    if [[ ${#args[@]} -eq 0 ]]; then
+        echo ""
+        return 1
+    fi
 
     # First arg is the interpreter
     local interpreter="${args[0]}"
@@ -636,14 +652,14 @@ get_script_from_interpreter_command() {
         fi
 
         # This looks like a file path (not a flag)
+        # Clean up quotes first
+        arg="${arg#\"}"
+        arg="${arg#\'}"
+        arg="${arg%\"}"
+        arg="${arg%\'}"
+
         # Check if it's an absolute path or relative path
         if [[ "$arg" =~ ^/ ]] || [[ "$arg" =~ ^\./ ]] || [[ "$arg" =~ ^\.\. ]] || [[ -f "$arg" ]]; then
-            # Clean up quotes
-            arg="${arg#\"}"
-            arg="${arg#\'}"
-            arg="${arg%\"}"
-            arg="${arg%\'}"
-
             echo "$arg"
             return 0
         fi
