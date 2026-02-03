@@ -1607,112 +1607,147 @@ analyze_cron_command() {
 check_cron() {
     log_info "[2/8] Checking cron jobs and scheduled tasks..."
 
-    # System crontabs
-    local cron_files=(
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 1: Crontab files (with time specifications)
+    # These need to be parsed line-by-line even if the file is package-managed
+    # because an attacker could add malicious entries to a legitimate crontab
+    # ═══════════════════════════════════════════════════════════════════════════
+    local crontab_files=(
         "/etc/crontab"
+    )
+    local crontab_dirs=(
         "/etc/cron.d"
-        "/etc/cron.daily"
-        "/etc/cron.hourly"
-        "/etc/cron.weekly"
-        "/etc/cron.monthly"
         "/var/spool/cron"
         "/var/spool/cron/crontabs"
     )
 
-    for cron_path in "${cron_files[@]}"; do
-        if [[ -e "$cron_path" ]]; then
-            if [[ -f "$cron_path" ]]; then
-                # Single file
-                local hash=$(get_file_hash "$cron_path")
-                local metadata=$(get_file_metadata "$cron_path")
-                local content=$(grep -Ev "^#|^$" "$cron_path" 2>/dev/null | head -20 || echo "")
+    # Process individual crontab files
+    for cron_path in "${crontab_files[@]}"; do
+        if [[ -f "$cron_path" ]]; then
+            local hash=$(get_file_hash "$cron_path")
+            local metadata=$(get_file_metadata "$cron_path")
+            local content=$(grep -Ev "^#|^$" "$cron_path" 2>/dev/null | head -20 || echo "")
+            local package_status=$(is_package_managed "$cron_path")
+
+            local confidence="MEDIUM"
+
+            # Check crontab entries for suspicious commands
+            while IFS= read -r cron_line; do
+                [[ -z "$cron_line" ]] && continue
+
+                # Extract command from cron line (skip time/user fields)
+                local cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}')
+
+                if analyze_cron_command "$cron_command" "$cron_path"; then
+                    confidence="HIGH"
+                    log_finding "Crontab entry suspicious ($CRON_ANALYSIS_REASON): $cron_path"
+                fi
+            done <<< "$content"
+
+            # Adjust confidence based on file package status
+            confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+
+            add_finding "Cron" "System" "crontab_file" "$cron_path" "System crontab" "$confidence" "$hash" "$metadata" "entries=$(echo "$content" | wc -l)|package=$package_status"
+        fi
+    done
+
+    # Process crontab directories (/etc/cron.d, /var/spool/cron/*)
+    for cron_dir in "${crontab_dirs[@]}"; do
+        if [[ -d "$cron_dir" ]]; then
+            while IFS= read -r -d '' cron_file; do
+                local hash="DEFER"
+                local metadata=$(get_file_metadata "$cron_file")
+                local content=$(grep -Ev "^#|^$" "$cron_file" 2>/dev/null | head -20 || echo "")
+                local package_status=$(is_package_managed "$cron_file")
 
                 local confidence="MEDIUM"
-                if quick_suspicious_check "$content"; then
-                    confidence="HIGH"
-                    log_finding "Suspicious cron job in: $cron_path"
-                elif check_suspicious_patterns "$content"; then
-                    confidence="HIGH"
-                    log_finding "Suspicious cron job (advanced patterns): $cron_path"
-                fi
 
-                # Check if cron file is a script and analyze its content
-                if is_script "$cron_path"; then
-                    if analyze_script_content "$cron_path"; then
-                        confidence="HIGH"
-                        log_finding "Cron file contains suspicious script content: $cron_path"
-                    fi
-                fi
-
-                # Check if cron entries use unmanaged or suspicious executables
+                # Check crontab entries for suspicious commands
                 while IFS= read -r cron_line; do
                     [[ -z "$cron_line" ]] && continue
 
                     # Extract command from cron line (skip time/user fields)
                     local cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}')
 
-                    if analyze_cron_command "$cron_command" "$cron_path"; then
+                    if analyze_cron_command "$cron_command" "$cron_file"; then
                         confidence="HIGH"
-                        log_finding "Cron entry suspicious ($CRON_ANALYSIS_REASON): $cron_path"
+                        log_finding "Crontab entry suspicious ($CRON_ANALYSIS_REASON): $cron_file"
                     fi
                 done <<< "$content"
 
-                add_finding "Cron" "System" "cron_file" "$cron_path" "Cron configuration file" "$confidence" "$hash" "$metadata" "entries=$(echo "$content" | wc -l)"
+                # Adjust confidence based on file package status
+                confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
-            elif [[ -d "$cron_path" ]]; then
-                # Directory of cron jobs
-                while IFS= read -r -d '' cron_file; do
-                    local hash="DEFER"  # Defer hash calculation until filtering
-                    local metadata=$(get_file_metadata "$cron_file")
-                    local content=$(grep -Ev "^#|^$" "$cron_file" 2>/dev/null | head -10 || echo "")
+                add_finding "Cron" "System" "crontab_file" "$cron_file" "Crontab: $(basename "$cron_file")" "$confidence" "$hash" "$metadata" "package=$package_status"
 
-                    local confidence="MEDIUM"
+            done < <(find "$cron_dir" -type f -print0 2>/dev/null)
+        fi
+    done
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 2: Cron script directories (standalone scripts, NO time specs)
+    # These are like systemd - check file package status FIRST, skip if verified
+    # ═══════════════════════════════════════════════════════════════════════════
+    local cron_script_dirs=(
+        "/etc/cron.daily"
+        "/etc/cron.hourly"
+        "/etc/cron.weekly"
+        "/etc/cron.monthly"
+    )
+
+    for cron_dir in "${cron_script_dirs[@]}"; do
+        if [[ -d "$cron_dir" ]]; then
+            while IFS= read -r -d '' cron_script; do
+                # ─────────────────────────────────────────────────────────────
+                # FIRST CHECK: Package verification (like systemd)
+                # If verified, skip entirely - no need to analyze
+                # ─────────────────────────────────────────────────────────────
+                local package_status
+                package_status=$(is_package_managed "$cron_script")
+                local pkg_return=$?
+
+                if [[ $pkg_return -eq 0 ]]; then
+                    # Package-managed and VERIFIED - skip this file entirely
+                    continue
+                fi
+
+                # File is either MODIFIED or UNMANAGED - analyze it
+                local hash="DEFER"
+                local metadata=$(get_file_metadata "$cron_script")
+                local confidence="MEDIUM"
+
+                if [[ $pkg_return -eq 2 ]]; then
+                    # Package file was MODIFIED - CRITICAL
+                    confidence="CRITICAL"
+                    log_finding "Cron script is MODIFIED package file: $cron_script"
+                else
+                    # UNMANAGED script - analyze content
                     # Check modification time
-                    local mod_time=$(stat -c %Y "$cron_file" 2>/dev/null || stat -f %m "$cron_file" 2>/dev/null || echo "0")
+                    local mod_time=$(stat -c %Y "$cron_script" 2>/dev/null || stat -f %m "$cron_script" 2>/dev/null || echo "0")
                     local current_time=$(date +%s)
                     local days_old=$(( (current_time - mod_time) / 86400 ))
 
-                    if quick_suspicious_check "$content"; then
+                    if [[ $days_old -lt 7 ]]; then
                         confidence="HIGH"
-                        log_finding "Suspicious cron job: $cron_file"
-                    elif check_suspicious_patterns "$content"; then
-                        confidence="HIGH"
-                        log_finding "Suspicious cron job (advanced patterns): $cron_file"
-                    elif [[ $days_old -lt 7 ]]; then
-                        confidence="HIGH"
-                        log_finding "Recently created cron job: $cron_file (${days_old} days old)"
+                        log_finding "Recently created cron script: $cron_script (${days_old} days old)"
                     fi
 
-                    # Check if cron job is a script and analyze its content
-                    if is_script "$cron_file"; then
-                        if analyze_script_content "$cron_file"; then
-                            confidence="HIGH"
-                            log_finding "Cron job script contains suspicious content: $cron_file"
-                        fi
+                    # Check suspicious location
+                    if [[ "$cron_script" =~ \.(tmp|bak|old)$ ]] || [[ "$(basename "$cron_script")" =~ ^\. ]]; then
+                        confidence="HIGH"
+                        log_finding "Cron script with suspicious name: $cron_script"
                     fi
 
-                    # Check if cron entries use unmanaged or suspicious executables
-                    while IFS= read -r cron_line; do
-                        [[ -z "$cron_line" ]] && continue
+                    # Analyze script content
+                    if analyze_script_content "$cron_script"; then
+                        confidence="HIGH"
+                        log_finding "Cron script contains suspicious content: $cron_script"
+                    fi
+                fi
 
-                        # Extract command from cron line
-                        local cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}')
+                add_finding "Cron" "Script" "cron_script" "$cron_script" "Cron script: $(basename "$cron_script")" "$confidence" "$hash" "$metadata" "dir=$(basename "$(dirname "$cron_script")")|package=$package_status"
 
-                        if analyze_cron_command "$cron_command" "$cron_file"; then
-                            confidence="HIGH"
-                            log_finding "Cron entry suspicious ($CRON_ANALYSIS_REASON): $cron_file"
-                        fi
-                    done <<< "$content"
-
-                    # Check if file is package-managed and adjust confidence
-                    local package_status=$(is_package_managed "$cron_file")
-                    confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
-
-                    add_finding "Cron" "System" "cron_script" "$cron_file" "Scheduled script: $(basename "$cron_file")" "$confidence" "$hash" "$metadata" "content_preview=${content:0:100}|days_old=$days_old|package=$package_status"
-
-                done < <(find "$cron_path" -type f -print0 2>/dev/null)
-            fi
+            done < <(find "$cron_dir" -type f -print0 2>/dev/null)
         fi
     done
 
@@ -1948,66 +1983,122 @@ check_ssh() {
 check_init_scripts() {
     log_info "[5/8] Checking init scripts and rc.local..."
 
-    local init_paths=(
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 1: rc.local files (typically NOT package-managed, always analyze)
+    # These are user-customization files that run at boot
+    # ═══════════════════════════════════════════════════════════════════════════
+    local rc_local_files=(
         "/etc/rc.local"
         "/etc/rc.d/rc.local"
-        "/etc/init.d"
-        "/etc/rc*.d"
     )
 
-    for init_path in "${init_paths[@]}"; do
-        if [[ -e "$init_path" ]]; then
-            if [[ -f "$init_path" ]]; then
-                local hash=$(get_file_hash "$init_path")
-                local metadata=$(get_file_metadata "$init_path")
-                local content=$(grep -Ev "^#|^$" "$init_path" 2>/dev/null | head -20 || echo "")
+    for rc_local in "${rc_local_files[@]}"; do
+        if [[ -f "$rc_local" ]]; then
+            # rc.local is typically not package-managed - always analyze
+            local hash=$(get_file_hash "$rc_local")
+            local metadata=$(get_file_metadata "$rc_local")
+            local content=$(grep -Ev "^#|^$" "$rc_local" 2>/dev/null | head -20 || echo "")
+            local package_status=$(is_package_managed "$rc_local")
+            local pkg_return=$?
 
-                local confidence="MEDIUM"
+            local confidence="MEDIUM"
+
+            # If it's package-managed and verified, still flag but lower confidence
+            # (rc.local having content is unusual even if from a package)
+            if [[ -n "$content" ]]; then
                 if quick_suspicious_check "$content"; then
                     confidence="HIGH"
-                    log_finding "Suspicious init script: $init_path"
-                elif analyze_script_content "$init_path"; then
+                    log_finding "Suspicious rc.local: $rc_local"
+                elif analyze_script_content "$rc_local"; then
                     confidence="HIGH"
-                    log_finding "Init script contains suspicious patterns: $init_path"
+                    log_finding "rc.local contains suspicious patterns: $rc_local"
                 fi
-
-                # Check if file is package-managed and adjust confidence
-                local package_status=$(is_package_managed "$init_path")
-                confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
-
-                add_finding "Init" "Script" "init_script" "$init_path" "Init script: $(basename "$init_path")" "$confidence" "$hash" "$metadata" "package=$package_status"
-
-            elif [[ -d "$init_path" ]]; then
-                while IFS= read -r -d '' init_file; do
-                    # Skip if it's a symbolic link to /dev/null or similar
-                    if [[ -L "$init_file" ]]; then
-                        local link_target=$(readlink -f "$init_file")
-                        if [[ "$link_target" == "/dev/null" ]]; then
-                            continue
-                        fi
-                    fi
-
-                    local hash="DEFER"  # Defer hash calculation until filtering
-                    local metadata=$(get_file_metadata "$init_file")
-                    local content=$(grep -Ev "^#|^$" "$init_file" 2>/dev/null | head -10 || echo "")
-
-                    local confidence="LOW"
-                    if quick_suspicious_check "$content"; then
-                        confidence="HIGH"
-                        log_finding "Suspicious init script: $init_file"
-                    elif analyze_script_content "$init_file"; then
-                        confidence="HIGH"
-                        log_finding "Init script contains suspicious patterns: $init_file"
-                    fi
-
-                    # Check if file is package-managed and adjust confidence
-                    local package_status=$(is_package_managed "$init_file")
-                    confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
-
-                    add_finding "Init" "Script" "init_script" "$init_file" "Init script: $(basename "$init_file")" "$confidence" "$hash" "$metadata" "dir=$(dirname "$init_file")|package=$package_status"
-
-                done < <(find "$init_path" -maxdepth 1 -type f -print0 2>/dev/null)
             fi
+
+            # Adjust confidence based on package status
+            confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+
+            add_finding "Init" "RcLocal" "rc_local" "$rc_local" "rc.local startup script" "$confidence" "$hash" "$metadata" "package=$package_status"
+        fi
+    done
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 2: /etc/init.d scripts (often package-managed)
+    # Check package status FIRST, skip if verified (like systemd/cron)
+    # ═══════════════════════════════════════════════════════════════════════════
+    if [[ -d "/etc/init.d" ]]; then
+        while IFS= read -r -d '' init_file; do
+            # Skip if it's a symbolic link to /dev/null
+            if [[ -L "$init_file" ]]; then
+                local link_target=$(readlink -f "$init_file")
+                if [[ "$link_target" == "/dev/null" ]]; then
+                    continue
+                fi
+            fi
+
+            # ─────────────────────────────────────────────────────────────
+            # FIRST CHECK: Package verification (like systemd/cron)
+            # If verified, skip entirely - no need to analyze
+            # ─────────────────────────────────────────────────────────────
+            local package_status
+            package_status=$(is_package_managed "$init_file")
+            local pkg_return=$?
+
+            if [[ $pkg_return -eq 0 ]]; then
+                # Package-managed and VERIFIED - skip this file entirely
+                continue
+            fi
+
+            # File is either MODIFIED or UNMANAGED - analyze it
+            local hash="DEFER"
+            local metadata=$(get_file_metadata "$init_file")
+            local confidence="MEDIUM"
+
+            if [[ $pkg_return -eq 2 ]]; then
+                # Package file was MODIFIED - CRITICAL
+                confidence="CRITICAL"
+                log_finding "Init script is MODIFIED package file: $init_file"
+            else
+                # UNMANAGED script - analyze content
+                if quick_suspicious_check "$(head -n 50 "$init_file" 2>/dev/null)"; then
+                    confidence="HIGH"
+                    log_finding "Suspicious init script: $init_file"
+                elif analyze_script_content "$init_file"; then
+                    confidence="HIGH"
+                    log_finding "Init script contains suspicious patterns: $init_file"
+                fi
+            fi
+
+            add_finding "Init" "Script" "init_script" "$init_file" "Init script: $(basename "$init_file")" "$confidence" "$hash" "$metadata" "package=$package_status"
+
+        done < <(find "/etc/init.d" -maxdepth 1 -type f -print0 2>/dev/null)
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 3: /etc/rc*.d directories (runlevel symlinks)
+    # These are typically symlinks to /etc/init.d - check for non-symlink files
+    # which would be suspicious (scripts shouldn't be directly in rc*.d)
+    # ═══════════════════════════════════════════════════════════════════════════
+    for rc_dir in /etc/rc*.d; do
+        if [[ -d "$rc_dir" ]]; then
+            while IFS= read -r -d '' rc_file; do
+                # We're looking for actual FILES, not symlinks (symlinks are normal)
+                if [[ -f "$rc_file" ]] && [[ ! -L "$rc_file" ]]; then
+                    # Non-symlink file in rc*.d is suspicious
+                    local hash="DEFER"
+                    local metadata=$(get_file_metadata "$rc_file")
+                    local confidence="HIGH"
+
+                    log_finding "Non-symlink file in rc directory (unusual): $rc_file"
+
+                    if analyze_script_content "$rc_file"; then
+                        confidence="CRITICAL"
+                        log_finding "Suspicious script in rc directory: $rc_file"
+                    fi
+
+                    add_finding "Init" "RcDir" "rc_script" "$rc_file" "Script in rc directory: $(basename "$rc_file")" "$confidence" "$hash" "$metadata" "dir=$(basename "$rc_dir")"
+                fi
+            done < <(find "$rc_dir" -maxdepth 1 -type f -print0 2>/dev/null)
         fi
     done
 }
