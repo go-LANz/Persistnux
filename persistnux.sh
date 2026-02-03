@@ -1656,9 +1656,10 @@ check_cron() {
     for cron_path in "${crontab_files[@]}"; do
         if [[ -f "$cron_path" ]]; then
             # FIRST CHECK: Package verification
+            # Use || true pattern to prevent set -e from exiting on non-zero return
             local package_status
-            package_status=$(is_package_managed "$cron_path")
-            local pkg_return=$?
+            local pkg_return=0
+            package_status=$(is_package_managed "$cron_path") || pkg_return=$?
 
             if [[ $pkg_return -eq 0 ]]; then
                 # Package-managed and VERIFIED - skip entirely
@@ -1666,9 +1667,12 @@ check_cron() {
             fi
 
             # File is MODIFIED or UNMANAGED - analyze it
-            local hash=$(get_file_hash "$cron_path")
-            local metadata=$(get_file_metadata "$cron_path")
-            local content=$(grep -Ev "^#|^$" "$cron_path" 2>/dev/null | head -20 || echo "")
+            local hash
+            hash=$(get_file_hash "$cron_path") || true
+            local metadata
+            metadata=$(get_file_metadata "$cron_path") || true
+            local content
+            content=$(grep -Ev "^#|^$" "$cron_path" 2>/dev/null | head -20) || true
             local confidence="MEDIUM"
 
             if [[ $pkg_return -eq 2 ]]; then
@@ -1680,7 +1684,8 @@ check_cron() {
             # Analyze crontab entries for suspicious commands
             while IFS= read -r cron_line; do
                 [[ -z "$cron_line" ]] && continue
-                local cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}')
+                local cron_command
+                cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}') || true
                 if analyze_cron_command "$cron_command" "$cron_path"; then
                     [[ "$confidence" != "CRITICAL" ]] && confidence="HIGH"
                     log_finding "Crontab entry suspicious ($CRON_ANALYSIS_REASON): $cron_path"
@@ -1698,9 +1703,10 @@ check_cron() {
         if [[ -d "$cron_dir" ]]; then
             while IFS= read -r -d '' cron_file; do
                 # FIRST CHECK: Package verification
+                # Use || pkg_return=$? pattern to capture return code with set -e
                 local package_status
-                package_status=$(is_package_managed "$cron_file")
-                local pkg_return=$?
+                local pkg_return=0
+                package_status=$(is_package_managed "$cron_file") || pkg_return=$?
 
                 if [[ $pkg_return -eq 0 ]]; then
                     # Package-managed and VERIFIED - skip entirely
@@ -1709,8 +1715,10 @@ check_cron() {
 
                 # File is MODIFIED or UNMANAGED - analyze it
                 local hash="DEFER"
-                local metadata=$(get_file_metadata "$cron_file")
-                local content=$(grep -Ev "^#|^$" "$cron_file" 2>/dev/null | head -20 || echo "")
+                local metadata
+                metadata=$(get_file_metadata "$cron_file") || true
+                local content
+                content=$(grep -Ev "^#|^$" "$cron_file" 2>/dev/null | head -20) || true
                 local confidence="MEDIUM"
 
                 if [[ $pkg_return -eq 2 ]]; then
@@ -1722,7 +1730,8 @@ check_cron() {
                 # Analyze crontab entries for suspicious commands
                 while IFS= read -r cron_line; do
                     [[ -z "$cron_line" ]] && continue
-                    local cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}')
+                    local cron_command
+                    cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}') || true
                     if analyze_cron_command "$cron_command" "$cron_file"; then
                         [[ "$confidence" != "CRITICAL" ]] && confidence="HIGH"
                         log_finding "Crontab entry suspicious ($CRON_ANALYSIS_REASON): $cron_file"
@@ -1743,9 +1752,10 @@ check_cron() {
         if [[ -d "$cron_dir" ]]; then
             while IFS= read -r -d '' cron_script; do
                 # FIRST CHECK: Package verification
+                # Use || pkg_return=$? pattern to capture return code with set -e
                 local package_status
-                package_status=$(is_package_managed "$cron_script")
-                local pkg_return=$?
+                local pkg_return=0
+                package_status=$(is_package_managed "$cron_script") || pkg_return=$?
 
                 if [[ $pkg_return -eq 0 ]]; then
                     # Package-managed and VERIFIED - skip entirely
@@ -1754,7 +1764,8 @@ check_cron() {
 
                 # File is MODIFIED or UNMANAGED - analyze it
                 local hash="DEFER"
-                local metadata=$(get_file_metadata "$cron_script")
+                local metadata
+                metadata=$(get_file_metadata "$cron_script") || true
                 local confidence="MEDIUM"
 
                 if [[ $pkg_return -eq 2 ]]; then
@@ -1763,8 +1774,10 @@ check_cron() {
                     log_finding "Cron script is MODIFIED package file: $cron_script"
                 else
                     # UNMANAGED script - analyze content
-                    local mod_time=$(stat -c %Y "$cron_script" 2>/dev/null || stat -f %m "$cron_script" 2>/dev/null || echo "0")
-                    local current_time=$(date +%s)
+                    local mod_time
+                    mod_time=$(stat -c %Y "$cron_script" 2>/dev/null || stat -f %m "$cron_script" 2>/dev/null || echo "0")
+                    local current_time
+                    current_time=$(date +%s)
                     local days_old=$(( (current_time - mod_time) / 86400 ))
 
                     if [[ $days_old -lt 7 ]]; then
