@@ -1381,8 +1381,12 @@ check_systemd() {
 }
 
 # Analyze a cron command for suspicious patterns and unmanaged executables
-# Usage: analyze_cron_command "cron_command" "source_file"
-# Returns: 0 if suspicious/unmanaged found, 1 if clean
+# Follows same detection logic as systemd:
+# - Package verification FIRST (verified = skip, move on)
+# - Interpreter detection (check script, not interpreter binary)
+# - Inline code detection (-c/-e flags)
+# - Unmanaged script content analysis
+# Returns: 0 if suspicious/unmanaged found, 1 if verified/clean (skip)
 # Sets CRON_ANALYSIS_REASON with the reason for detection
 CRON_ANALYSIS_REASON=""
 analyze_cron_command() {
@@ -1392,63 +1396,107 @@ analyze_cron_command() {
 
     [[ -z "$cron_command" ]] && return 1
 
-    local cron_executable
-    cron_executable=$(get_executable_from_command "$cron_command")
+    local executable
+    executable=$(get_executable_from_command "$cron_command")
 
     # Check if executable exists
-    if [[ -z "$cron_executable" ]] || [[ ! -f "$cron_executable" ]]; then
-        return 1  # Cannot analyze
+    if [[ -z "$executable" ]] || [[ ! -f "$executable" ]]; then
+        return 1  # Cannot analyze, skip
     fi
 
-    # Check if executable is package-managed
-    local pkg_status
-    pkg_status=$(is_package_managed "$cron_executable")
-    local pkg_return=$?
+    # ═══════════════════════════════════════════════════════════════════
+    # BRANCH 1: Is it an interpreter? (python, perl, bash, etc.)
+    # For interpreters, analyze the SCRIPT, not the interpreter binary
+    # ═══════════════════════════════════════════════════════════════════
+    if is_interpreter "$executable"; then
+        local script_file
+        script_file=$(get_script_from_interpreter_command "$cron_command") || true
 
-    if [[ $pkg_return -eq 2 ]]; then
-        # Package file was MODIFIED - highly suspicious
-        CRON_ANALYSIS_REASON="modified_package_binary:$cron_executable"
-        return 0
-    elif [[ $pkg_return -eq 1 ]]; then
-        # Unmanaged binary - suspicious
-        CRON_ANALYSIS_REASON="unmanaged_binary:$cron_executable"
-        return 0
-    fi
-
-    # Check if using interpreter
-    if is_interpreter "$cron_executable"; then
-        local cron_script
-        cron_script=$(get_script_from_interpreter_command "$cron_command") || true
-
-        if [[ -n "$cron_script" ]] && [[ -f "$cron_script" ]]; then
-            # Check if script is package-managed
+        if [[ -n "$script_file" ]] && [[ -f "$script_file" ]]; then
+            # ─────────────────────────────────────────────────────────
+            # FIRST CHECK: Script package verification (most efficient)
+            # ─────────────────────────────────────────────────────────
             local script_pkg_status
-            script_pkg_status=$(is_package_managed "$cron_script")
+            script_pkg_status=$(is_package_managed "$script_file")
             local script_pkg_return=$?
 
-            if [[ $script_pkg_return -eq 2 ]]; then
-                CRON_ANALYSIS_REASON="modified_package_script:$cron_script"
+            if [[ $script_pkg_return -eq 0 ]]; then
+                # Script is package-managed and VERIFIED - SKIP, move on
+                return 1
+            elif [[ $script_pkg_return -eq 2 ]]; then
+                # Script was MODIFIED - CRITICAL
+                CRON_ANALYSIS_REASON="modified_script:$script_file"
                 return 0
-            elif [[ $script_pkg_return -eq 1 ]]; then
-                # Unmanaged script - check content
-                if analyze_script_content "$cron_script"; then
-                    CRON_ANALYSIS_REASON="suspicious_unmanaged_script:$cron_script"
-                    return 0
-                else
-                    CRON_ANALYSIS_REASON="unmanaged_script:$cron_script"
+            fi
+
+            # Script is UNMANAGED - analyze content and location
+            # Check suspicious location first
+            if [[ "$script_file" =~ ^/(tmp|dev/shm|var/tmp) ]]; then
+                CRON_ANALYSIS_REASON="suspicious_location:$script_file"
+                return 0
+            fi
+
+            # Analyze script content for suspicious patterns
+            if is_script "$script_file"; then
+                if analyze_script_content "$script_file"; then
+                    CRON_ANALYSIS_REASON="suspicious_script_content:$script_file"
                     return 0
                 fi
             fi
 
-            # Even if managed, check for suspicious content
-            if analyze_script_content "$cron_script"; then
-                CRON_ANALYSIS_REASON="suspicious_script_content:$cron_script"
+            # Unmanaged but no suspicious content - still flag as unmanaged
+            CRON_ANALYSIS_REASON="unmanaged_script:$script_file"
+            return 0
+
+        else
+            # No script file - check for INLINE CODE (-c/-e flags)
+            if [[ "$cron_command" =~ \ -[ce]\  ]] || [[ "$cron_command" =~ \ -[ce]$ ]]; then
+                CRON_ANALYSIS_REASON="inline_code:-c/-e flag"
                 return 0
             fi
+            # Interactive interpreter without script - skip
+            return 1
         fi
     fi
 
-    return 1  # Clean
+    # ═══════════════════════════════════════════════════════════════════
+    # BRANCH 2: Not an interpreter - direct binary execution
+    # ═══════════════════════════════════════════════════════════════════
+
+    # ─────────────────────────────────────────────────────────────────
+    # FIRST CHECK: Binary package verification (most efficient)
+    # ─────────────────────────────────────────────────────────────────
+    local pkg_status
+    pkg_status=$(is_package_managed "$executable")
+    local pkg_return=$?
+
+    if [[ $pkg_return -eq 0 ]]; then
+        # Binary is package-managed and VERIFIED - SKIP, move on
+        return 1
+    elif [[ $pkg_return -eq 2 ]]; then
+        # Binary was MODIFIED - CRITICAL
+        CRON_ANALYSIS_REASON="modified_binary:$executable"
+        return 0
+    fi
+
+    # Binary is UNMANAGED - analyze location and content
+    # Check suspicious location
+    if [[ "$executable" =~ ^/(tmp|dev/shm|var/tmp) ]]; then
+        CRON_ANALYSIS_REASON="suspicious_location:$executable"
+        return 0
+    fi
+
+    # If it's a script file, analyze content
+    if is_script "$executable"; then
+        if analyze_script_content "$executable"; then
+            CRON_ANALYSIS_REASON="suspicious_script_content:$executable"
+            return 0
+        fi
+    fi
+
+    # Unmanaged binary but no suspicious content
+    CRON_ANALYSIS_REASON="unmanaged_binary:$executable"
+    return 0
 }
 
 # Check cron jobs
