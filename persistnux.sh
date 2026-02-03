@@ -955,7 +955,7 @@ analyze_inline_code() {
     # Extract potential encoded strings (quoted values, variable assignments)
     # Pattern: strings of 20+ chars that look like encoded data
     local encoded_patterns
-    encoded_patterns=$(echo "$inline_code" | grep -oE "[A-Za-z0-9+/=]{20,}" | head -5)
+    encoded_patterns=$(echo "$inline_code" | grep -oE "[A-Za-z0-9+/=]{20,}" | head -5) || true
 
     while IFS= read -r potential_encoded; do
         [[ -z "$potential_encoded" ]] && continue
@@ -968,7 +968,7 @@ analyze_inline_code() {
 
     # Also check for hex-encoded strings (common in perl/python obfuscation)
     local hex_patterns
-    hex_patterns=$(echo "$inline_code" | grep -oE "[0-9a-fA-F]{20,}" | head -5)
+    hex_patterns=$(echo "$inline_code" | grep -oE "[0-9a-fA-F]{20,}" | head -5) || true
 
     while IFS= read -r potential_hex; do
         [[ -z "$potential_hex" ]] && continue
@@ -1014,8 +1014,8 @@ is_command_safe() {
         if echo "$command" | grep -qE "$path"; then
             # Path matches known-good location, but we MUST verify it's package-managed
             if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
-                local pkg_status=$(is_package_managed "$executable")
-                local pkg_return=$?
+                local pkg_status pkg_return=0
+                pkg_status=$(is_package_managed "$executable") || pkg_return=$?
 
                 # Only trust if package-managed AND not modified
                 if [[ $pkg_return -eq 0 ]]; then
@@ -1041,8 +1041,8 @@ is_command_safe() {
     # Fourth check: Is the executable itself package-managed (even if not in standard path)?
     # Example: /opt/vendor/bin/tool that IS package-managed
     if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
-        local pkg_status=$(is_package_managed "$executable")
-        local pkg_return=$?
+        local pkg_status pkg_return=0
+        pkg_status=$(is_package_managed "$executable") || pkg_return=$?
 
         if [[ $pkg_return -eq 0 ]]; then
             return 0  # Safe - package-managed binary
@@ -1531,9 +1531,8 @@ analyze_cron_command() {
             # ─────────────────────────────────────────────────────────
             # FIRST CHECK: Script package verification (most efficient)
             # ─────────────────────────────────────────────────────────
-            local script_pkg_status
-            script_pkg_status=$(is_package_managed "$script_file")
-            local script_pkg_return=$?
+            local script_pkg_status script_pkg_return=0
+            script_pkg_status=$(is_package_managed "$script_file") || script_pkg_return=$?
 
             if [[ $script_pkg_return -eq 0 ]]; then
                 # Script is package-managed and VERIFIED - SKIP, move on
@@ -1586,9 +1585,8 @@ analyze_cron_command() {
     # ─────────────────────────────────────────────────────────────────
     # FIRST CHECK: Binary package verification (most efficient)
     # ─────────────────────────────────────────────────────────────────
-    local pkg_status
-    pkg_status=$(is_package_managed "$executable")
-    local pkg_return=$?
+    local pkg_status pkg_return=0
+    pkg_status=$(is_package_managed "$executable") || pkg_return=$?
 
     if [[ $pkg_return -eq 0 ]]; then
         # Binary is package-managed and VERIFIED - SKIP, move on
@@ -1879,7 +1877,8 @@ check_shell_profiles() {
                 fi
 
                 # Check if file is package-managed and adjust confidence
-                local package_status=$(is_package_managed "$profile")
+                local package_status
+                package_status=$(is_package_managed "$profile") || true
                 confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
                 add_finding "ShellProfile" "System" "profile_file" "$profile" "System shell profile" "$confidence" "$hash" "$metadata" "package=$package_status"
@@ -1900,7 +1899,8 @@ check_shell_profiles() {
                     fi
 
                     # Check if file is package-managed and adjust confidence
-                    local package_status=$(is_package_managed "$profile_file")
+                    local package_status
+                    package_status=$(is_package_managed "$profile_file") || true
                     confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
                     add_finding "ShellProfile" "System" "profile_script" "$profile_file" "Profile.d script: $(basename "$profile_file")" "$confidence" "$hash" "$metadata" "package=$package_status"
@@ -2049,8 +2049,8 @@ check_init_scripts() {
             local hash=$(get_file_hash "$rc_local")
             local metadata=$(get_file_metadata "$rc_local")
             local content=$(grep -Ev "^#|^$" "$rc_local" 2>/dev/null | head -20 || echo "")
-            local package_status=$(is_package_managed "$rc_local")
-            local pkg_return=$?
+            local package_status pkg_return=0
+            package_status=$(is_package_managed "$rc_local") || pkg_return=$?
 
             local confidence="MEDIUM"
 
@@ -2091,9 +2091,8 @@ check_init_scripts() {
             # FIRST CHECK: Package verification (like systemd/cron)
             # If verified, skip entirely - no need to analyze
             # ─────────────────────────────────────────────────────────────
-            local package_status
-            package_status=$(is_package_managed "$init_file")
-            local pkg_return=$?
+            local package_status pkg_return=0
+            package_status=$(is_package_managed "$init_file") || pkg_return=$?
 
             if [[ $pkg_return -eq 0 ]]; then
                 # Package-managed and VERIFIED - skip this file entirely
