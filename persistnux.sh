@@ -955,7 +955,7 @@ analyze_inline_code() {
     # Extract potential encoded strings (quoted values, variable assignments)
     # Pattern: strings of 20+ chars that look like encoded data
     local encoded_patterns
-    encoded_patterns=$(echo "$inline_code" | grep -oE "[A-Za-z0-9+/=]{20,}" | head -5)
+    encoded_patterns=$(echo "$inline_code" | grep -oE "[A-Za-z0-9+/=]{20,}" | head -5) || true
 
     while IFS= read -r potential_encoded; do
         [[ -z "$potential_encoded" ]] && continue
@@ -968,7 +968,7 @@ analyze_inline_code() {
 
     # Also check for hex-encoded strings (common in perl/python obfuscation)
     local hex_patterns
-    hex_patterns=$(echo "$inline_code" | grep -oE "[0-9a-fA-F]{20,}" | head -5)
+    hex_patterns=$(echo "$inline_code" | grep -oE "[0-9a-fA-F]{20,}" | head -5) || true
 
     while IFS= read -r potential_hex; do
         [[ -z "$potential_hex" ]] && continue
@@ -1014,8 +1014,8 @@ is_command_safe() {
         if echo "$command" | grep -qE "$path"; then
             # Path matches known-good location, but we MUST verify it's package-managed
             if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
-                local pkg_status=$(is_package_managed "$executable")
-                local pkg_return=$?
+                local pkg_status pkg_return=0
+                pkg_status=$(is_package_managed "$executable") || pkg_return=$?
 
                 # Only trust if package-managed AND not modified
                 if [[ $pkg_return -eq 0 ]]; then
@@ -1041,8 +1041,8 @@ is_command_safe() {
     # Fourth check: Is the executable itself package-managed (even if not in standard path)?
     # Example: /opt/vendor/bin/tool that IS package-managed
     if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
-        local pkg_status=$(is_package_managed "$executable")
-        local pkg_return=$?
+        local pkg_status pkg_return=0
+        pkg_status=$(is_package_managed "$executable") || pkg_return=$?
 
         if [[ $pkg_return -eq 0 ]]; then
             return 0  # Safe - package-managed binary
@@ -1531,9 +1531,8 @@ analyze_cron_command() {
             # ─────────────────────────────────────────────────────────
             # FIRST CHECK: Script package verification (most efficient)
             # ─────────────────────────────────────────────────────────
-            local script_pkg_status
-            script_pkg_status=$(is_package_managed "$script_file")
-            local script_pkg_return=$?
+            local script_pkg_status script_pkg_return=0
+            script_pkg_status=$(is_package_managed "$script_file") || script_pkg_return=$?
 
             if [[ $script_pkg_return -eq 0 ]]; then
                 # Script is package-managed and VERIFIED - SKIP, move on
@@ -1586,9 +1585,8 @@ analyze_cron_command() {
     # ─────────────────────────────────────────────────────────────────
     # FIRST CHECK: Binary package verification (most efficient)
     # ─────────────────────────────────────────────────────────────────
-    local pkg_status
-    pkg_status=$(is_package_managed "$executable")
-    local pkg_return=$?
+    local pkg_status pkg_return=0
+    pkg_status=$(is_package_managed "$executable") || pkg_return=$?
 
     if [[ $pkg_return -eq 0 ]]; then
         # Binary is package-managed and VERIFIED - SKIP, move on
@@ -1656,9 +1654,10 @@ check_cron() {
     for cron_path in "${crontab_files[@]}"; do
         if [[ -f "$cron_path" ]]; then
             # FIRST CHECK: Package verification
+            # Use || true pattern to prevent set -e from exiting on non-zero return
             local package_status
-            package_status=$(is_package_managed "$cron_path")
-            local pkg_return=$?
+            local pkg_return=0
+            package_status=$(is_package_managed "$cron_path") || pkg_return=$?
 
             if [[ $pkg_return -eq 0 ]]; then
                 # Package-managed and VERIFIED - skip entirely
@@ -1666,9 +1665,12 @@ check_cron() {
             fi
 
             # File is MODIFIED or UNMANAGED - analyze it
-            local hash=$(get_file_hash "$cron_path")
-            local metadata=$(get_file_metadata "$cron_path")
-            local content=$(grep -Ev "^#|^$" "$cron_path" 2>/dev/null | head -20 || echo "")
+            local hash
+            hash=$(get_file_hash "$cron_path") || true
+            local metadata
+            metadata=$(get_file_metadata "$cron_path") || true
+            local content
+            content=$(grep -Ev "^#|^$" "$cron_path" 2>/dev/null | head -20) || true
             local confidence="MEDIUM"
 
             if [[ $pkg_return -eq 2 ]]; then
@@ -1680,7 +1682,8 @@ check_cron() {
             # Analyze crontab entries for suspicious commands
             while IFS= read -r cron_line; do
                 [[ -z "$cron_line" ]] && continue
-                local cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}')
+                local cron_command
+                cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}') || true
                 if analyze_cron_command "$cron_command" "$cron_path"; then
                     [[ "$confidence" != "CRITICAL" ]] && confidence="HIGH"
                     log_finding "Crontab entry suspicious ($CRON_ANALYSIS_REASON): $cron_path"
@@ -1698,9 +1701,10 @@ check_cron() {
         if [[ -d "$cron_dir" ]]; then
             while IFS= read -r -d '' cron_file; do
                 # FIRST CHECK: Package verification
+                # Use || pkg_return=$? pattern to capture return code with set -e
                 local package_status
-                package_status=$(is_package_managed "$cron_file")
-                local pkg_return=$?
+                local pkg_return=0
+                package_status=$(is_package_managed "$cron_file") || pkg_return=$?
 
                 if [[ $pkg_return -eq 0 ]]; then
                     # Package-managed and VERIFIED - skip entirely
@@ -1709,8 +1713,10 @@ check_cron() {
 
                 # File is MODIFIED or UNMANAGED - analyze it
                 local hash="DEFER"
-                local metadata=$(get_file_metadata "$cron_file")
-                local content=$(grep -Ev "^#|^$" "$cron_file" 2>/dev/null | head -20 || echo "")
+                local metadata
+                metadata=$(get_file_metadata "$cron_file") || true
+                local content
+                content=$(grep -Ev "^#|^$" "$cron_file" 2>/dev/null | head -20) || true
                 local confidence="MEDIUM"
 
                 if [[ $pkg_return -eq 2 ]]; then
@@ -1722,7 +1728,8 @@ check_cron() {
                 # Analyze crontab entries for suspicious commands
                 while IFS= read -r cron_line; do
                     [[ -z "$cron_line" ]] && continue
-                    local cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}')
+                    local cron_command
+                    cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}') || true
                     if analyze_cron_command "$cron_command" "$cron_file"; then
                         [[ "$confidence" != "CRITICAL" ]] && confidence="HIGH"
                         log_finding "Crontab entry suspicious ($CRON_ANALYSIS_REASON): $cron_file"
@@ -1743,9 +1750,10 @@ check_cron() {
         if [[ -d "$cron_dir" ]]; then
             while IFS= read -r -d '' cron_script; do
                 # FIRST CHECK: Package verification
+                # Use || pkg_return=$? pattern to capture return code with set -e
                 local package_status
-                package_status=$(is_package_managed "$cron_script")
-                local pkg_return=$?
+                local pkg_return=0
+                package_status=$(is_package_managed "$cron_script") || pkg_return=$?
 
                 if [[ $pkg_return -eq 0 ]]; then
                     # Package-managed and VERIFIED - skip entirely
@@ -1754,7 +1762,8 @@ check_cron() {
 
                 # File is MODIFIED or UNMANAGED - analyze it
                 local hash="DEFER"
-                local metadata=$(get_file_metadata "$cron_script")
+                local metadata
+                metadata=$(get_file_metadata "$cron_script") || true
                 local confidence="MEDIUM"
 
                 if [[ $pkg_return -eq 2 ]]; then
@@ -1763,8 +1772,10 @@ check_cron() {
                     log_finding "Cron script is MODIFIED package file: $cron_script"
                 else
                     # UNMANAGED script - analyze content
-                    local mod_time=$(stat -c %Y "$cron_script" 2>/dev/null || stat -f %m "$cron_script" 2>/dev/null || echo "0")
-                    local current_time=$(date +%s)
+                    local mod_time
+                    mod_time=$(stat -c %Y "$cron_script" 2>/dev/null || stat -f %m "$cron_script" 2>/dev/null || echo "0")
+                    local current_time
+                    current_time=$(date +%s)
                     local days_old=$(( (current_time - mod_time) / 86400 ))
 
                     if [[ $days_old -lt 7 ]]; then
@@ -1866,7 +1877,8 @@ check_shell_profiles() {
                 fi
 
                 # Check if file is package-managed and adjust confidence
-                local package_status=$(is_package_managed "$profile")
+                local package_status
+                package_status=$(is_package_managed "$profile") || true
                 confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
                 add_finding "ShellProfile" "System" "profile_file" "$profile" "System shell profile" "$confidence" "$hash" "$metadata" "package=$package_status"
@@ -1887,7 +1899,8 @@ check_shell_profiles() {
                     fi
 
                     # Check if file is package-managed and adjust confidence
-                    local package_status=$(is_package_managed "$profile_file")
+                    local package_status
+                    package_status=$(is_package_managed "$profile_file") || true
                     confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
                     add_finding "ShellProfile" "System" "profile_script" "$profile_file" "Profile.d script: $(basename "$profile_file")" "$confidence" "$hash" "$metadata" "package=$package_status"
@@ -2036,8 +2049,8 @@ check_init_scripts() {
             local hash=$(get_file_hash "$rc_local")
             local metadata=$(get_file_metadata "$rc_local")
             local content=$(grep -Ev "^#|^$" "$rc_local" 2>/dev/null | head -20 || echo "")
-            local package_status=$(is_package_managed "$rc_local")
-            local pkg_return=$?
+            local package_status pkg_return=0
+            package_status=$(is_package_managed "$rc_local") || pkg_return=$?
 
             local confidence="MEDIUM"
 
@@ -2078,9 +2091,8 @@ check_init_scripts() {
             # FIRST CHECK: Package verification (like systemd/cron)
             # If verified, skip entirely - no need to analyze
             # ─────────────────────────────────────────────────────────────
-            local package_status
-            package_status=$(is_package_managed "$init_file")
-            local pkg_return=$?
+            local package_status pkg_return=0
+            package_status=$(is_package_managed "$init_file") || pkg_return=$?
 
             if [[ $pkg_return -eq 0 ]]; then
                 # Package-managed and VERIFIED - skip this file entirely
