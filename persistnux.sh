@@ -885,6 +885,97 @@ analyze_script_content() {
     return 1  # Clean - no suspicious patterns found
 }
 
+# Analyze inline code content for suspicious patterns and obfuscation
+# Used for: interpreter -c "code" or interpreter -e "code"
+# Returns: 0 if suspicious, 1 if clean
+# Sets INLINE_CODE_REASON with detection details
+INLINE_CODE_REASON=""
+analyze_inline_code() {
+    local full_command="$1"
+    INLINE_CODE_REASON=""
+
+    # Extract the inline code from -c "..." or -e "..." patterns
+    local inline_code=""
+
+    # Match -c 'code' or -c "code" or -e 'code' or -e "code"
+    if [[ "$full_command" =~ \ -[ce]\ +[\"\'](.+)[\"\'] ]]; then
+        inline_code="${BASH_REMATCH[1]}"
+    elif [[ "$full_command" =~ \ -[ce]\ +([^\ ]+) ]]; then
+        # Unquoted inline code
+        inline_code="${BASH_REMATCH[1]}"
+    fi
+
+    [[ -z "$inline_code" ]] && return 1  # No inline code found
+
+    # ─────────────────────────────────────────────────────────────────
+    # CHECK 1: Suspicious patterns in inline code
+    # ─────────────────────────────────────────────────────────────────
+    if quick_suspicious_check "$inline_code"; then
+        INLINE_CODE_REASON="suspicious_pattern"
+        return 0
+    fi
+
+    # Check NEVER_WHITELIST patterns
+    local never_whitelist_combined=""
+    for pattern in "${NEVER_WHITELIST_PATTERNS[@]}"; do
+        if [[ -n "$never_whitelist_combined" ]]; then
+            never_whitelist_combined="${never_whitelist_combined}|${pattern}"
+        else
+            never_whitelist_combined="$pattern"
+        fi
+    done
+    if [[ -n "$never_whitelist_combined" ]]; then
+        if echo "$inline_code" | grep -qiE "$never_whitelist_combined"; then
+            INLINE_CODE_REASON="dangerous_pattern"
+            return 0
+        fi
+    fi
+
+    # ─────────────────────────────────────────────────────────────────
+    # CHECK 2: High-entropy strings (obfuscation detection)
+    # Look for base64, hex, or other encoded payloads
+    # ─────────────────────────────────────────────────────────────────
+
+    # Extract potential encoded strings (quoted values, variable assignments)
+    # Pattern: strings of 20+ chars that look like encoded data
+    local encoded_patterns
+    encoded_patterns=$(echo "$inline_code" | grep -oE "[A-Za-z0-9+/=]{20,}" | head -5)
+
+    while IFS= read -r potential_encoded; do
+        [[ -z "$potential_encoded" ]] && continue
+
+        if is_high_entropy "$potential_encoded" 4.5; then
+            INLINE_CODE_REASON="high_entropy_string:${potential_encoded:0:30}..."
+            return 0
+        fi
+    done <<< "$encoded_patterns"
+
+    # Also check for hex-encoded strings (common in perl/python obfuscation)
+    local hex_patterns
+    hex_patterns=$(echo "$inline_code" | grep -oE "[0-9a-fA-F]{20,}" | head -5)
+
+    while IFS= read -r potential_hex; do
+        [[ -z "$potential_hex" ]] && continue
+
+        # Hex strings have moderate entropy (~3.7-4.0) but are suspicious if long
+        if [[ ${#potential_hex} -ge 30 ]]; then
+            INLINE_CODE_REASON="hex_encoded_string:${potential_hex:0:30}..."
+            return 0
+        fi
+    done <<< "$hex_patterns"
+
+    # Check variable assignments with high entropy values
+    if [[ "$inline_code" =~ [\"\']([A-Za-z0-9+/=]{30,})[\"\'] ]]; then
+        local value="${BASH_REMATCH[1]}"
+        if is_high_entropy "$value" 4.5; then
+            INLINE_CODE_REASON="obfuscated_variable:${value:0:30}..."
+            return 0
+        fi
+    fi
+
+    return 1  # Clean
+}
+
 # Check if command is executing a known-safe system binary
 is_command_safe() {
     local command="$1"
@@ -1262,10 +1353,18 @@ check_systemd() {
                             else
                                 # Interpreter with no file argument - check for inline code
                                 if [[ "$exec_start" =~ \ -[ce]\  ]] || [[ "$exec_start" =~ \ -[ce]$ ]]; then
-                                    confidence="HIGH"
-                                    finding_matched_pattern="inline_code"
-                                    finding_matched_string="-c/-e flag"
-                                    log_finding "Systemd service uses interpreter with inline code: $service_file"
+                                    # Analyze the inline code content for patterns and obfuscation
+                                    if analyze_inline_code "$exec_start"; then
+                                        confidence="CRITICAL"
+                                        finding_matched_pattern="inline_code_suspicious"
+                                        finding_matched_string="$INLINE_CODE_REASON"
+                                        log_finding "Systemd service has suspicious inline code ($INLINE_CODE_REASON): $service_file"
+                                    else
+                                        confidence="HIGH"
+                                        finding_matched_pattern="inline_code"
+                                        finding_matched_string="-c/-e flag"
+                                        log_finding "Systemd service uses interpreter with inline code: $service_file"
+                                    fi
                                 else
                                     # Interactive shell or command without script
                                     finding_matched_pattern="interpreter_interactive"
@@ -1451,7 +1550,12 @@ analyze_cron_command() {
         else
             # No script file - check for INLINE CODE (-c/-e flags)
             if [[ "$cron_command" =~ \ -[ce]\  ]] || [[ "$cron_command" =~ \ -[ce]$ ]]; then
-                CRON_ANALYSIS_REASON="inline_code:-c/-e flag"
+                # Analyze the inline code content for patterns and obfuscation
+                if analyze_inline_code "$cron_command"; then
+                    CRON_ANALYSIS_REASON="inline_code_suspicious:$INLINE_CODE_REASON"
+                else
+                    CRON_ANALYSIS_REASON="inline_code:-c/-e flag"
+                fi
                 return 0
             fi
             # Interactive interpreter without script - skip
