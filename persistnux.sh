@@ -311,7 +311,16 @@ check_suspicious_patterns() {
 quick_suspicious_check() {
     local content="$1"
     [[ -z "$content" ]] && return 1
-    echo "$content" | grep -qiE "$UNIFIED_SUSPICIOUS_PATTERN"
+
+    # Try to find the actual match for reporting
+    local match
+    match=$(echo "$content" | grep -oiE "$UNIFIED_SUSPICIOUS_PATTERN" | head -1) || true
+    if [[ -n "$match" ]]; then
+        MATCHED_PATTERN="unified_suspicious"
+        MATCHED_STRING="$match"
+        return 0
+    fi
+    return 1
 }
 
 ################################################################################
@@ -840,7 +849,11 @@ analyze_script_content() {
 
     # Check all dangerous patterns in single grep call
     if [[ -n "$never_whitelist_combined" ]]; then
-        if echo "$script_content" | grep -qiE "$never_whitelist_combined"; then
+        local match
+        match=$(echo "$script_content" | grep -oiE "$never_whitelist_combined" | head -1) || true
+        if [[ -n "$match" ]]; then
+            MATCHED_PATTERN="never_whitelist"
+            MATCHED_STRING="$match"
             return 0  # SUSPICIOUS - found dangerous pattern
         fi
     fi
@@ -848,7 +861,11 @@ analyze_script_content() {
     # Combined script-specific suspicious patterns (single grep call)
     local script_pattern_combined="eval.*\\$|exec.*\\$|\\$\\(curl|\\$\\(wget|base64.*-d|openssl.*enc.*-d|mkfifo|nc.*-l.*-p|socat.*TCP|python.*-c|perl.*-e|ruby.*-e|awk.*system|/proc/self/exe|chmod.*\\+x.*tmp|chmod.*777"
 
-    if echo "$script_content" | grep -qiE "$script_pattern_combined"; then
+    local match
+    match=$(echo "$script_content" | grep -oiE "$script_pattern_combined" | head -1) || true
+    if [[ -n "$match" ]]; then
+        MATCHED_PATTERN="script_suspicious"
+        MATCHED_STRING="$match"
         return 0  # SUSPICIOUS - found dangerous script pattern
     fi
 
@@ -857,7 +874,11 @@ analyze_script_content() {
     local content_single_line
     content_single_line=$(echo "$script_content" | tr '\n' ' ')
     for pattern in "${MULTILINE_SUSPICIOUS_PATTERNS[@]}"; do
-        if echo "$content_single_line" | grep -qiE "$pattern"; then
+        local match
+        match=$(echo "$content_single_line" | grep -oiE "$pattern" | head -1) || true
+        if [[ -n "$match" ]]; then
+            MATCHED_PATTERN="multiline_suspicious"
+            MATCHED_STRING="$match"
             return 0  # SUSPICIOUS - found multi-line dangerous pattern
         fi
     done
@@ -875,12 +896,16 @@ analyze_script_content() {
         if [[ "$line" =~ =\"([^\"]{30,})\" ]]; then
             local value="${BASH_REMATCH[1]}"
             if is_high_entropy "$value" 4.5; then
+                MATCHED_PATTERN="high_entropy"
+                MATCHED_STRING="${value:0:50}..."
                 return 0  # SUSPICIOUS - high entropy indicates obfuscation
             fi
         # Try single quoted strings
         elif [[ "$line" =~ =\'([^\']{30,})\' ]]; then
             local value="${BASH_REMATCH[1]}"
             if is_high_entropy "$value" 4.5; then
+                MATCHED_PATTERN="high_entropy"
+                MATCHED_STRING="${value:0:50}..."
                 return 0  # SUSPICIOUS - high entropy indicates obfuscation
             fi
         # Fall back to unquoted strings without spaces
@@ -892,6 +917,8 @@ analyze_script_content() {
             value="${value%\"}"
             value="${value%\'}"
             if is_high_entropy "$value" 4.5; then
+                MATCHED_PATTERN="high_entropy"
+                MATCHED_STRING="${value:0:50}..."
                 return 0  # SUSPICIOUS - high entropy indicates obfuscation
             fi
         fi
@@ -1207,6 +1234,8 @@ add_finding() {
     local hash="$7"
     local metadata="$8"
     local additional_info="${9:-}"
+    local matched_pattern="${10:-}"    # The pattern that triggered detection
+    local matched_string="${11:-}"     # The actual string that matched
 
     # Extract structured fields from metadata and additional_info
     local owner=$(echo "$metadata" | grep -oP 'owner:\K[^|]+' | head -1 || echo "N/A")
@@ -1228,8 +1257,8 @@ add_finding() {
     # Build clean category name
     local clean_category="$category $subcategory"
 
-    # Call new structured function
-    add_finding_new "$clean_category" "$confidence" "$location" "$hash" "$owner" "$permissions" "$days_old" "$package_status" "$command" "$enabled" "$persistence_type"
+    # Call new structured function with matched_pattern and matched_string
+    add_finding_new "$clean_category" "$confidence" "$location" "$hash" "$owner" "$permissions" "$days_old" "$package_status" "$command" "$enabled" "$persistence_type" "$matched_pattern" "$matched_string"
 }
 
 # Initialize output files
@@ -1672,10 +1701,14 @@ check_cron() {
             local content
             content=$(grep -Ev "^#|^$" "$cron_path" 2>/dev/null | head -20) || true
             local confidence="MEDIUM"
+            local finding_matched_pattern=""
+            local finding_matched_string=""
 
             if [[ $pkg_return -eq 2 ]]; then
                 # Package file was MODIFIED - CRITICAL
                 confidence="CRITICAL"
+                finding_matched_pattern="modified_package"
+                finding_matched_string="$cron_path"
                 log_finding "Crontab is MODIFIED package file: $cron_path"
             fi
 
@@ -1686,11 +1719,14 @@ check_cron() {
                 cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}') || true
                 if analyze_cron_command "$cron_command" "$cron_path"; then
                     [[ "$confidence" != "CRITICAL" ]] && confidence="HIGH"
+                    # Extract pattern and string from CRON_ANALYSIS_REASON (format: pattern:value)
+                    finding_matched_pattern="${CRON_ANALYSIS_REASON%%:*}"
+                    finding_matched_string="${CRON_ANALYSIS_REASON#*:}"
                     log_finding "Crontab entry suspicious ($CRON_ANALYSIS_REASON): $cron_path"
                 fi
             done <<< "$content"
 
-            add_finding "Cron" "System" "crontab_file" "$cron_path" "System crontab" "$confidence" "$hash" "$metadata" "entries=$(echo "$content" | wc -l)|package=$package_status"
+            add_finding "Cron" "System" "crontab_file" "$cron_path" "System crontab" "$confidence" "$hash" "$metadata" "entries=$(echo "$content" | wc -l)|package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
         fi
     done
 
@@ -1718,10 +1754,14 @@ check_cron() {
                 local content
                 content=$(grep -Ev "^#|^$" "$cron_file" 2>/dev/null | head -20) || true
                 local confidence="MEDIUM"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
 
                 if [[ $pkg_return -eq 2 ]]; then
                     # Package file was MODIFIED - CRITICAL
                     confidence="CRITICAL"
+                    finding_matched_pattern="modified_package"
+                    finding_matched_string="$cron_file"
                     log_finding "Crontab is MODIFIED package file: $cron_file"
                 fi
 
@@ -1732,11 +1772,13 @@ check_cron() {
                     cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}') || true
                     if analyze_cron_command "$cron_command" "$cron_file"; then
                         [[ "$confidence" != "CRITICAL" ]] && confidence="HIGH"
+                        finding_matched_pattern="${CRON_ANALYSIS_REASON%%:*}"
+                        finding_matched_string="${CRON_ANALYSIS_REASON#*:}"
                         log_finding "Crontab entry suspicious ($CRON_ANALYSIS_REASON): $cron_file"
                     fi
                 done <<< "$content"
 
-                add_finding "Cron" "System" "crontab_file" "$cron_file" "Crontab: $(basename "$cron_file")" "$confidence" "$hash" "$metadata" "package=$package_status"
+                add_finding "Cron" "System" "crontab_file" "$cron_file" "Crontab: $(basename "$cron_file")" "$confidence" "$hash" "$metadata" "package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
 
             done < <(find "$cron_dir" -type f -print0 2>/dev/null)
         fi
@@ -1765,10 +1807,14 @@ check_cron() {
                 local metadata
                 metadata=$(get_file_metadata "$cron_script") || true
                 local confidence="MEDIUM"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
 
                 if [[ $pkg_return -eq 2 ]]; then
                     # Package file was MODIFIED - CRITICAL
                     confidence="CRITICAL"
+                    finding_matched_pattern="modified_package"
+                    finding_matched_string="$cron_script"
                     log_finding "Cron script is MODIFIED package file: $cron_script"
                 else
                     # UNMANAGED script - analyze content
@@ -1780,21 +1826,27 @@ check_cron() {
 
                     if [[ $days_old -lt 7 ]]; then
                         confidence="HIGH"
+                        finding_matched_pattern="recently_created"
+                        finding_matched_string="${days_old} days old"
                         log_finding "Recently created cron script: $cron_script (${days_old} days old)"
                     fi
 
                     if [[ "$cron_script" =~ \.(tmp|bak|old)$ ]] || [[ "$(basename "$cron_script")" =~ ^\. ]]; then
                         confidence="HIGH"
+                        finding_matched_pattern="suspicious_name"
+                        finding_matched_string="$(basename "$cron_script")"
                         log_finding "Cron script with suspicious name: $cron_script"
                     fi
 
                     if analyze_script_content "$cron_script"; then
                         confidence="HIGH"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
                         log_finding "Cron script contains suspicious content: $cron_script"
                     fi
                 fi
 
-                add_finding "Cron" "Script" "cron_script" "$cron_script" "Cron script: $(basename "$cron_script")" "$confidence" "$hash" "$metadata" "dir=$(basename "$(dirname "$cron_script")")|package=$package_status"
+                add_finding "Cron" "Script" "cron_script" "$cron_script" "Cron script: $(basename "$cron_script")" "$confidence" "$hash" "$metadata" "dir=$(basename "$(dirname "$cron_script")")|package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
 
             done < <(find "$cron_dir" -type f -print0 2>/dev/null)
         fi
@@ -1807,12 +1859,16 @@ check_cron() {
                 local user_cron=$(crontab -u "$username" -l 2>/dev/null || echo "")
                 if [[ -n "$user_cron" ]]; then
                     local confidence="MEDIUM"
+                    local finding_matched_pattern=""
+                    local finding_matched_string=""
                     if quick_suspicious_check "$user_cron"; then
                         confidence="HIGH"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
                         log_finding "Suspicious user crontab for: $username"
                     fi
 
-                    add_finding "Cron" "User" "user_crontab" "/var/spool/cron/crontabs/$username" "User $username crontab entries" "$confidence" "N/A" "user=$username" "preview=${user_cron:0:100}"
+                    add_finding "Cron" "User" "user_crontab" "/var/spool/cron/crontabs/$username" "User $username crontab entries" "$confidence" "N/A" "user=$username" "preview=${user_cron:0:100}" "$finding_matched_pattern" "$finding_matched_string"
                 fi
             fi
         done < /etc/passwd
@@ -1820,7 +1876,13 @@ check_cron() {
         # Non-root: check only current user
         local user_cron=$(crontab -l 2>/dev/null || echo "")
         if [[ -n "$user_cron" ]]; then
-            add_finding "Cron" "User" "user_crontab" "~/.crontab" "Current user crontab" "MEDIUM" "N/A" "user=$(whoami)" "preview=${user_cron:0:100}"
+            local finding_matched_pattern=""
+            local finding_matched_string=""
+            if quick_suspicious_check "$user_cron"; then
+                finding_matched_pattern="$MATCHED_PATTERN"
+                finding_matched_string="$MATCHED_STRING"
+            fi
+            add_finding "Cron" "User" "user_crontab" "~/.crontab" "Current user crontab" "MEDIUM" "N/A" "user=$(whoami)" "preview=${user_cron:0:100}" "$finding_matched_pattern" "$finding_matched_string"
         fi
     fi
 
@@ -1834,12 +1896,16 @@ check_cron() {
                 local job_details=$(at -c "$job_id" 2>/dev/null | tail -20 || echo "")
 
                 local confidence="LOW"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
                 if quick_suspicious_check "$job_details"; then
                     confidence="HIGH"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
                     log_finding "Suspicious at job: $job_id"
                 fi
 
-                add_finding "Scheduled" "At" "at_job" "/var/spool/cron/atjobs/$job_id" "At job $job_id" "$confidence" "N/A" "$job_line" "job_id=$job_id"
+                add_finding "Scheduled" "At" "at_job" "/var/spool/cron/atjobs/$job_id" "At job $job_id" "$confidence" "N/A" "$job_line" "job_id=$job_id" "$finding_matched_pattern" "$finding_matched_string"
             done <<< "$at_jobs"
         fi
     fi
@@ -1868,11 +1934,17 @@ check_shell_profiles() {
                 local content=$(head -n 500 "$profile" 2>/dev/null || echo "")
 
                 local confidence="LOW"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
                 if quick_suspicious_check "$content"; then
                     confidence="HIGH"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
                     log_finding "Suspicious content in profile: $profile"
                 elif analyze_script_content "$profile"; then
                     confidence="HIGH"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
                     log_finding "Profile contains suspicious script patterns: $profile"
                 fi
 
@@ -1881,7 +1953,7 @@ check_shell_profiles() {
                 package_status=$(is_package_managed "$profile") || true
                 confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
-                add_finding "ShellProfile" "System" "profile_file" "$profile" "System shell profile" "$confidence" "$hash" "$metadata" "package=$package_status"
+                add_finding "ShellProfile" "System" "profile_file" "$profile" "System shell profile" "$confidence" "$hash" "$metadata" "package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
 
             elif [[ -d "$profile" ]]; then
                 while IFS= read -r -d '' profile_file; do
@@ -1890,11 +1962,17 @@ check_shell_profiles() {
                     local content=$(head -n 500 "$profile_file" 2>/dev/null || echo "")
 
                     local confidence="LOW"
+                    local finding_matched_pattern=""
+                    local finding_matched_string=""
                     if quick_suspicious_check "$content"; then
                         confidence="HIGH"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
                         log_finding "Suspicious profile script: $profile_file"
                     elif analyze_script_content "$profile_file"; then
                         confidence="HIGH"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
                         log_finding "Profile.d script contains suspicious patterns: $profile_file"
                     fi
 
@@ -1903,7 +1981,7 @@ check_shell_profiles() {
                     package_status=$(is_package_managed "$profile_file") || true
                     confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
-                    add_finding "ShellProfile" "System" "profile_script" "$profile_file" "Profile.d script: $(basename "$profile_file")" "$confidence" "$hash" "$metadata" "package=$package_status"
+                    add_finding "ShellProfile" "System" "profile_script" "$profile_file" "Profile.d script: $(basename "$profile_file")" "$confidence" "$hash" "$metadata" "package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
 
                 done < <(find "$profile" -type f -print0 2>/dev/null)
             fi
@@ -1934,15 +2012,21 @@ check_shell_profiles() {
                         local content=$(head -n 500 "$profile_path" 2>/dev/null || echo "")
 
                         local confidence="LOW"
+                        local finding_matched_pattern=""
+                        local finding_matched_string=""
                         if quick_suspicious_check "$content"; then
                             confidence="HIGH"
+                            finding_matched_pattern="$MATCHED_PATTERN"
+                            finding_matched_string="$MATCHED_STRING"
                             log_finding "Suspicious user profile: $profile_path (user: $username)"
                         elif analyze_script_content "$profile_path"; then
                             confidence="HIGH"
+                            finding_matched_pattern="$MATCHED_PATTERN"
+                            finding_matched_string="$MATCHED_STRING"
                             log_finding "User profile contains suspicious patterns: $profile_path (user: $username)"
                         fi
 
-                        add_finding "ShellProfile" "User" "user_profile" "$profile_path" "User profile for $username" "$confidence" "$hash" "$metadata" "user=$username"
+                        add_finding "ShellProfile" "User" "user_profile" "$profile_path" "User profile for $username" "$confidence" "$hash" "$metadata" "user=$username" "$finding_matched_pattern" "$finding_matched_string"
                     fi
                 done
             fi
@@ -1957,13 +2041,19 @@ check_shell_profiles() {
                 local content=$(head -n 500 "$profile_path" 2>/dev/null || echo "")
 
                 local confidence="LOW"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
                 if quick_suspicious_check "$content"; then
                     confidence="MEDIUM"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
                 elif analyze_script_content "$profile_path"; then
                     confidence="MEDIUM"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
                 fi
 
-                add_finding "ShellProfile" "User" "user_profile" "$profile_path" "Current user profile" "$confidence" "$hash" "$metadata" "user=$(whoami)"
+                add_finding "ShellProfile" "User" "user_profile" "$profile_path" "Current user profile" "$confidence" "$hash" "$metadata" "user=$(whoami)" "$finding_matched_pattern" "$finding_matched_string"
             fi
         done
     fi
@@ -1995,11 +2085,15 @@ check_ssh() {
                         local suspicious_config=$(grep -iE "(ProxyCommand|LocalForward|RemoteForward|DynamicForward)" "$ssh_dir/config" 2>/dev/null || echo "")
 
                         local confidence="LOW"
+                        local finding_matched_pattern=""
+                        local finding_matched_string=""
                         if [[ -n "$suspicious_config" ]]; then
                             confidence="MEDIUM"
+                            finding_matched_pattern="ssh_forwarding"
+                            finding_matched_string="$suspicious_config"
                         fi
 
-                        add_finding "SSH" "Config" "ssh_config" "$ssh_dir/config" "User SSH config for $username" "$confidence" "$hash" "$metadata" "user=$username"
+                        add_finding "SSH" "Config" "ssh_config" "$ssh_dir/config" "User SSH config for $username" "$confidence" "$hash" "$metadata" "user=$username" "$finding_matched_pattern" "$finding_matched_string"
                     fi
                 fi
             fi
@@ -2022,11 +2116,15 @@ check_ssh() {
         local suspicious_sshd=$(grep -iE "(PermitRootLogin yes|PasswordAuthentication yes|PermitEmptyPasswords yes|AuthorizedKeysFile)" /etc/ssh/sshd_config 2>/dev/null | grep -v "^#" || echo "")
 
         local confidence="LOW"
+        local finding_matched_pattern=""
+        local finding_matched_string=""
         if echo "$suspicious_sshd" | grep -qiE "(PermitRootLogin yes|PermitEmptyPasswords yes)"; then
             confidence="MEDIUM"
+            finding_matched_pattern="insecure_sshd"
+            finding_matched_string="$suspicious_sshd"
         fi
 
-        add_finding "SSH" "SystemConfig" "sshd_config" "/etc/ssh/sshd_config" "SSH daemon configuration" "$confidence" "$hash" "$metadata" ""
+        add_finding "SSH" "SystemConfig" "sshd_config" "/etc/ssh/sshd_config" "SSH daemon configuration" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
     fi
 }
 
@@ -2053,15 +2151,21 @@ check_init_scripts() {
             package_status=$(is_package_managed "$rc_local") || pkg_return=$?
 
             local confidence="MEDIUM"
+            local finding_matched_pattern=""
+            local finding_matched_string=""
 
             # If it's package-managed and verified, still flag but lower confidence
             # (rc.local having content is unusual even if from a package)
             if [[ -n "$content" ]]; then
                 if quick_suspicious_check "$content"; then
                     confidence="HIGH"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
                     log_finding "Suspicious rc.local: $rc_local"
                 elif analyze_script_content "$rc_local"; then
                     confidence="HIGH"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
                     log_finding "rc.local contains suspicious patterns: $rc_local"
                 fi
             fi
@@ -2069,7 +2173,7 @@ check_init_scripts() {
             # Adjust confidence based on package status
             confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
-            add_finding "Init" "RcLocal" "rc_local" "$rc_local" "rc.local startup script" "$confidence" "$hash" "$metadata" "package=$package_status"
+            add_finding "Init" "RcLocal" "rc_local" "$rc_local" "rc.local startup script" "$confidence" "$hash" "$metadata" "package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
         fi
     done
 
@@ -2103,23 +2207,31 @@ check_init_scripts() {
             local hash="DEFER"
             local metadata=$(get_file_metadata "$init_file")
             local confidence="MEDIUM"
+            local finding_matched_pattern=""
+            local finding_matched_string=""
 
             if [[ $pkg_return -eq 2 ]]; then
                 # Package file was MODIFIED - CRITICAL
                 confidence="CRITICAL"
+                finding_matched_pattern="modified_package"
+                finding_matched_string="$init_file"
                 log_finding "Init script is MODIFIED package file: $init_file"
             else
                 # UNMANAGED script - analyze content
                 if quick_suspicious_check "$(head -n 50 "$init_file" 2>/dev/null)"; then
                     confidence="HIGH"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
                     log_finding "Suspicious init script: $init_file"
                 elif analyze_script_content "$init_file"; then
                     confidence="HIGH"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
                     log_finding "Init script contains suspicious patterns: $init_file"
                 fi
             fi
 
-            add_finding "Init" "Script" "init_script" "$init_file" "Init script: $(basename "$init_file")" "$confidence" "$hash" "$metadata" "package=$package_status"
+            add_finding "Init" "Script" "init_script" "$init_file" "Init script: $(basename "$init_file")" "$confidence" "$hash" "$metadata" "package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
 
         done < <(find "/etc/init.d" -maxdepth 1 -type f -print0 2>/dev/null)
     fi
@@ -2138,15 +2250,19 @@ check_init_scripts() {
                     local hash="DEFER"
                     local metadata=$(get_file_metadata "$rc_file")
                     local confidence="HIGH"
+                    local finding_matched_pattern="non_symlink_in_rcd"
+                    local finding_matched_string="$rc_file"
 
                     log_finding "Non-symlink file in rc directory (unusual): $rc_file"
 
                     if analyze_script_content "$rc_file"; then
                         confidence="CRITICAL"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
                         log_finding "Suspicious script in rc directory: $rc_file"
                     fi
 
-                    add_finding "Init" "RcDir" "rc_script" "$rc_file" "Script in rc directory: $(basename "$rc_file")" "$confidence" "$hash" "$metadata" "dir=$(basename "$rc_dir")"
+                    add_finding "Init" "RcDir" "rc_script" "$rc_file" "Script in rc directory: $(basename "$rc_file")" "$confidence" "$hash" "$metadata" "dir=$(basename "$rc_dir")" "$finding_matched_pattern" "$finding_matched_string"
                 fi
             done < <(find "$rc_dir" -maxdepth 1 -type f -print0 2>/dev/null)
         fi
@@ -2255,12 +2371,16 @@ check_additional_persistence() {
                 local exec_line=$(grep "^Exec=" "$desktop_file" 2>/dev/null | cut -d'=' -f2- || echo "")
 
                 local confidence="LOW"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
                 if quick_suspicious_check "$exec_line"; then
                     confidence="HIGH"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
                     log_finding "Suspicious XDG autostart: $desktop_file"
                 fi
 
-                add_finding "Autostart" "XDG" "xdg_autostart" "$desktop_file" "XDG autostart: $(basename "$desktop_file") | Exec: $exec_line" "$confidence" "$hash" "$metadata" ""
+                add_finding "Autostart" "XDG" "xdg_autostart" "$desktop_file" "XDG autostart: $(basename "$desktop_file") | Exec: $exec_line" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
             done < <(find "$autostart_dir" -type f -name "*.desktop" -print0 2>/dev/null)
         fi
     done
@@ -2272,12 +2392,16 @@ check_additional_persistence() {
         local suspicious_env=$(grep -iE "(LD_PRELOAD|LD_LIBRARY_PATH)" /etc/environment 2>/dev/null || echo "")
 
         local confidence="LOW"
+        local finding_matched_pattern=""
+        local finding_matched_string=""
         if [[ -n "$suspicious_env" ]]; then
             confidence="HIGH"
+            finding_matched_pattern="ld_preload_env"
+            finding_matched_string="$suspicious_env"
             log_finding "Suspicious environment variables in /etc/environment"
         fi
 
-        add_finding "Environment" "System" "environment_file" "/etc/environment" "System environment file" "$confidence" "$hash" "$metadata" ""
+        add_finding "Environment" "System" "environment_file" "/etc/environment" "System environment file" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
     fi
 
     # Check sudoers for persistence
@@ -2307,11 +2431,15 @@ check_additional_persistence() {
             local suspicious_pam=$(grep -v "^#" "$pam_file" 2>/dev/null | grep -E "pam_.*\.so" | grep -vE "(pam_unix|pam_systemd|pam_permit|pam_deny|pam_env|pam_limits)" || echo "")
 
             local confidence="LOW"
+            local finding_matched_pattern=""
+            local finding_matched_string=""
             if [[ -n "$suspicious_pam" ]]; then
                 confidence="MEDIUM"
+                finding_matched_pattern="unusual_pam_module"
+                finding_matched_string="$suspicious_pam"
             fi
 
-            add_finding "PAM" "Config" "pam_config" "$pam_file" "PAM config: $(basename "$pam_file")" "$confidence" "$hash" "$metadata" ""
+            add_finding "PAM" "Config" "pam_config" "$pam_file" "PAM config: $(basename "$pam_file")" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
         done < <(find /etc/pam.d -type f -print0 2>/dev/null)
     fi
 
@@ -2329,12 +2457,21 @@ check_additional_persistence() {
                 local content=$(head -n 100 "$motd_script" 2>/dev/null || echo "")
 
                 local confidence="LOW"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
                 if quick_suspicious_check "$content"; then
                     confidence="HIGH"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
                     log_finding "Suspicious MOTD script: $motd_script"
+                elif analyze_script_content "$motd_script"; then
+                    confidence="HIGH"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
+                    log_finding "MOTD script contains suspicious patterns: $motd_script"
                 fi
 
-                add_finding "MOTD" "Script" "motd_script" "$motd_script" "MOTD script: $(basename "$motd_script")" "$confidence" "$hash" "$metadata" ""
+                add_finding "MOTD" "Script" "motd_script" "$motd_script" "MOTD script: $(basename "$motd_script")" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
             done < <(find "$motd_dir" -type f -print0 2>/dev/null)
         fi
     done
@@ -2360,12 +2497,16 @@ check_common_backdoors() {
                 local content=$(cat "$config_dir" 2>/dev/null || echo "")
 
                 local confidence="LOW"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
                 if check_suspicious_patterns "$content"; then
                     confidence="HIGH"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
                     log_finding "Suspicious package manager config: $config_dir"
                 fi
 
-                add_finding "PackageManager" "Config" "pkg_config" "$config_dir" "Package manager configuration: $(basename "$config_dir")" "$confidence" "$hash" "$metadata" ""
+                add_finding "PackageManager" "Config" "pkg_config" "$config_dir" "Package manager configuration: $(basename "$config_dir")" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
 
             elif [[ -d "$config_dir" ]]; then
                 while IFS= read -r -d '' config_file; do
@@ -2374,12 +2515,16 @@ check_common_backdoors() {
                     local content=$(head -50 "$config_file" 2>/dev/null || echo "")
 
                     local confidence="LOW"
+                    local finding_matched_pattern=""
+                    local finding_matched_string=""
                     if check_suspicious_patterns "$content"; then
                         confidence="HIGH"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
                         log_finding "Suspicious package manager config: $config_file"
                     fi
 
-                    add_finding "PackageManager" "Config" "pkg_config" "$config_file" "Package manager config: $(basename "$config_file")" "$confidence" "$hash" "$metadata" ""
+                    add_finding "PackageManager" "Config" "pkg_config" "$config_file" "Package manager config: $(basename "$config_file")" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
                 done < <(find "$config_dir" -type f -print0 2>/dev/null)
             fi
         fi
@@ -2407,12 +2552,17 @@ check_common_backdoors() {
         local content=$(cat "/etc/doas.conf" 2>/dev/null || echo "")
 
         local confidence="MEDIUM"
-        if echo "$content" | grep -qiE "(permit nopass|persist)"; then
+        local finding_matched_pattern=""
+        local finding_matched_string=""
+        local permissive_match=$(echo "$content" | grep -iE "(permit nopass|persist)" | head -1) || true
+        if [[ -n "$permissive_match" ]]; then
             confidence="HIGH"
+            finding_matched_pattern="permissive_doas"
+            finding_matched_string="$permissive_match"
             log_finding "Potentially permissive doas configuration"
         fi
 
-        add_finding "Privilege" "Doas" "doas_config" "/etc/doas.conf" "Doas privilege escalation config" "$confidence" "$hash" "$metadata" ""
+        add_finding "Privilege" "Doas" "doas_config" "/etc/doas.conf" "Doas privilege escalation config" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
     fi
 
     # Check for user git configs (can contain credential helpers or hooks)
@@ -2426,15 +2576,22 @@ check_common_backdoors() {
                     local content=$(cat "$gitconfig" 2>/dev/null || echo "")
 
                     local confidence="LOW"
-                    if echo "$content" | grep -qiE "(credential.*helper|core.*pager|core.*editor.*sh)"; then
+                    local finding_matched_pattern=""
+                    local finding_matched_string=""
+                    local helper_match=$(echo "$content" | grep -iE "(credential.*helper|core.*pager|core.*editor.*sh)" | head -1) || true
+                    if [[ -n "$helper_match" ]]; then
                         confidence="MEDIUM"
+                        finding_matched_pattern="git_helper"
+                        finding_matched_string="$helper_match"
                     fi
                     if check_suspicious_patterns "$content"; then
                         confidence="HIGH"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
                         log_finding "Suspicious git config for user $username: $gitconfig"
                     fi
 
-                    add_finding "GitConfig" "User" "git_config" "$gitconfig" "User git config for $username" "$confidence" "$hash" "$metadata" "user=$username"
+                    add_finding "GitConfig" "User" "git_config" "$gitconfig" "User git config for $username" "$confidence" "$hash" "$metadata" "user=$username" "$finding_matched_pattern" "$finding_matched_string"
                 fi
             fi
         done < /etc/passwd
@@ -2469,19 +2626,26 @@ check_common_backdoors() {
                 local days_old=$(( (current_time - mod_time) / 86400 ))
 
                 local confidence="LOW"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
                 if [[ $days_old -lt 30 ]]; then
                     confidence="MEDIUM"
+                    finding_matched_pattern="recently_modified"
+                    finding_matched_string="${days_old} days old"
 
                     # Check for webshell patterns
                     local content=$(head -100 "$web_file" 2>/dev/null || echo "")
-                    if echo "$content" | grep -qiE "(eval|base64_decode|system\(|exec\(|shell_exec|passthru|proc_open|popen)"; then
+                    local webshell_match=$(echo "$content" | grep -oiE "(eval|base64_decode|system\(|exec\(|shell_exec|passthru|proc_open|popen)" | head -1) || true
+                    if [[ -n "$webshell_match" ]]; then
                         confidence="HIGH"
+                        finding_matched_pattern="webshell_pattern"
+                        finding_matched_string="$webshell_match"
                         log_finding "Potential webshell detected: $web_file (modified ${days_old} days ago)"
                     fi
                 fi
 
                 if [[ $confidence != "LOW" ]]; then
-                    add_finding "WebShell" "Suspicious" "web_file" "$web_file" "Recently modified web file in $web_dir (${days_old} days old)" "$confidence" "$hash" "$metadata" "days_old=$days_old"
+                    add_finding "WebShell" "Suspicious" "web_file" "$web_file" "Recently modified web file in $web_dir (${days_old} days old)" "$confidence" "$hash" "$metadata" "days_old=$days_old" "$finding_matched_pattern" "$finding_matched_string"
                 fi
             done < <(find "$web_dir" -type f \( -name "*.php" -o -name "*.asp" -o -name "*.aspx" -o -name "*.jsp" \) -print0 2>/dev/null | head -100)
         fi
