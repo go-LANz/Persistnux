@@ -841,8 +841,9 @@ analyze_script_content() {
     fi
 
     # Read first 1000 lines of script (to avoid huge files)
+    # Strip null bytes to prevent bash warnings with binary content
     local script_content
-    script_content=$(head -n 1000 "$script_file" 2>/dev/null) || true
+    script_content=$(head -n 1000 "$script_file" 2>/dev/null | tr -d '\0') || true
 
     # Build combined pattern from NEVER_WHITELIST_PATTERNS (joined with |)
     local never_whitelist_combined=""
@@ -2474,7 +2475,8 @@ check_additional_persistence() {
             while IFS= read -r -d '' motd_script; do
                 local hash=$(get_file_hash "$motd_script")
                 local metadata=$(get_file_metadata "$motd_script")
-                local content=$(head -n 100 "$motd_script" 2>/dev/null || echo "")
+                # Strip null bytes to prevent bash warnings with binary content
+                local content=$(head -n 100 "$motd_script" 2>/dev/null | tr -d '\0' || echo "")
 
                 local confidence="LOW"
                 local finding_matched_pattern=""
