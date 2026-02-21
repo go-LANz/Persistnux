@@ -2355,22 +2355,89 @@ check_additional_persistence() {
     fi
 
     # Check for PAM backdoors
+    # Verify actual PAM module .so files, not just config references
     if [[ -d "/etc/pam.d" ]]; then
-        while IFS= read -r -d '' pam_file; do
-            local hash=$(get_file_hash "$pam_file")
-            local metadata=$(get_file_metadata "$pam_file")
-            local suspicious_pam=$(grep -v "^#" "$pam_file" 2>/dev/null | grep -E "pam_.*\.so" | grep -vE "(pam_unix|pam_systemd|pam_permit|pam_deny|pam_env|pam_limits)" || echo "")
+        # Common PAM module directories
+        local pam_lib_dirs=(
+            "/lib/security"
+            "/lib64/security"
+            "/lib/x86_64-linux-gnu/security"
+            "/lib/aarch64-linux-gnu/security"
+            "/usr/lib/security"
+            "/usr/lib64/security"
+            "/usr/lib/x86_64-linux-gnu/security"
+        )
 
-            local confidence="LOW"
-            local finding_matched_pattern=""
-            local finding_matched_string=""
-            if [[ -n "$suspicious_pam" ]]; then
-                confidence="MEDIUM"
-                finding_matched_pattern="unusual_pam_module"
-                finding_matched_string="$suspicious_pam"
+        # Find the actual PAM lib directory on this system
+        local pam_lib_dir=""
+        for dir in "${pam_lib_dirs[@]}"; do
+            if [[ -d "$dir" ]]; then
+                pam_lib_dir="$dir"
+                break
             fi
+        done
 
-            add_finding "PAM" "Config" "pam_config" "$pam_file" "PAM config: $(basename "$pam_file")" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
+        # Track which modules we've already checked (avoid duplicates)
+        declare -A checked_modules
+
+        while IFS= read -r -d '' pam_file; do
+            # Extract PAM module names from config (e.g., pam_unix.so)
+            local modules
+            modules=$(grep -v "^#" "$pam_file" 2>/dev/null | grep -oE "pam_[a-zA-Z0-9_]+\.so" | sort -u) || true
+
+            for module in $modules; do
+                # Skip if already checked
+                [[ -n "${checked_modules[$module]}" ]] && continue
+                checked_modules[$module]=1
+
+                # Find the actual .so file
+                local module_path=""
+                if [[ -n "$pam_lib_dir" ]] && [[ -f "$pam_lib_dir/$module" ]]; then
+                    module_path="$pam_lib_dir/$module"
+                else
+                    # Try to find it
+                    for dir in "${pam_lib_dirs[@]}"; do
+                        if [[ -f "$dir/$module" ]]; then
+                            module_path="$dir/$module"
+                            break
+                        fi
+                    done
+                fi
+
+                # If module file doesn't exist, skip (might be optional/conditional)
+                [[ -z "$module_path" ]] && continue
+
+                # Check package status of the actual .so file
+                local pkg_status pkg_return=0
+                pkg_status=$(is_package_managed "$module_path") || pkg_return=$?
+
+                if [[ $pkg_return -eq 0 ]]; then
+                    # Package-managed and VERIFIED - skip
+                    continue
+                fi
+
+                local hash=$(get_file_hash "$module_path")
+                local metadata=$(get_file_metadata "$module_path")
+                local confidence="MEDIUM"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
+
+                if [[ $pkg_return -eq 2 ]]; then
+                    # Module was MODIFIED - CRITICAL (potential backdoor)
+                    confidence="CRITICAL"
+                    finding_matched_pattern="modified_pam_module"
+                    finding_matched_string="$module_path"
+                    log_finding "PAM module is MODIFIED package file: $module_path"
+                else
+                    # UNMANAGED module - suspicious
+                    confidence="HIGH"
+                    finding_matched_pattern="unmanaged_pam_module"
+                    finding_matched_string="$module_path"
+                    log_finding "Unmanaged PAM module: $module_path"
+                fi
+
+                add_finding "PAM" "Module" "pam_module" "$module_path" "PAM module: $module" "$confidence" "$hash" "$metadata" "package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
+            done
         done < <(find /etc/pam.d -type f -print0 2>/dev/null)
     fi
 
