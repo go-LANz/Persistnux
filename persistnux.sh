@@ -1315,9 +1315,15 @@ check_systemd() {
                     exec_start=$(grep -E "^ExecStart=" "$service_file" 2>/dev/null | head -1 | cut -d'=' -f2- || echo "")
                 fi
 
+                # Skip services with no ExecStart - nothing to analyse
+                [[ -z "$exec_start" ]] && continue
+
                 # Check if service is enabled (using cache for performance)
                 local enabled_status
                 enabled_status=$(get_systemctl_enabled_status "$service_name")
+
+                # Skip disabled services - not active, not a persistence risk
+                [[ "$enabled_status" == "disabled" ]] && continue
 
                 local confidence="MEDIUM"
                 local finding_matched_pattern=""
@@ -1498,12 +1504,6 @@ check_systemd() {
                         finding_matched_string="$executable"
                     fi
 
-                else
-                    # No ExecStart found - can't verify anything
-                    # Keep default MEDIUM confidence
-                    package_status="no_execstart"
-                    finding_matched_pattern="no_execstart"
-                    finding_matched_string="service has no ExecStart"
                 fi
 
                 # Extract owner and permissions from metadata
