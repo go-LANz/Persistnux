@@ -1,6 +1,6 @@
 # Persistnux Detection Logic Tree
 
-## Version 1.8.0
+## Version 1.9.0
 
 This document describes the complete detection and analysis logic flow.
 
@@ -55,20 +55,19 @@ diff baseline_*/persistnux_*.csv current_scan/persistnux_*.csv
 ├─────────────────────────────────────────────────────────────────┤
 │  1. Initialize → Parse args, create output files                │
 │  2. Build Patterns → Compile regex for fast matching            │
-│  3. Run 8 Detection Modules (sequential)                        │
+│  3. Run 7 Detection Modules (sequential)                        │
 │  4. Output → CSV + JSONL with matched patterns                  │
 │  5. Cleanup → Remove temp files                                 │
 └─────────────────────────────────────────────────────────────────┘
 
 Detection Modules:
-  [1/8] Systemd Services    → .service files, ExecStart analysis
-  [2/8] Cron Jobs           → System/user crontabs, at jobs
-  [3/8] Shell Profiles      → .bashrc, .profile, /etc/profile.d
-  [4/8] SSH Persistence     → authorized_keys, ssh_config
-  [5/8] Init Scripts        → rc.local, /etc/init.d
-  [6/8] Kernel/Preload      → ld.so.preload, kernel modules
-  [7/8] Additional          → XDG autostart, sudoers, PAM, MOTD
-  [8/8] Backdoor Locations  → Package managers, git, webshells
+  [1/7] Systemd Services    → .service files, ExecStart analysis
+  [2/7] Cron Jobs           → System/user crontabs, at jobs
+  [3/7] Shell Profiles      → .bashrc, .profile, /etc/profile.d
+  [4/7] Init Scripts        → rc.local, /etc/init.d
+  [5/7] Kernel/Preload      → ld.so.preload, kernel modules
+  [6/7] Additional          → XDG autostart, sudoers, PAM, MOTD
+  [7/7] Backdoor Locations  → Package managers, git, webshells
 ```
 
 ---
@@ -88,7 +87,7 @@ Detection Modules:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│              SYSTEMD SERVICE ANALYSIS (v1.8.0)                  │
+│              SYSTEMD SERVICE ANALYSIS (v1.9.0)                  │
 │         Only scans .service files (not .socket/.timer)          │
 │                                                                 │
 │  OPTIMIZATION: Package verification FIRST, skip analysis if OK │
@@ -452,7 +451,7 @@ For each cron file/entry:
 
 ---
 
-## Module 3-8: Other Detection Modules
+## Modules 3-7: Other Detection Modules
 
 ### Shell Profiles (Module 3)
 ```
@@ -461,35 +460,30 @@ CHECK: curl, wget, nc, eval, base64 decode, chmod +x
 CONFIDENCE: Suspicious content → HIGH, else LOW
 ```
 
-### SSH Persistence (Module 4)
-```
-SCAN: ~/.ssh/authorized_keys, ~/.ssh/config, /etc/ssh/sshd_config
-CHECK: Key counts, ProxyCommand, port forwarding, weak configs
-CONFIDENCE: Suspicious config → MEDIUM/HIGH
-```
-
-### Init Scripts (Module 5)
+### Init Scripts (Module 4)
 ```
 SCAN: /etc/rc.local, /etc/init.d/*, /etc/rc*.d/*
 CHECK: Suspicious commands in startup scripts
 CONFIDENCE: curl/wget/nc in init → HIGH
 ```
 
-### Kernel/Preload (Module 6)
+### Kernel/Preload (Module 5)
 ```
 SCAN: /etc/ld.so.preload, /etc/ld.so.conf.d/*, lsmod
 CHECK: LD_PRELOAD entries, loaded kernel modules
 CONFIDENCE: Non-empty ld.so.preload → HIGH
 ```
 
-### Additional Persistence (Module 7)
+### Additional Persistence (Module 6)
 ```
 SCAN: XDG autostart, /etc/environment, sudoers, PAM, MOTD
-CHECK: Suspicious exec lines, LD_PRELOAD in env, unusual PAM modules
+CHECK: Suspicious exec lines, LD_PRELOAD in env
+PAM: Verifies module .so files using package verification
+     Modified → CRITICAL, Unmanaged → HIGH
 CONFIDENCE: Context-dependent
 ```
 
-### Backdoor Locations (Module 8)
+### Backdoor Locations (Module 7)
 ```
 SCAN: APT/YUM configs, git configs, web directories
 CHECK: Webshell patterns (eval, base64_decode, system())
@@ -500,7 +494,7 @@ CONFIDENCE: Recently modified + webshell patterns → HIGH
 
 ## Output Schema
 
-### CSV Columns (v1.8.0)
+### CSV Columns (v1.9.0)
 ```
 timestamp,hostname,category,confidence,file_path,file_hash,
 file_owner,file_permissions,file_age_days,package_status,

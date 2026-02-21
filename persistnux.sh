@@ -388,7 +388,7 @@ print_banner() {
  / ____/  __/ /  (__  ) (__  ) /_/ /_/ />  <_>  <
 /_/    \___/_/  /____/_/____/\__/\__,_/_/|_/_/|_|
 
-    Linux Persistence Detection Tool v1.8.0
+    Linux Persistence Detection Tool v1.9.0
     For DFIR Investigations
 EOF
     echo -e "${NC}"
