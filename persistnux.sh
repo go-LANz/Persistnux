@@ -490,6 +490,12 @@ get_systemctl_enabled_status() {
 is_package_managed() {
     local file="$1"
 
+    # Canonicalize path (resolve symlinks like /lib -> /usr/lib)
+    # dpkg stores canonical paths, so /lib/... won't match /usr/lib/... without this
+    if [[ -e "$file" ]]; then
+        file=$(realpath "$file" 2>/dev/null) || true
+    fi
+
     # Check cache first (performance optimization)
     if [[ -n "${PKG_CACHE[$file]+isset}" ]]; then
         local cached="${PKG_CACHE[$file]}"
