@@ -2227,83 +2227,253 @@ check_init_scripts() {
 check_kernel_and_preload() {
     log_info "[5/7] Checking kernel modules and library preloading..."
 
-    # LD_PRELOAD in environment and configs
-    local preload_files=(
-        "/etc/ld.so.preload"
-        "/etc/ld.so.conf"
-        "/etc/ld.so.conf.d"
-    )
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Suspicious locations for libraries/modules - these should NEVER contain
+    # legitimate system libraries or kernel modules
+    # ═══════════════════════════════════════════════════════════════════════════
+    local suspicious_locations_pattern="^/(tmp|dev/shm|var/tmp|home|root)/|/\."
 
-    for preload_file in "${preload_files[@]}"; do
-        if [[ -e "$preload_file" ]]; then
-            if [[ -f "$preload_file" ]]; then
-                local hash=$(get_file_hash "$preload_file")
-                local metadata=$(get_file_metadata "$preload_file")
-                local content=$(cat "$preload_file" 2>/dev/null || echo "")
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 1: /etc/ld.so.preload - Libraries loaded into ALL processes
+    # This file is almost NEVER used legitimately - any content is suspicious
+    # ═══════════════════════════════════════════════════════════════════════════
+    if [[ -f "/etc/ld.so.preload" ]]; then
+        local preload_content
+        preload_content=$(grep -v "^#" "/etc/ld.so.preload" 2>/dev/null | grep -v "^$") || true
 
-                if [[ -n "$content" ]] && [[ "$content" != "" ]]; then
-                    log_finding "LD_PRELOAD configuration found: $preload_file"
-                    add_finding "Preload" "LDPreload" "ld_preload" "$preload_file" "LD_PRELOAD config with content" "HIGH" "$hash" "$metadata" "content=$content"
+        if [[ -n "$preload_content" ]]; then
+            # Parse each library path and verify
+            while IFS= read -r lib_path; do
+                [[ -z "$lib_path" ]] && continue
+
+                local confidence="HIGH"
+                local finding_matched_pattern="ld_preload_entry"
+                local finding_matched_string="$lib_path"
+
+                # Check if library file exists
+                if [[ -f "$lib_path" ]]; then
+                    local lib_hash=$(get_file_hash "$lib_path")
+                    local lib_metadata=$(get_file_metadata "$lib_path")
+
+                    # Check for suspicious location FIRST
+                    if [[ "$lib_path" =~ $suspicious_locations_pattern ]]; then
+                        confidence="CRITICAL"
+                        finding_matched_pattern="preload_suspicious_location"
+                        log_finding "LD_PRELOAD library in suspicious location: $lib_path"
+                    else
+                        # Check package status
+                        local pkg_status pkg_return=0
+                        pkg_status=$(is_package_managed "$lib_path") || pkg_return=$?
+
+                        if [[ $pkg_return -eq 0 ]]; then
+                            # Package-managed and verified - still suspicious in ld.so.preload!
+                            # Even legitimate libraries in ld.so.preload is unusual
+                            confidence="MEDIUM"
+                            finding_matched_pattern="preload_verified_lib"
+                            log_finding "LD_PRELOAD with package-managed library (unusual): $lib_path"
+                        elif [[ $pkg_return -eq 2 ]]; then
+                            # MODIFIED package file - CRITICAL
+                            confidence="CRITICAL"
+                            finding_matched_pattern="preload_modified_lib"
+                            log_finding "LD_PRELOAD with MODIFIED library: $lib_path"
+                        else
+                            # Unmanaged library in ld.so.preload - HIGH
+                            confidence="HIGH"
+                            finding_matched_pattern="preload_unmanaged_lib"
+                            log_finding "LD_PRELOAD with unmanaged library: $lib_path"
+                        fi
+                    fi
+
+                    add_finding "Preload" "LDPreload" "ld_preload_lib" "$lib_path" "Preloaded library: $lib_path" "$confidence" "$lib_hash" "$lib_metadata" "package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
                 else
-                    add_finding "Preload" "LDPreload" "ld_preload" "$preload_file" "LD_PRELOAD config (empty)" "LOW" "$hash" "$metadata" ""
+                    # Library doesn't exist - still flag the config entry
+                    log_finding "LD_PRELOAD references non-existent library: $lib_path"
+                    add_finding "Preload" "LDPreload" "ld_preload_missing" "/etc/ld.so.preload" "Preload references missing library: $lib_path" "MEDIUM" "N/A" "N/A" "" "preload_missing_lib" "$lib_path"
                 fi
+            done <<< "$preload_content"
+        fi
+    fi
 
-            elif [[ -d "$preload_file" ]]; then
-                while IFS= read -r -d '' conf_file; do
-                    local hash=$(get_file_hash "$conf_file")
-                    local metadata=$(get_file_metadata "$conf_file")
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 2: /etc/ld.so.conf and /etc/ld.so.conf.d/* - Library search paths
+    # Check for suspicious paths being added to library search
+    # ═══════════════════════════════════════════════════════════════════════════
+    local ld_conf_files=()
+    [[ -f "/etc/ld.so.conf" ]] && ld_conf_files+=("/etc/ld.so.conf")
+    if [[ -d "/etc/ld.so.conf.d" ]]; then
+        while IFS= read -r -d '' conf_file; do
+            ld_conf_files+=("$conf_file")
+        done < <(find "/etc/ld.so.conf.d" -type f -name "*.conf" -print0 2>/dev/null)
+    fi
 
-                    add_finding "Preload" "LDConfig" "ld_config" "$conf_file" "LD configuration: $(basename "$conf_file")" "LOW" "$hash" "$metadata" ""
-                done < <(find "$preload_file" -type f -print0 2>/dev/null)
+    for conf_file in "${ld_conf_files[@]}"; do
+        local hash=$(get_file_hash "$conf_file")
+        local metadata=$(get_file_metadata "$conf_file")
+        local confidence="LOW"
+        local finding_matched_pattern=""
+        local finding_matched_string=""
+
+        # Check package status of config file
+        local pkg_status pkg_return=0
+        pkg_status=$(is_package_managed "$conf_file") || pkg_return=$?
+
+        if [[ $pkg_return -eq 2 ]]; then
+            # Config file was MODIFIED
+            confidence="CRITICAL"
+            finding_matched_pattern="modified_ld_config"
+            finding_matched_string="$conf_file"
+            log_finding "LD config is MODIFIED package file: $conf_file"
+        elif [[ $pkg_return -eq 1 ]]; then
+            # Unmanaged config - check for suspicious paths
+            local suspicious_paths
+            suspicious_paths=$(grep -vE "^#|^$|^include" "$conf_file" 2>/dev/null | grep -E "$suspicious_locations_pattern" | head -1) || true
+
+            if [[ -n "$suspicious_paths" ]]; then
+                confidence="HIGH"
+                finding_matched_pattern="suspicious_lib_path"
+                finding_matched_string="$suspicious_paths"
+                log_finding "LD config contains suspicious path: $suspicious_paths"
+            else
+                confidence="MEDIUM"
+                finding_matched_pattern="unmanaged_ld_config"
+                finding_matched_string="$conf_file"
             fi
         fi
+        # If pkg_return -eq 0 (verified), confidence stays LOW
+
+        add_finding "Preload" "LDConfig" "ld_config" "$conf_file" "LD configuration: $(basename "$conf_file")" "$confidence" "$hash" "$metadata" "package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
     done
 
-    # Check loaded kernel modules
-    if [[ $EUID_CHECK -eq 0 ]]; then
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 3: Loaded kernel modules - verify each module file
+    # ═══════════════════════════════════════════════════════════════════════════
+    if [[ $EUID_CHECK -eq 0 ]] && command -v lsmod &>/dev/null; then
         log_info "Enumerating loaded kernel modules..."
+
         while read -r module_line; do
+            [[ -z "$module_line" ]] && continue
+
             local module_name=$(echo "$module_line" | awk '{print $1}')
             local module_size=$(echo "$module_line" | awk '{print $2}')
             local module_used=$(echo "$module_line" | awk '{print $3}')
 
-            # Find module file
-            local module_path=$(modinfo -F filename "$module_name" 2>/dev/null || echo "N/A")
+            # Find module file path
+            local module_path
+            module_path=$(modinfo -F filename "$module_name" 2>/dev/null) || true
+
+            # Skip built-in modules (no file path)
+            if [[ -z "$module_path" ]] || [[ "$module_path" == "(builtin)" ]]; then
+                continue
+            fi
+
             local hash="N/A"
             local metadata="N/A"
+            local confidence="LOW"
+            local finding_matched_pattern=""
+            local finding_matched_string=""
+            local pkg_status="N/A"
 
-            if [[ "$module_path" != "N/A" ]] && [[ -f "$module_path" ]]; then
+            if [[ -f "$module_path" ]]; then
                 hash=$(get_file_hash "$module_path")
                 metadata=$(get_file_metadata "$module_path")
+
+                # Check for suspicious location FIRST
+                if [[ "$module_path" =~ $suspicious_locations_pattern ]]; then
+                    confidence="CRITICAL"
+                    finding_matched_pattern="module_suspicious_location"
+                    finding_matched_string="$module_path"
+                    log_finding "Kernel module loaded from suspicious location: $module_path"
+                else
+                    # Check if module is from standard kernel module paths
+                    # Normal paths: /lib/modules/$(uname -r)/, /usr/lib/modules/
+                    if [[ ! "$module_path" =~ ^/(lib|usr/lib)/modules/ ]]; then
+                        confidence="HIGH"
+                        finding_matched_pattern="module_nonstandard_location"
+                        finding_matched_string="$module_path"
+                        log_finding "Kernel module from non-standard location: $module_path"
+                    else
+                        # Check package status
+                        local pkg_return=0
+                        pkg_status=$(is_package_managed "$module_path") || pkg_return=$?
+
+                        if [[ $pkg_return -eq 0 ]]; then
+                            # Package-managed and verified - skip
+                            continue
+                        elif [[ $pkg_return -eq 2 ]]; then
+                            # MODIFIED package file - CRITICAL
+                            confidence="CRITICAL"
+                            finding_matched_pattern="modified_kernel_module"
+                            finding_matched_string="$module_path"
+                            log_finding "Kernel module is MODIFIED package file: $module_path"
+                        else
+                            # Unmanaged module in standard location
+                            confidence="MEDIUM"
+                            finding_matched_pattern="unmanaged_kernel_module"
+                            finding_matched_string="$module_path"
+                        fi
+                    fi
+                fi
+            else
+                # Module file doesn't exist (shouldn't happen for loaded modules)
+                confidence="HIGH"
+                finding_matched_pattern="module_file_missing"
+                finding_matched_string="$module_name"
             fi
 
-            add_finding "Kernel" "Module" "kernel_module" "$module_path" "Loaded module: $module_name (size: $module_size, used: $module_used)" "LOW" "$hash" "$metadata" "module=$module_name"
-        done < <(lsmod | tail -n +2)
+            add_finding "Kernel" "Module" "kernel_module" "$module_path" "Loaded module: $module_name (size: $module_size)" "$confidence" "$hash" "$metadata" "module=$module_name|package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
+
+        done < <(lsmod 2>/dev/null | tail -n +2)
     fi
 
-    # Check for kernel module auto-loading configs
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 4: Kernel module auto-loading configs
+    # Check /etc/modules and /etc/modules-load.d/* for suspicious entries
+    # ═══════════════════════════════════════════════════════════════════════════
     local module_configs=(
         "/etc/modules"
-        "/etc/modules-load.d"
     )
 
+    # Add files from /etc/modules-load.d/
+    if [[ -d "/etc/modules-load.d" ]]; then
+        while IFS= read -r -d '' conf_file; do
+            module_configs+=("$conf_file")
+        done < <(find "/etc/modules-load.d" -type f -print0 2>/dev/null)
+    fi
+
     for mod_config in "${module_configs[@]}"; do
-        if [[ -e "$mod_config" ]]; then
-            if [[ -f "$mod_config" ]]; then
-                local hash=$(get_file_hash "$mod_config")
-                local metadata=$(get_file_metadata "$mod_config")
+        [[ ! -f "$mod_config" ]] && continue
 
-                add_finding "Kernel" "ModuleConfig" "module_config" "$mod_config" "Kernel module auto-load config" "MEDIUM" "$hash" "$metadata" ""
+        local hash=$(get_file_hash "$mod_config")
+        local metadata=$(get_file_metadata "$mod_config")
+        local confidence="LOW"
+        local finding_matched_pattern=""
+        local finding_matched_string=""
 
-            elif [[ -d "$mod_config" ]]; then
-                while IFS= read -r -d '' conf_file; do
-                    local hash=$(get_file_hash "$conf_file")
-                    local metadata=$(get_file_metadata "$conf_file")
+        # Check package status
+        local pkg_status pkg_return=0
+        pkg_status=$(is_package_managed "$mod_config") || pkg_return=$?
 
-                    add_finding "Kernel" "ModuleConfig" "module_config" "$conf_file" "Module config: $(basename "$conf_file")" "MEDIUM" "$hash" "$metadata" ""
-                done < <(find "$mod_config" -type f -print0 2>/dev/null)
-            fi
+        if [[ $pkg_return -eq 0 ]]; then
+            # Package-managed and verified - skip
+            continue
+        elif [[ $pkg_return -eq 2 ]]; then
+            # MODIFIED package file
+            confidence="CRITICAL"
+            finding_matched_pattern="modified_module_config"
+            finding_matched_string="$mod_config"
+            log_finding "Module config is MODIFIED package file: $mod_config"
+        else
+            # Unmanaged config - analyze content
+            confidence="MEDIUM"
+            finding_matched_pattern="unmanaged_module_config"
+
+            # Check for suspicious module names (modules that shouldn't be auto-loaded)
+            local suspicious_modules
+            suspicious_modules=$(grep -vE "^#|^$" "$mod_config" 2>/dev/null | head -5 | tr '\n' ' ') || true
+            finding_matched_string="${suspicious_modules:-$mod_config}"
         fi
+
+        add_finding "Kernel" "ModuleConfig" "module_config" "$mod_config" "Module auto-load config: $(basename "$mod_config")" "$confidence" "$hash" "$metadata" "package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
     done
 }
 
