@@ -1283,7 +1283,7 @@ init_output() {
 
 # Check systemd services
 check_systemd() {
-    log_info "[1/8] Checking systemd services..."
+    log_info "[1/7] Checking systemd services..."
 
     if ! command -v systemctl &> /dev/null; then
         log_warn "systemctl not found, skipping systemd checks"
@@ -1315,9 +1315,15 @@ check_systemd() {
                     exec_start=$(grep -E "^ExecStart=" "$service_file" 2>/dev/null | head -1 | cut -d'=' -f2- || echo "")
                 fi
 
+                # Skip services with no ExecStart - nothing to analyse
+                [[ -z "$exec_start" ]] && continue
+
                 # Check if service is enabled (using cache for performance)
                 local enabled_status
                 enabled_status=$(get_systemctl_enabled_status "$service_name")
+
+                # Skip disabled services - not active, not a persistence risk
+                [[ "$enabled_status" == "disabled" ]] && continue
 
                 local confidence="MEDIUM"
                 local finding_matched_pattern=""
@@ -1498,12 +1504,6 @@ check_systemd() {
                         finding_matched_string="$executable"
                     fi
 
-                else
-                    # No ExecStart found - can't verify anything
-                    # Keep default MEDIUM confidence
-                    package_status="no_execstart"
-                    finding_matched_pattern="no_execstart"
-                    finding_matched_string="service has no ExecStart"
                 fi
 
                 # Extract owner and permissions from metadata
@@ -1648,7 +1648,7 @@ analyze_cron_command() {
 
 # Check cron jobs
 check_cron() {
-    log_info "[2/8] Checking cron jobs and scheduled tasks..."
+    log_info "[2/7] Checking cron jobs and scheduled tasks..."
 
     # ═══════════════════════════════════════════════════════════════════════════
     # ALL CRON FILES: Same detection logic
@@ -1913,7 +1913,7 @@ check_cron() {
 
 # Check shell profiles and RC files
 check_shell_profiles() {
-    log_info "[3/8] Checking shell profiles and RC files..."
+    log_info "[3/7] Checking shell profiles and RC files..."
 
     local profile_files=(
         "/etc/profile"
@@ -2059,78 +2059,9 @@ check_shell_profiles() {
     fi
 }
 
-# Check SSH persistence
-check_ssh() {
-    log_info "[4/8] Checking SSH persistence mechanisms..."
-
-    # SSH authorized_keys
-    if [[ $EUID_CHECK -eq 0 ]]; then
-        while IFS=: read -r username _ uid _ _ homedir _; do
-            if [[ $uid -ge 1000 ]] || [[ $uid -eq 0 ]]; then
-                local ssh_dir="$homedir/.ssh"
-                if [[ -d "$ssh_dir" ]]; then
-                    # authorized_keys
-                    if [[ -f "$ssh_dir/authorized_keys" ]]; then
-                        local hash=$(get_file_hash "$ssh_dir/authorized_keys")
-                        local metadata=$(get_file_metadata "$ssh_dir/authorized_keys")
-                        local key_count=$(grep -c "^ssh-" "$ssh_dir/authorized_keys" 2>/dev/null || echo "0")
-
-                        add_finding "SSH" "AuthorizedKeys" "ssh_authorized_keys" "$ssh_dir/authorized_keys" "User $username has $key_count SSH authorized keys" "MEDIUM" "$hash" "$metadata" "user=$username|keys=$key_count"
-                    fi
-
-                    # Check for suspicious SSH config
-                    if [[ -f "$ssh_dir/config" ]]; then
-                        local hash=$(get_file_hash "$ssh_dir/config")
-                        local metadata=$(get_file_metadata "$ssh_dir/config")
-                        local suspicious_config=$(grep -iE "(ProxyCommand|LocalForward|RemoteForward|DynamicForward)" "$ssh_dir/config" 2>/dev/null || echo "")
-
-                        local confidence="LOW"
-                        local finding_matched_pattern=""
-                        local finding_matched_string=""
-                        if [[ -n "$suspicious_config" ]]; then
-                            confidence="MEDIUM"
-                            finding_matched_pattern="ssh_forwarding"
-                            finding_matched_string="$suspicious_config"
-                        fi
-
-                        add_finding "SSH" "Config" "ssh_config" "$ssh_dir/config" "User SSH config for $username" "$confidence" "$hash" "$metadata" "user=$username" "$finding_matched_pattern" "$finding_matched_string"
-                    fi
-                fi
-            fi
-        done < /etc/passwd
-    else
-        # Non-root
-        if [[ -f "$HOME/.ssh/authorized_keys" ]]; then
-            local hash=$(get_file_hash "$HOME/.ssh/authorized_keys")
-            local metadata=$(get_file_metadata "$HOME/.ssh/authorized_keys")
-            local key_count=$(grep -c "^ssh-" "$HOME/.ssh/authorized_keys" 2>/dev/null || echo "0")
-
-            add_finding "SSH" "AuthorizedKeys" "ssh_authorized_keys" "$HOME/.ssh/authorized_keys" "Current user has $key_count SSH authorized keys" "MEDIUM" "$hash" "$metadata" "keys=$key_count"
-        fi
-    fi
-
-    # System SSH config
-    if [[ -f "/etc/ssh/sshd_config" ]]; then
-        local hash=$(get_file_hash "/etc/ssh/sshd_config")
-        local metadata=$(get_file_metadata "/etc/ssh/sshd_config")
-        local suspicious_sshd=$(grep -iE "(PermitRootLogin yes|PasswordAuthentication yes|PermitEmptyPasswords yes|AuthorizedKeysFile)" /etc/ssh/sshd_config 2>/dev/null | grep -v "^#" || echo "")
-
-        local confidence="LOW"
-        local finding_matched_pattern=""
-        local finding_matched_string=""
-        if echo "$suspicious_sshd" | grep -qiE "(PermitRootLogin yes|PermitEmptyPasswords yes)"; then
-            confidence="MEDIUM"
-            finding_matched_pattern="insecure_sshd"
-            finding_matched_string="$suspicious_sshd"
-        fi
-
-        add_finding "SSH" "SystemConfig" "sshd_config" "/etc/ssh/sshd_config" "SSH daemon configuration" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
-    fi
-}
-
 # Check init scripts and rc.local
 check_init_scripts() {
-    log_info "[5/8] Checking init scripts and rc.local..."
+    log_info "[4/7] Checking init scripts and rc.local..."
 
     # ═══════════════════════════════════════════════════════════════════════════
     # TYPE 1: rc.local files (typically NOT package-managed, always analyze)
@@ -2271,7 +2202,7 @@ check_init_scripts() {
 
 # Check kernel modules and library preloading
 check_kernel_and_preload() {
-    log_info "[6/8] Checking kernel modules and library preloading..."
+    log_info "[5/7] Checking kernel modules and library preloading..."
 
     # LD_PRELOAD in environment and configs
     local preload_files=(
@@ -2355,7 +2286,7 @@ check_kernel_and_preload() {
 
 # Check additional persistence locations
 check_additional_persistence() {
-    log_info "[7/8] Checking additional persistence mechanisms..."
+    log_info "[6/7] Checking additional persistence mechanisms..."
 
     # XDG autostart
     local autostart_dirs=(
@@ -2424,22 +2355,89 @@ check_additional_persistence() {
     fi
 
     # Check for PAM backdoors
+    # Verify actual PAM module .so files, not just config references
     if [[ -d "/etc/pam.d" ]]; then
-        while IFS= read -r -d '' pam_file; do
-            local hash=$(get_file_hash "$pam_file")
-            local metadata=$(get_file_metadata "$pam_file")
-            local suspicious_pam=$(grep -v "^#" "$pam_file" 2>/dev/null | grep -E "pam_.*\.so" | grep -vE "(pam_unix|pam_systemd|pam_permit|pam_deny|pam_env|pam_limits)" || echo "")
+        # Common PAM module directories
+        local pam_lib_dirs=(
+            "/lib/security"
+            "/lib64/security"
+            "/lib/x86_64-linux-gnu/security"
+            "/lib/aarch64-linux-gnu/security"
+            "/usr/lib/security"
+            "/usr/lib64/security"
+            "/usr/lib/x86_64-linux-gnu/security"
+        )
 
-            local confidence="LOW"
-            local finding_matched_pattern=""
-            local finding_matched_string=""
-            if [[ -n "$suspicious_pam" ]]; then
-                confidence="MEDIUM"
-                finding_matched_pattern="unusual_pam_module"
-                finding_matched_string="$suspicious_pam"
+        # Find the actual PAM lib directory on this system
+        local pam_lib_dir=""
+        for dir in "${pam_lib_dirs[@]}"; do
+            if [[ -d "$dir" ]]; then
+                pam_lib_dir="$dir"
+                break
             fi
+        done
 
-            add_finding "PAM" "Config" "pam_config" "$pam_file" "PAM config: $(basename "$pam_file")" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
+        # Track which modules we've already checked (avoid duplicates)
+        declare -A checked_modules
+
+        while IFS= read -r -d '' pam_file; do
+            # Extract PAM module names from config (e.g., pam_unix.so)
+            local modules
+            modules=$(grep -v "^#" "$pam_file" 2>/dev/null | grep -oE "pam_[a-zA-Z0-9_]+\.so" | sort -u) || true
+
+            for module in $modules; do
+                # Skip if already checked
+                [[ -n "${checked_modules[$module]}" ]] && continue
+                checked_modules[$module]=1
+
+                # Find the actual .so file
+                local module_path=""
+                if [[ -n "$pam_lib_dir" ]] && [[ -f "$pam_lib_dir/$module" ]]; then
+                    module_path="$pam_lib_dir/$module"
+                else
+                    # Try to find it
+                    for dir in "${pam_lib_dirs[@]}"; do
+                        if [[ -f "$dir/$module" ]]; then
+                            module_path="$dir/$module"
+                            break
+                        fi
+                    done
+                fi
+
+                # If module file doesn't exist, skip (might be optional/conditional)
+                [[ -z "$module_path" ]] && continue
+
+                # Check package status of the actual .so file
+                local pkg_status pkg_return=0
+                pkg_status=$(is_package_managed "$module_path") || pkg_return=$?
+
+                if [[ $pkg_return -eq 0 ]]; then
+                    # Package-managed and VERIFIED - skip
+                    continue
+                fi
+
+                local hash=$(get_file_hash "$module_path")
+                local metadata=$(get_file_metadata "$module_path")
+                local confidence="MEDIUM"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
+
+                if [[ $pkg_return -eq 2 ]]; then
+                    # Module was MODIFIED - CRITICAL (potential backdoor)
+                    confidence="CRITICAL"
+                    finding_matched_pattern="modified_pam_module"
+                    finding_matched_string="$module_path"
+                    log_finding "PAM module is MODIFIED package file: $module_path"
+                else
+                    # UNMANAGED module - suspicious
+                    confidence="HIGH"
+                    finding_matched_pattern="unmanaged_pam_module"
+                    finding_matched_string="$module_path"
+                    log_finding "Unmanaged PAM module: $module_path"
+                fi
+
+                add_finding "PAM" "Module" "pam_module" "$module_path" "PAM module: $module" "$confidence" "$hash" "$metadata" "package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
+            done
         done < <(find /etc/pam.d -type f -print0 2>/dev/null)
     fi
 
@@ -2479,7 +2477,7 @@ check_additional_persistence() {
 
 # Check common backdoor locations (inspired by Crackdown and DFIR research)
 check_common_backdoors() {
-    log_info "[8/8] Checking common backdoor locations..."
+    log_info "[7/7] Checking common backdoor locations..."
 
     # APT/YUM configuration files that can be abused
     local pkg_mgr_configs=(
@@ -2739,9 +2737,6 @@ main() {
     echo
 
     check_shell_profiles
-    echo
-
-    check_ssh
     echo
 
     check_init_scripts
