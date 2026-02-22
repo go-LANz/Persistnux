@@ -495,9 +495,10 @@ get_systemctl_enabled_status() {
 # Uses PKG_CACHE for performance optimization
 is_package_managed() {
     local file="$1"
+    local original_file="$1"
 
     # Canonicalize path (resolve symlinks like /lib -> /usr/lib)
-    # dpkg stores canonical paths, so /lib/... won't match /usr/lib/... without this
+    # Some packages store canonical paths, others store symlink paths (e.g., kernel modules)
     # NOTE: only update file if realpath succeeds; a failed realpath with no output
     # would otherwise zero $file, causing dpkg -S "" to find nothing → false "unmanaged"
     if [[ -e "$file" ]]; then
@@ -525,6 +526,14 @@ is_package_managed() {
     if command -v dpkg &> /dev/null; then
         local dpkg_output
         dpkg_output=$(dpkg -S "$file" 2>/dev/null) || true
+
+        # If canonical path lookup fails, try original path (kernel modules use /lib/modules not /usr/lib/modules)
+        if [[ -z "$dpkg_output" ]] && [[ "$file" != "$original_file" ]]; then
+            dpkg_output=$(dpkg -S "$original_file" 2>/dev/null) || true
+            # Use original path for subsequent checks if it matched
+            [[ -n "$dpkg_output" ]] && file="$original_file"
+        fi
+
         if [[ -n "$dpkg_output" ]]; then
             local package=$(echo "$dpkg_output" | cut -d':' -f1 | head -n1)
 
@@ -553,6 +562,14 @@ is_package_managed() {
     if command -v rpm &> /dev/null; then
         local rpm_output
         rpm_output=$(rpm -qf "$file" 2>/dev/null) || true
+
+        # If canonical path lookup fails, try original path
+        if { [[ -z "$rpm_output" ]] || [[ "$rpm_output" == *"not owned"* ]]; } && [[ "$file" != "$original_file" ]]; then
+            rpm_output=$(rpm -qf "$original_file" 2>/dev/null) || true
+            # Use original path for subsequent checks if it matched
+            [[ -n "$rpm_output" ]] && [[ "$rpm_output" != *"not owned"* ]] && file="$original_file"
+        fi
+
         if [[ -n "$rpm_output" ]] && [[ "$rpm_output" != *"not owned"* ]]; then
             local package=$(echo "$rpm_output" | head -n1)
 
