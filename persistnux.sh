@@ -498,8 +498,11 @@ is_package_managed() {
 
     # Canonicalize path (resolve symlinks like /lib -> /usr/lib)
     # dpkg stores canonical paths, so /lib/... won't match /usr/lib/... without this
+    # NOTE: only update file if realpath succeeds; a failed realpath with no output
+    # would otherwise zero $file, causing dpkg -S "" to find nothing → false "unmanaged"
     if [[ -e "$file" ]]; then
-        file=$(realpath "$file" 2>/dev/null) || true
+        local canonical
+        canonical=$(realpath "$file" 2>/dev/null) && file="$canonical" || true
     fi
 
     # Check cache first (performance optimization)
@@ -527,7 +530,9 @@ is_package_managed() {
 
             # Verify file hasn't been tampered with
             # dpkg --verify returns errors if file modified/missing
-            local verify_output=$(dpkg --verify "$package" 2>/dev/null | grep -F "$file")
+            # Use " $file" (space prefix) to prevent substring false-match on short paths
+            # e.g. /usr/bin/py would otherwise match /usr/bin/python3 in verify output
+            local verify_output=$(dpkg --verify "$package" 2>/dev/null | grep -F " $file")
             if [[ -n "$verify_output" ]]; then
                 # File has been modified - flag as compromised
                 result="dpkg:$package:MODIFIED"
@@ -552,7 +557,8 @@ is_package_managed() {
             local package=$(echo "$rpm_output" | head -n1)
 
             # Verify file integrity using rpm -V
-            local verify_output=$(rpm -V "$package" 2>/dev/null | grep -F "$file")
+            # Use " $file" (space prefix) to prevent substring false-match on short paths
+            local verify_output=$(rpm -V "$package" 2>/dev/null | grep -F " $file")
             if [[ -n "$verify_output" ]]; then
                 # File has been modified
                 result="rpm:$package:MODIFIED"
