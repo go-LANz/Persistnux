@@ -1346,10 +1346,11 @@ check_systemd() {
     # Initialize systemctl cache for faster enabled status lookups
     init_systemctl_cache
 
+    # NOTE: /lib/systemd is omitted since /lib -> usr/lib on modern systems
+    # dpkg stores paths as /lib/... but we scan /usr/lib/... to avoid duplicates
     local systemd_paths=(
         "/etc/systemd/system"
         "/usr/lib/systemd/system"
-        "/lib/systemd/system"
         "/run/systemd/system"
         "/etc/systemd/user"
         "/usr/lib/systemd/user"
@@ -1681,10 +1682,10 @@ check_systemd() {
     # They can dynamically create service unit files, making them a powerful and
     # stealthy persistence vector - the actual generated units are ephemeral.
     # ═══════════════════════════════════════════════════════════════════════════
+    # NOTE: /lib/systemd is omitted since /lib -> usr/lib on modern systems
     local generator_dirs=(
         "/etc/systemd/system-generators"
         "/usr/lib/systemd/system-generators"
-        "/lib/systemd/system-generators"
         "/run/systemd/system-generators"
         "/etc/systemd/user-generators"
         "/usr/lib/systemd/user-generators"
@@ -1818,7 +1819,20 @@ analyze_cron_command() {
                 fi
                 return 0
             fi
-            # Interactive interpreter without script - skip
+
+            # Check raw command for suspicious patterns (reverse shells use -i with /dev/tcp, etc.)
+            if quick_suspicious_check "$cron_command"; then
+                CRON_ANALYSIS_REASON="suspicious_command:$cron_command"
+                return 0
+            fi
+            if [[ -n "$COMBINED_NEVER_WHITELIST_PATTERN" ]]; then
+                if echo "$cron_command" | grep -qiE "$COMBINED_NEVER_WHITELIST_PATTERN"; then
+                    CRON_ANALYSIS_REASON="dangerous_command:$cron_command"
+                    return 0
+                fi
+            fi
+
+            # Interactive interpreter without script and no suspicious patterns - skip
             return 1
         fi
     fi
@@ -2910,14 +2924,13 @@ check_additional_persistence() {
     # Verify actual PAM module .so files, not just config references
     if [[ -d "/etc/pam.d" ]]; then
         # Common PAM module directories
+        # NOTE: /lib -> usr/lib on modern merged-/usr systems, so we only scan /usr/lib
+        # to avoid duplicates; the fallback in is_package_managed handles dpkg's /lib paths
         local pam_lib_dirs=(
-            "/lib/security"
-            "/lib64/security"
-            "/lib/x86_64-linux-gnu/security"
-            "/lib/aarch64-linux-gnu/security"
             "/usr/lib/security"
             "/usr/lib64/security"
             "/usr/lib/x86_64-linux-gnu/security"
+            "/usr/lib/aarch64-linux-gnu/security"
         )
 
         # Find the actual PAM lib directory on this system
