@@ -144,6 +144,8 @@ declare -a KNOWN_INTERPRETER_PATTERNS=(
     "^awk$"
     "^gawk$"
     "^mawk$"
+    "^env$"            # /usr/bin/env /tmp/evil.sh - env is a relay, check what it runs
+    "^xargs$"          # xargs can execute arbitrary commands
 )
 
 # Known legitimate command patterns (safe operations)
@@ -841,8 +843,9 @@ analyze_script_content() {
     fi
 
     # Read first 1000 lines of script (to avoid huge files)
+    # Strip null bytes to prevent bash warnings with binary content
     local script_content
-    script_content=$(head -n 1000 "$script_file" 2>/dev/null) || true
+    script_content=$(head -n 1000 "$script_file" 2>/dev/null | tr -d '\0') || true
 
     # Build combined pattern from NEVER_WHITELIST_PATTERNS (joined with |)
     local never_whitelist_combined=""
@@ -892,6 +895,37 @@ analyze_script_content() {
             return 0  # SUSPICIOUS - found multi-line dangerous pattern
         fi
     done
+
+    # Check for encoding-based obfuscation (hex/octal/ANSI-C encoding)
+    # Legitimate scripts have no reason to encode strings this way.
+    # 4+ consecutive escape sequences = intentional encoding, not accidental.
+
+    # Hex escape sequences: \x41\x42\x43 (shell/perl/python style)
+    local hex_line
+    hex_line=$(echo "$script_content" | grep -E '(\\x[0-9a-fA-F]{2}){4,}' | head -1) || true
+    if [[ -n "$hex_line" ]]; then
+        MATCHED_PATTERN="hex_encoding"
+        MATCHED_STRING=$(echo "$hex_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
+        return 0  # SUSPICIOUS - hex-encoded payload
+    fi
+
+    # Octal escape sequences: \101\102\060 (shell/perl style)
+    local octal_line
+    octal_line=$(echo "$script_content" | grep -E '(\\[0-7]{3}){4,}' | head -1) || true
+    if [[ -n "$octal_line" ]]; then
+        MATCHED_PATTERN="octal_encoding"
+        MATCHED_STRING=$(echo "$octal_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
+        return 0  # SUSPICIOUS - octal-encoded payload
+    fi
+
+    # ANSI-C quoting: $'\x41\x62\x63' (bash-specific hex encoding in strings)
+    local ansi_line
+    ansi_line=$(echo "$script_content" | grep -E "\\\$'(\\\\x[0-9a-fA-F]{2}|\\\\[0-7]{3}){3,}'" | head -1) || true
+    if [[ -n "$ansi_line" ]]; then
+        MATCHED_PATTERN="ansi_c_encoding"
+        MATCHED_STRING=$(echo "$ansi_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
+        return 0  # SUSPICIOUS - ANSI-C encoded payload
+    fi
 
     # Check for high-entropy strings (obfuscation detection)
     # Look for long strings/variables with suspiciously high entropy
@@ -1313,20 +1347,42 @@ check_systemd() {
         "$HOME/.config/systemd/user"
     )
 
+    # When running as root, also scan all users' user-level systemd service directories
+    # User-level systemd services run as the user without root, used by attackers after
+    # compromising non-privileged accounts (www-data, service accounts, etc.)
+    if [[ $EUID_CHECK -eq 0 ]]; then
+        while IFS=: read -r username _ uid _ _ homedir _; do
+            if [[ $uid -ge 1000 ]] || [[ $uid -eq 0 ]]; then
+                local user_systemd_dir="$homedir/.config/systemd/user"
+                if [[ -d "$user_systemd_dir" ]] && [[ "$user_systemd_dir" != "$HOME/.config/systemd/user" ]]; then
+                    systemd_paths+=("$user_systemd_dir")
+                fi
+            fi
+        done < /etc/passwd
+    fi
+
     for path in "${systemd_paths[@]}"; do
         if [[ -d "$path" ]]; then
             while IFS= read -r -d '' service_file; do
                 local metadata=$(get_file_metadata "$service_file")
                 local service_name=$(basename "$service_file")
 
-                # Extract ExecStart from service file
-                local exec_start=""
+                # Extract exec directives from service file
+                local exec_start="" exec_pre="" exec_post=""
                 if [[ -f "$service_file" ]]; then
                     exec_start=$(grep -E "^ExecStart=" "$service_file" 2>/dev/null | head -1 | cut -d'=' -f2- || echo "")
+                    exec_pre=$(grep -E "^ExecStartPre=" "$service_file" 2>/dev/null | cut -d'=' -f2- | tr '\n' ';' || echo "")
+                    exec_post=$(grep -E "^ExecStartPost=" "$service_file" 2>/dev/null | cut -d'=' -f2- | tr '\n' ';' || echo "")
                 fi
 
                 # Skip services with no ExecStart - nothing to analyse
-                [[ -z "$exec_start" ]] && continue
+                [[ -z "$exec_start" ]] && [[ -z "$exec_pre" ]] && [[ -z "$exec_post" ]] && continue
+
+                # If only pre/post hooks exist with no ExecStart, still analyze them
+                if [[ -z "$exec_start" ]]; then
+                    exec_start="${exec_pre:-${exec_post}}"
+                    exec_pre=""
+                fi
 
                 # Check if service is enabled (using cache for performance)
                 local enabled_status
@@ -1520,6 +1576,51 @@ check_systemd() {
 
                 fi
 
+                # Check ExecStartPre and ExecStartPost hooks for suspicious content
+                # These run before/after the main service and are a common injection point:
+                # attackers leave ExecStart clean but add malicious hooks to tampered services
+                for exec_hook in "$exec_pre" "$exec_post"; do
+                    [[ -z "$exec_hook" ]] && continue
+                    # Strip systemd prefixes from hook commands too
+                    local hook_clean="$exec_hook"
+                    while [[ "$hook_clean" =~ ^[@:+!\-] ]]; do hook_clean="${hook_clean#?}"; done
+
+                    local hook_executable
+                    hook_executable=$(get_executable_from_command "$hook_clean") || true
+
+                    # Check if hook executable is unmanaged or suspicious
+                    if [[ -n "$hook_executable" ]]; then
+                        local hook_pkg_status hook_pkg_return=0
+                        hook_pkg_status=$(is_package_managed "$hook_executable") || hook_pkg_return=$?
+
+                        if [[ $hook_pkg_return -eq 2 ]]; then
+                            # Hook runs a MODIFIED binary - CRITICAL regardless of ExecStart
+                            confidence="CRITICAL"
+                            finding_matched_pattern="modified_exec_hook"
+                            finding_matched_string="$exec_hook"
+                            log_finding "Service has MODIFIED binary in exec hook: $service_file [$exec_hook]"
+                        elif [[ $hook_pkg_return -eq 1 ]]; then
+                            # Unmanaged binary in hook - suspicious, upgrade if not already HIGH+
+                            if [[ "$confidence" == "LOW" ]] || [[ "$confidence" == "MEDIUM" ]]; then
+                                confidence="HIGH"
+                                finding_matched_pattern="unmanaged_exec_hook"
+                                finding_matched_string="$exec_hook"
+                                log_finding "Service has unmanaged binary in exec hook: $service_file [$exec_hook]"
+                            fi
+                        fi
+                    fi
+
+                    # Also check hook content for suspicious patterns directly
+                    if check_suspicious_patterns "$exec_hook" || quick_suspicious_check "$exec_hook"; then
+                        if [[ "$confidence" != "CRITICAL" ]]; then
+                            confidence="HIGH"
+                            finding_matched_pattern="suspicious_exec_hook"
+                            finding_matched_string="$exec_hook"
+                            log_finding "Suspicious pattern in exec hook: $service_file [$exec_hook]"
+                        fi
+                    fi
+                done
+
                 # Extract owner and permissions from metadata
                 local owner=$(get_owner_from_metadata "$metadata")
                 local permissions=$(get_permissions_from_metadata "$metadata")
@@ -1534,6 +1635,67 @@ check_systemd() {
             # From a forensics perspective, only .service files contain the actual
             # persistence mechanism (the executable/script being run).
             done < <(find "$path" -maxdepth 1 -type f -name "*.service" -print0 2>/dev/null)
+        fi
+    done
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Systemd Generator Scripts
+    # Generators run at boot BEFORE any units load, as root, with no restrictions.
+    # They can dynamically create service unit files, making them a powerful and
+    # stealthy persistence vector - the actual generated units are ephemeral.
+    # ═══════════════════════════════════════════════════════════════════════════
+    local generator_dirs=(
+        "/etc/systemd/system-generators"
+        "/usr/lib/systemd/system-generators"
+        "/lib/systemd/system-generators"
+        "/run/systemd/system-generators"
+        "/etc/systemd/user-generators"
+        "/usr/lib/systemd/user-generators"
+    )
+
+    for gen_dir in "${generator_dirs[@]}"; do
+        if [[ -d "$gen_dir" ]]; then
+            while IFS= read -r -d '' gen_file; do
+                local pkg_status pkg_return=0
+                pkg_status=$(is_package_managed "$gen_file") || pkg_return=$?
+
+                # Skip verified package-managed generators (expected on all systemd systems)
+                [[ $pkg_return -eq 0 ]] && continue
+
+                local metadata
+                metadata=$(get_file_metadata "$gen_file") || true
+                local confidence="HIGH"
+                local finding_matched_pattern="unmanaged_generator"
+                local finding_matched_string="$gen_file"
+
+                if [[ $pkg_return -eq 2 ]]; then
+                    # Modified generator - CRITICAL (runs as root before all units)
+                    confidence="CRITICAL"
+                    finding_matched_pattern="modified_generator"
+                    finding_matched_string="$gen_file"
+                    log_finding "Systemd generator is MODIFIED package file: $gen_file"
+                elif [[ "$gen_file" =~ ^/(tmp|dev/shm|var/tmp|home) ]] || [[ "$gen_dir" =~ ^/(run) ]]; then
+                    # Generator in suspicious/ephemeral location
+                    confidence="CRITICAL"
+                    finding_matched_pattern="suspicious_location_generator"
+                    log_finding "Systemd generator in suspicious location: $gen_file"
+                else
+                    log_finding "Unmanaged systemd generator: $gen_file"
+                fi
+
+                # Analyze script content if accessible
+                if is_script "$gen_file"; then
+                    if analyze_script_content "$gen_file"; then
+                        confidence="CRITICAL"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
+                        log_finding "Generator contains suspicious content: $gen_file"
+                    fi
+                fi
+
+                add_finding "Systemd" "Generator" "systemd_generator" "$gen_file" "Systemd generator: $(basename "$gen_file")" "$confidence" "DEFER" "$metadata" "dir=$(basename "$gen_dir")|package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
+
+            done < <(find "$gen_dir" -maxdepth 1 -type f -print0 2>/dev/null)
         fi
     done
 }
@@ -1908,14 +2070,22 @@ check_cron() {
         fi
     fi
 
-    # Check at jobs
+    # Check at jobs - two methods:
+    # 1. atq + at -c: standard, but atq can be tampered on compromised systems
+    # 2. Direct spool scan: forensically reliable, catches hidden jobs not shown by atq
+    local atq_job_ids=()
+
     if command -v atq &> /dev/null; then
-        local at_jobs=$(atq 2>/dev/null || echo "")
+        local at_jobs
+        at_jobs=$(atq 2>/dev/null || echo "")
         if [[ -n "$at_jobs" ]]; then
-            log_info "Found at jobs"
+            log_info "Found at jobs via atq"
             while read -r job_line; do
-                local job_id=$(echo "$job_line" | awk '{print $1}')
-                local job_details=$(at -c "$job_id" 2>/dev/null | tail -20 || echo "")
+                local job_id
+                job_id=$(echo "$job_line" | awk '{print $1}')
+                atq_job_ids+=("$job_id")
+                local job_details
+                job_details=$(at -c "$job_id" 2>/dev/null | tail -20 | tr -d '\0' || echo "")
 
                 local confidence="LOW"
                 local finding_matched_pattern=""
@@ -1927,8 +2097,107 @@ check_cron() {
                     log_finding "Suspicious at job: $job_id"
                 fi
 
-                add_finding "Scheduled" "At" "at_job" "/var/spool/cron/atjobs/$job_id" "At job $job_id" "$confidence" "N/A" "$job_line" "job_id=$job_id" "$finding_matched_pattern" "$finding_matched_string"
+                add_finding "Scheduled" "At" "at_job" "/var/spool/at/$job_id" "At job $job_id" "$confidence" "N/A" "$job_line" "job_id=$job_id" "$finding_matched_pattern" "$finding_matched_string"
             done <<< "$at_jobs"
+        fi
+    fi
+
+    # Direct at spool scan - catches hidden jobs not visible via atq
+    # On compromised systems, atq may be tampered but spool files remain
+    local at_spool_dirs=(
+        "/var/spool/at"
+        "/var/spool/cron/atjobs"
+    )
+    for spool_dir in "${at_spool_dirs[@]}"; do
+        if [[ -d "$spool_dir" ]] && [[ $EUID_CHECK -eq 0 ]]; then
+            while IFS= read -r -d '' spool_file; do
+                local spool_name
+                spool_name=$(basename "$spool_file")
+
+                # at spool files are named with job ID (numeric) - skip non-job files like .SEQ
+                [[ "$spool_name" =~ ^\. ]] && continue
+                [[ ! "$spool_name" =~ ^[a-zA-Z0-9=+_-]+$ ]] && continue
+
+                local metadata
+                metadata=$(get_file_metadata "$spool_file") || true
+                local content
+                # at spool files start with env setup then the actual job commands
+                # Skip the env header (lines starting with export/cd etc) and read the job payload
+                content=$(grep -v "^export\|^cd \|^umask\|^#!/" "$spool_file" 2>/dev/null | tr -d '\0' | head -50) || true
+
+                local confidence="LOW"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
+                local hidden_flag=""
+
+                # Check if this job was NOT visible in atq (hidden job)
+                local in_atq=false
+                for known_id in "${atq_job_ids[@]}"; do
+                    if [[ "$spool_name" == *"$known_id"* ]] || [[ "$known_id" == *"$spool_name"* ]]; then
+                        in_atq=true
+                        break
+                    fi
+                done
+
+                if [[ "$in_atq" == "false" ]]; then
+                    # Job exists in spool but was NOT shown by atq - highly suspicious
+                    confidence="HIGH"
+                    finding_matched_pattern="hidden_at_job"
+                    finding_matched_string="$spool_name (not in atq output)"
+                    hidden_flag="hidden=true"
+                    log_finding "At job in spool not visible in atq (possible hidden job): $spool_file"
+                fi
+
+                if quick_suspicious_check "$content"; then
+                    [[ "$confidence" != "HIGH" ]] && confidence="HIGH"
+                    if [[ -z "$finding_matched_pattern" ]] || [[ "$in_atq" == "true" ]]; then
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
+                    fi
+                    log_finding "Suspicious content in at spool file: $spool_file"
+                fi
+
+                # Only report if not already reported via atq (avoid duplicates for visible jobs)
+                if [[ "$in_atq" == "false" ]]; then
+                    add_finding "Scheduled" "At" "at_spool" "$spool_file" "At spool job: $spool_name" "$confidence" "DEFER" "$metadata" "spool=$spool_dir|${hidden_flag}" "$finding_matched_pattern" "$finding_matched_string"
+                fi
+
+            done < <(find "$spool_dir" -maxdepth 1 -type f -print0 2>/dev/null)
+        fi
+    done
+
+    # Check anacron (/etc/anacrontab) - persistent jobs for machines that may be powered off
+    # Anacron guarantees job execution even after missed runs - a stealth persistence vector
+    if [[ -f "/etc/anacrontab" ]]; then
+        local pkg_status pkg_return=0
+        pkg_status=$(is_package_managed "/etc/anacrontab") || pkg_return=$?
+
+        if [[ $pkg_return -ne 0 ]]; then
+            # Unmanaged or modified anacrontab
+            local metadata
+            metadata=$(get_file_metadata "/etc/anacrontab") || true
+            local content
+            content=$(grep -Ev "^#|^$|^SHELL|^PATH|^MAILTO|^RANDOM_DELAY|^START_HOURS_RANGE" "/etc/anacrontab" 2>/dev/null | head -20) || true
+            local confidence="MEDIUM"
+            local finding_matched_pattern="unmanaged_anacrontab"
+            local finding_matched_string="/etc/anacrontab"
+
+            if [[ $pkg_return -eq 2 ]]; then
+                confidence="CRITICAL"
+                finding_matched_pattern="modified_anacrontab"
+                log_finding "anacrontab is MODIFIED package file: /etc/anacrontab"
+            elif [[ -n "$content" ]]; then
+                if quick_suspicious_check "$content"; then
+                    confidence="HIGH"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
+                    log_finding "Suspicious anacrontab content: /etc/anacrontab"
+                else
+                    log_finding "Unmanaged anacrontab with entries: /etc/anacrontab"
+                fi
+            fi
+
+            add_finding "Cron" "Anacron" "anacrontab" "/etc/anacrontab" "Anacron scheduled jobs" "$confidence" "DEFER" "$metadata" "package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
         fi
     fi
 }
@@ -1944,6 +2213,9 @@ check_shell_profiles() {
         "/etc/bashrc"
         "/etc/zsh/zshrc"
         "/etc/zshrc"
+        "/etc/zsh/zshenv"      # Sourced for ALL zsh invocations (interactive, non-interactive, login, scripts)
+        "/etc/zsh/zprofile"    # Zsh login profile (equivalent to bash_profile)
+        "/etc/zsh/zlogin"      # Zsh login shell post-zshrc
         "/etc/fish/config.fish"
     )
 
@@ -2019,6 +2291,7 @@ check_shell_profiles() {
         ".zshrc"
         ".zprofile"
         ".zlogin"
+        ".zshenv"              # Most powerful zsh config - sourced for ALL invocations including non-interactive
         ".config/fish/config.fish"
     )
 
@@ -2196,10 +2469,9 @@ check_init_scripts() {
     # ═══════════════════════════════════════════════════════════════════════════
     for rc_dir in /etc/rc*.d; do
         if [[ -d "$rc_dir" ]]; then
+            # Check 1: Non-symlink files in rc*.d (always suspicious - these dirs should only have symlinks)
             while IFS= read -r -d '' rc_file; do
-                # We're looking for actual FILES, not symlinks (symlinks are normal)
                 if [[ -f "$rc_file" ]] && [[ ! -L "$rc_file" ]]; then
-                    # Non-symlink file in rc*.d is suspicious
                     local hash="DEFER"
                     local metadata=$(get_file_metadata "$rc_file")
                     local confidence="HIGH"
@@ -2218,6 +2490,52 @@ check_init_scripts() {
                     add_finding "Init" "RcDir" "rc_script" "$rc_file" "Script in rc directory: $(basename "$rc_file")" "$confidence" "$hash" "$metadata" "dir=$(basename "$rc_dir")" "$finding_matched_pattern" "$finding_matched_string"
                 fi
             done < <(find "$rc_dir" -maxdepth 1 -type f -print0 2>/dev/null)
+
+            # Check 2: Symlinks pointing OUTSIDE /etc/init.d/ (should always point there)
+            # Legitimate runlevel links: /etc/rc2.d/S20ssh -> /etc/init.d/ssh
+            # Malicious example:        /etc/rc2.d/S99backdoor -> /tmp/backdoor.sh
+            while IFS= read -r -d '' rc_link; do
+                local link_target
+                link_target=$(readlink -f "$rc_link" 2>/dev/null) || true
+
+                # Normal: symlinks pointing to /etc/init.d/ - skip
+                [[ "$link_target" == /etc/init.d/* ]] && continue
+
+                # Suspicious: symlink pointing outside /etc/init.d/
+                local metadata
+                metadata=$(get_file_metadata "$rc_link") || true
+                local confidence="HIGH"
+                local finding_matched_pattern="suspicious_rcd_symlink"
+                local finding_matched_string="${link_target:-broken link}"
+
+                if [[ -z "$link_target" ]] || [[ ! -e "$link_target" ]]; then
+                    # Broken symlink - possibly cleaned up but rc entry left, or temp evasion
+                    confidence="MEDIUM"
+                    finding_matched_pattern="broken_rcd_symlink"
+                    finding_matched_string="$(readlink "$rc_link" 2>/dev/null || echo "unknown")"
+                    log_finding "Broken rc*.d symlink: $rc_link"
+                elif [[ "$link_target" =~ ^/(tmp|dev/shm|var/tmp) ]]; then
+                    # Points to temp directory - CRITICAL
+                    confidence="CRITICAL"
+                    finding_matched_pattern="suspicious_rcd_symlink_temp"
+                    log_finding "rc*.d symlink points to temp directory: $rc_link -> $link_target"
+                else
+                    log_finding "rc*.d symlink points outside /etc/init.d/: $rc_link -> $link_target"
+                fi
+
+                # Analyze the symlink target if it's a script
+                if [[ -f "$link_target" ]] && is_script "$link_target"; then
+                    if analyze_script_content "$link_target"; then
+                        confidence="CRITICAL"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
+                        log_finding "rc*.d symlink target contains suspicious content: $link_target"
+                    fi
+                fi
+
+                add_finding "Init" "RcLink" "rc_symlink" "$rc_link" "Suspicious rc symlink: $(basename "$rc_link")" "$confidence" "DEFER" "$metadata" "target=$link_target|dir=$(basename "$rc_dir")" "$finding_matched_pattern" "$finding_matched_string"
+
+            done < <(find "$rc_dir" -maxdepth 1 -type l -print0 2>/dev/null)
         fi
     done
 }
@@ -2226,83 +2544,253 @@ check_init_scripts() {
 check_kernel_and_preload() {
     log_info "[5/7] Checking kernel modules and library preloading..."
 
-    # LD_PRELOAD in environment and configs
-    local preload_files=(
-        "/etc/ld.so.preload"
-        "/etc/ld.so.conf"
-        "/etc/ld.so.conf.d"
-    )
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Suspicious locations for libraries/modules - these should NEVER contain
+    # legitimate system libraries or kernel modules
+    # ═══════════════════════════════════════════════════════════════════════════
+    local suspicious_locations_pattern="^/(tmp|dev/shm|var/tmp|home|root)/|/\."
 
-    for preload_file in "${preload_files[@]}"; do
-        if [[ -e "$preload_file" ]]; then
-            if [[ -f "$preload_file" ]]; then
-                local hash=$(get_file_hash "$preload_file")
-                local metadata=$(get_file_metadata "$preload_file")
-                local content=$(cat "$preload_file" 2>/dev/null || echo "")
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 1: /etc/ld.so.preload - Libraries loaded into ALL processes
+    # This file is almost NEVER used legitimately - any content is suspicious
+    # ═══════════════════════════════════════════════════════════════════════════
+    if [[ -f "/etc/ld.so.preload" ]]; then
+        local preload_content
+        preload_content=$(grep -v "^#" "/etc/ld.so.preload" 2>/dev/null | grep -v "^$") || true
 
-                if [[ -n "$content" ]] && [[ "$content" != "" ]]; then
-                    log_finding "LD_PRELOAD configuration found: $preload_file"
-                    add_finding "Preload" "LDPreload" "ld_preload" "$preload_file" "LD_PRELOAD config with content" "HIGH" "$hash" "$metadata" "content=$content"
+        if [[ -n "$preload_content" ]]; then
+            # Parse each library path and verify
+            while IFS= read -r lib_path; do
+                [[ -z "$lib_path" ]] && continue
+
+                local confidence="HIGH"
+                local finding_matched_pattern="ld_preload_entry"
+                local finding_matched_string="$lib_path"
+
+                # Check if library file exists
+                if [[ -f "$lib_path" ]]; then
+                    local lib_hash=$(get_file_hash "$lib_path")
+                    local lib_metadata=$(get_file_metadata "$lib_path")
+
+                    # Check for suspicious location FIRST
+                    if [[ "$lib_path" =~ $suspicious_locations_pattern ]]; then
+                        confidence="CRITICAL"
+                        finding_matched_pattern="preload_suspicious_location"
+                        log_finding "LD_PRELOAD library in suspicious location: $lib_path"
+                    else
+                        # Check package status
+                        local pkg_status pkg_return=0
+                        pkg_status=$(is_package_managed "$lib_path") || pkg_return=$?
+
+                        if [[ $pkg_return -eq 0 ]]; then
+                            # Package-managed and verified - still suspicious in ld.so.preload!
+                            # Even legitimate libraries in ld.so.preload is unusual
+                            confidence="MEDIUM"
+                            finding_matched_pattern="preload_verified_lib"
+                            log_finding "LD_PRELOAD with package-managed library (unusual): $lib_path"
+                        elif [[ $pkg_return -eq 2 ]]; then
+                            # MODIFIED package file - CRITICAL
+                            confidence="CRITICAL"
+                            finding_matched_pattern="preload_modified_lib"
+                            log_finding "LD_PRELOAD with MODIFIED library: $lib_path"
+                        else
+                            # Unmanaged library in ld.so.preload - HIGH
+                            confidence="HIGH"
+                            finding_matched_pattern="preload_unmanaged_lib"
+                            log_finding "LD_PRELOAD with unmanaged library: $lib_path"
+                        fi
+                    fi
+
+                    add_finding "Preload" "LDPreload" "ld_preload_lib" "$lib_path" "Preloaded library: $lib_path" "$confidence" "$lib_hash" "$lib_metadata" "package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
                 else
-                    add_finding "Preload" "LDPreload" "ld_preload" "$preload_file" "LD_PRELOAD config (empty)" "LOW" "$hash" "$metadata" ""
+                    # Library doesn't exist - still flag the config entry
+                    log_finding "LD_PRELOAD references non-existent library: $lib_path"
+                    add_finding "Preload" "LDPreload" "ld_preload_missing" "/etc/ld.so.preload" "Preload references missing library: $lib_path" "MEDIUM" "N/A" "N/A" "" "preload_missing_lib" "$lib_path"
                 fi
+            done <<< "$preload_content"
+        fi
+    fi
 
-            elif [[ -d "$preload_file" ]]; then
-                while IFS= read -r -d '' conf_file; do
-                    local hash=$(get_file_hash "$conf_file")
-                    local metadata=$(get_file_metadata "$conf_file")
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 2: /etc/ld.so.conf and /etc/ld.so.conf.d/* - Library search paths
+    # Check for suspicious paths being added to library search
+    # ═══════════════════════════════════════════════════════════════════════════
+    local ld_conf_files=()
+    [[ -f "/etc/ld.so.conf" ]] && ld_conf_files+=("/etc/ld.so.conf")
+    if [[ -d "/etc/ld.so.conf.d" ]]; then
+        while IFS= read -r -d '' conf_file; do
+            ld_conf_files+=("$conf_file")
+        done < <(find "/etc/ld.so.conf.d" -type f -name "*.conf" -print0 2>/dev/null)
+    fi
 
-                    add_finding "Preload" "LDConfig" "ld_config" "$conf_file" "LD configuration: $(basename "$conf_file")" "LOW" "$hash" "$metadata" ""
-                done < <(find "$preload_file" -type f -print0 2>/dev/null)
+    for conf_file in "${ld_conf_files[@]}"; do
+        local hash=$(get_file_hash "$conf_file")
+        local metadata=$(get_file_metadata "$conf_file")
+        local confidence="LOW"
+        local finding_matched_pattern=""
+        local finding_matched_string=""
+
+        # Check package status of config file
+        local pkg_status pkg_return=0
+        pkg_status=$(is_package_managed "$conf_file") || pkg_return=$?
+
+        if [[ $pkg_return -eq 2 ]]; then
+            # Config file was MODIFIED
+            confidence="CRITICAL"
+            finding_matched_pattern="modified_ld_config"
+            finding_matched_string="$conf_file"
+            log_finding "LD config is MODIFIED package file: $conf_file"
+        elif [[ $pkg_return -eq 1 ]]; then
+            # Unmanaged config - check for suspicious paths
+            local suspicious_paths
+            suspicious_paths=$(grep -vE "^#|^$|^include" "$conf_file" 2>/dev/null | grep -E "$suspicious_locations_pattern" | head -1) || true
+
+            if [[ -n "$suspicious_paths" ]]; then
+                confidence="HIGH"
+                finding_matched_pattern="suspicious_lib_path"
+                finding_matched_string="$suspicious_paths"
+                log_finding "LD config contains suspicious path: $suspicious_paths"
+            else
+                confidence="MEDIUM"
+                finding_matched_pattern="unmanaged_ld_config"
+                finding_matched_string="$conf_file"
             fi
         fi
+        # If pkg_return -eq 0 (verified), confidence stays LOW
+
+        add_finding "Preload" "LDConfig" "ld_config" "$conf_file" "LD configuration: $(basename "$conf_file")" "$confidence" "$hash" "$metadata" "package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
     done
 
-    # Check loaded kernel modules
-    if [[ $EUID_CHECK -eq 0 ]]; then
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 3: Loaded kernel modules - verify each module file
+    # ═══════════════════════════════════════════════════════════════════════════
+    if [[ $EUID_CHECK -eq 0 ]] && command -v lsmod &>/dev/null; then
         log_info "Enumerating loaded kernel modules..."
+
         while read -r module_line; do
+            [[ -z "$module_line" ]] && continue
+
             local module_name=$(echo "$module_line" | awk '{print $1}')
             local module_size=$(echo "$module_line" | awk '{print $2}')
             local module_used=$(echo "$module_line" | awk '{print $3}')
 
-            # Find module file
-            local module_path=$(modinfo -F filename "$module_name" 2>/dev/null || echo "N/A")
+            # Find module file path
+            local module_path
+            module_path=$(modinfo -F filename "$module_name" 2>/dev/null) || true
+
+            # Skip built-in modules (no file path)
+            if [[ -z "$module_path" ]] || [[ "$module_path" == "(builtin)" ]]; then
+                continue
+            fi
+
             local hash="N/A"
             local metadata="N/A"
+            local confidence="LOW"
+            local finding_matched_pattern=""
+            local finding_matched_string=""
+            local pkg_status="N/A"
 
-            if [[ "$module_path" != "N/A" ]] && [[ -f "$module_path" ]]; then
+            if [[ -f "$module_path" ]]; then
                 hash=$(get_file_hash "$module_path")
                 metadata=$(get_file_metadata "$module_path")
+
+                # Check for suspicious location FIRST
+                if [[ "$module_path" =~ $suspicious_locations_pattern ]]; then
+                    confidence="CRITICAL"
+                    finding_matched_pattern="module_suspicious_location"
+                    finding_matched_string="$module_path"
+                    log_finding "Kernel module loaded from suspicious location: $module_path"
+                else
+                    # Check if module is from standard kernel module paths
+                    # Normal paths: /lib/modules/$(uname -r)/, /usr/lib/modules/
+                    if [[ ! "$module_path" =~ ^/(lib|usr/lib)/modules/ ]]; then
+                        confidence="HIGH"
+                        finding_matched_pattern="module_nonstandard_location"
+                        finding_matched_string="$module_path"
+                        log_finding "Kernel module from non-standard location: $module_path"
+                    else
+                        # Check package status
+                        local pkg_return=0
+                        pkg_status=$(is_package_managed "$module_path") || pkg_return=$?
+
+                        if [[ $pkg_return -eq 0 ]]; then
+                            # Package-managed and verified - skip
+                            continue
+                        elif [[ $pkg_return -eq 2 ]]; then
+                            # MODIFIED package file - CRITICAL
+                            confidence="CRITICAL"
+                            finding_matched_pattern="modified_kernel_module"
+                            finding_matched_string="$module_path"
+                            log_finding "Kernel module is MODIFIED package file: $module_path"
+                        else
+                            # Unmanaged module in standard location
+                            confidence="MEDIUM"
+                            finding_matched_pattern="unmanaged_kernel_module"
+                            finding_matched_string="$module_path"
+                        fi
+                    fi
+                fi
+            else
+                # Module file doesn't exist (shouldn't happen for loaded modules)
+                confidence="HIGH"
+                finding_matched_pattern="module_file_missing"
+                finding_matched_string="$module_name"
             fi
 
-            add_finding "Kernel" "Module" "kernel_module" "$module_path" "Loaded module: $module_name (size: $module_size, used: $module_used)" "LOW" "$hash" "$metadata" "module=$module_name"
-        done < <(lsmod | tail -n +2)
+            add_finding "Kernel" "Module" "kernel_module" "$module_path" "Loaded module: $module_name (size: $module_size)" "$confidence" "$hash" "$metadata" "module=$module_name|package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
+
+        done < <(lsmod 2>/dev/null | tail -n +2)
     fi
 
-    # Check for kernel module auto-loading configs
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 4: Kernel module auto-loading configs
+    # Check /etc/modules and /etc/modules-load.d/* for suspicious entries
+    # ═══════════════════════════════════════════════════════════════════════════
     local module_configs=(
         "/etc/modules"
-        "/etc/modules-load.d"
     )
 
+    # Add files from /etc/modules-load.d/
+    if [[ -d "/etc/modules-load.d" ]]; then
+        while IFS= read -r -d '' conf_file; do
+            module_configs+=("$conf_file")
+        done < <(find "/etc/modules-load.d" -type f -print0 2>/dev/null)
+    fi
+
     for mod_config in "${module_configs[@]}"; do
-        if [[ -e "$mod_config" ]]; then
-            if [[ -f "$mod_config" ]]; then
-                local hash=$(get_file_hash "$mod_config")
-                local metadata=$(get_file_metadata "$mod_config")
+        [[ ! -f "$mod_config" ]] && continue
 
-                add_finding "Kernel" "ModuleConfig" "module_config" "$mod_config" "Kernel module auto-load config" "MEDIUM" "$hash" "$metadata" ""
+        local hash=$(get_file_hash "$mod_config")
+        local metadata=$(get_file_metadata "$mod_config")
+        local confidence="LOW"
+        local finding_matched_pattern=""
+        local finding_matched_string=""
 
-            elif [[ -d "$mod_config" ]]; then
-                while IFS= read -r -d '' conf_file; do
-                    local hash=$(get_file_hash "$conf_file")
-                    local metadata=$(get_file_metadata "$conf_file")
+        # Check package status
+        local pkg_status pkg_return=0
+        pkg_status=$(is_package_managed "$mod_config") || pkg_return=$?
 
-                    add_finding "Kernel" "ModuleConfig" "module_config" "$conf_file" "Module config: $(basename "$conf_file")" "MEDIUM" "$hash" "$metadata" ""
-                done < <(find "$mod_config" -type f -print0 2>/dev/null)
-            fi
+        if [[ $pkg_return -eq 0 ]]; then
+            # Package-managed and verified - skip
+            continue
+        elif [[ $pkg_return -eq 2 ]]; then
+            # MODIFIED package file
+            confidence="CRITICAL"
+            finding_matched_pattern="modified_module_config"
+            finding_matched_string="$mod_config"
+            log_finding "Module config is MODIFIED package file: $mod_config"
+        else
+            # Unmanaged config - analyze content
+            confidence="MEDIUM"
+            finding_matched_pattern="unmanaged_module_config"
+
+            # Check for suspicious module names (modules that shouldn't be auto-loaded)
+            local suspicious_modules
+            suspicious_modules=$(grep -vE "^#|^$" "$mod_config" 2>/dev/null | head -5 | tr '\n' ' ') || true
+            finding_matched_string="${suspicious_modules:-$mod_config}"
         fi
+
+        add_finding "Kernel" "ModuleConfig" "module_config" "$mod_config" "Module auto-load config: $(basename "$mod_config")" "$confidence" "$hash" "$metadata" "package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
     done
 }
 
@@ -2461,6 +2949,67 @@ check_additional_persistence() {
                 add_finding "PAM" "Module" "pam_module" "$module_path" "PAM module: $module" "$confidence" "$hash" "$metadata" "package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
             done
         done < <(find /etc/pam.d -type f -print0 2>/dev/null)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # Special case: pam_exec.so is a relay module - its .so file is always
+        # package-managed and verified, BUT it executes an external script given
+        # as an argument in the PAM config. We must analyze THAT script, not the .so.
+        # Example: "auth optional pam_exec.so /tmp/credential_logger.sh"
+        #           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        #           verified package file (we skip)  ACTUAL PAYLOAD (we were missing this)
+        # ─────────────────────────────────────────────────────────────────────
+        if [[ -d "/etc/pam.d" ]]; then
+            # Extract all script paths passed to pam_exec.so from all PAM config files
+            # Format: "auth optional pam_exec.so [--option] /path/to/script [args]"
+            local pam_exec_scripts
+            pam_exec_scripts=$(grep -h -v "^#" /etc/pam.d/* 2>/dev/null | \
+                grep "pam_exec\.so" | \
+                grep -oE 'pam_exec\.so([[:space:]]--[a-z_-]+)*[[:space:]]+(/[^[:space:]]+)' | \
+                grep -oE '(/[^[:space:]]+)$' | \
+                sort -u) || true
+
+            for exec_script in $pam_exec_scripts; do
+                [[ -z "$exec_script" ]] && continue
+
+                local exec_pkg_status exec_pkg_return=0
+                exec_pkg_status=$(is_package_managed "$exec_script") || exec_pkg_return=$?
+
+                local confidence="HIGH"
+                local finding_matched_pattern="pam_exec_script"
+                local finding_matched_string="$exec_script"
+
+                if [[ $exec_pkg_return -eq 0 ]]; then
+                    # Script is package-managed and verified - LOW confidence
+                    confidence="LOW"
+                    finding_matched_pattern="pam_exec_verified_script"
+                elif [[ $exec_pkg_return -eq 2 ]]; then
+                    # Script is MODIFIED - CRITICAL
+                    confidence="CRITICAL"
+                    finding_matched_pattern="pam_exec_modified_script"
+                    log_finding "pam_exec.so executes MODIFIED package script: $exec_script"
+                else
+                    # UNMANAGED script - check location and content
+                    if [[ "$exec_script" =~ ^/(tmp|dev/shm|var/tmp) ]]; then
+                        confidence="CRITICAL"
+                        finding_matched_pattern="pam_exec_suspicious_location"
+                        log_finding "pam_exec.so executes script from temp location: $exec_script"
+                    elif [[ -f "$exec_script" ]] && analyze_script_content "$exec_script"; then
+                        confidence="CRITICAL"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
+                        log_finding "pam_exec.so script contains suspicious content: $exec_script"
+                    else
+                        log_finding "pam_exec.so executes unmanaged script: $exec_script"
+                    fi
+                fi
+
+                local exec_hash="DEFER"
+                local exec_metadata
+                exec_metadata=$(get_file_metadata "$exec_script") || true
+
+                add_finding "PAM" "Exec" "pam_exec_script" "$exec_script" "pam_exec.so target script" "$confidence" "$exec_hash" "$exec_metadata" "package=$exec_pkg_status" "$finding_matched_pattern" "$finding_matched_string"
+            done
+        fi
     fi
 
     # Check MOTD scripts
@@ -2474,7 +3023,8 @@ check_additional_persistence() {
             while IFS= read -r -d '' motd_script; do
                 local hash=$(get_file_hash "$motd_script")
                 local metadata=$(get_file_metadata "$motd_script")
-                local content=$(head -n 100 "$motd_script" 2>/dev/null || echo "")
+                # Strip null bytes to prevent bash warnings with binary content
+                local content=$(head -n 100 "$motd_script" 2>/dev/null | tr -d '\0' || echo "")
 
                 local confidence="LOW"
                 local finding_matched_pattern=""
