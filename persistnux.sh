@@ -145,7 +145,6 @@ declare -a KNOWN_INTERPRETER_PATTERNS=(
     "^gawk$"
     "^mawk$"
     "^env$"            # /usr/bin/env /tmp/evil.sh - env is a relay, check what it runs
-    "^xargs$"          # xargs can execute arbitrary commands
 )
 
 # Known legitimate command patterns (safe operations)
@@ -1471,8 +1470,23 @@ check_systemd() {
                                     fi
                                 else
                                     # Interactive shell or command without script
-                                    finding_matched_pattern="interpreter_interactive"
-                                    finding_matched_string="$executable"
+                                    # Verify the interpreter binary itself (e.g., ExecStart=/usr/bin/bash)
+                                    local interp_pkg_status
+                                    interp_pkg_status=$(is_package_managed "$executable") || true
+                                    package_status="$interp_pkg_status"
+                                    if [[ "$interp_pkg_status" == *":MODIFIED" ]]; then
+                                        confidence="CRITICAL"
+                                        finding_matched_pattern="modified_interpreter"
+                                        finding_matched_string="$executable"
+                                        log_finding "Systemd service uses MODIFIED interpreter: $executable"
+                                    elif [[ "$interp_pkg_status" != "unmanaged" ]]; then
+                                        # Managed interpreter - LOW risk
+                                        confidence="LOW"
+                                    fi
+                                    if [[ -z "$finding_matched_pattern" ]]; then
+                                        finding_matched_pattern="interpreter_interactive"
+                                        finding_matched_string="$executable"
+                                    fi
                                 fi
                             fi
 
@@ -1566,46 +1580,59 @@ check_systemd() {
                 # Check ExecStartPre and ExecStartPost hooks for suspicious content
                 # These run before/after the main service and are a common injection point:
                 # attackers leave ExecStart clean but add malicious hooks to tampered services
-                for exec_hook in "$exec_pre" "$exec_post"; do
-                    [[ -z "$exec_hook" ]] && continue
-                    # Strip systemd prefixes from hook commands too
-                    local hook_clean="$exec_hook"
-                    while [[ "$hook_clean" =~ ^[@:+!\-] ]]; do hook_clean="${hook_clean#?}"; done
+                for exec_hook_str in "$exec_pre" "$exec_post"; do
+                    [[ -z "$exec_hook_str" ]] && continue
 
-                    local hook_executable
-                    hook_executable=$(get_executable_from_command "$hook_clean") || true
-
-                    # Check if hook executable is unmanaged or suspicious
-                    if [[ -n "$hook_executable" ]]; then
-                        local hook_pkg_status hook_pkg_return=0
-                        hook_pkg_status=$(is_package_managed "$hook_executable") || hook_pkg_return=$?
-
-                        if [[ $hook_pkg_return -eq 2 ]]; then
-                            # Hook runs a MODIFIED binary - CRITICAL regardless of ExecStart
-                            confidence="CRITICAL"
-                            finding_matched_pattern="modified_exec_hook"
-                            finding_matched_string="$exec_hook"
-                            log_finding "Service has MODIFIED binary in exec hook: $service_file [$exec_hook]"
-                        elif [[ $hook_pkg_return -eq 1 ]]; then
-                            # Unmanaged binary in hook - suspicious, upgrade if not already HIGH+
-                            if [[ "$confidence" == "LOW" ]] || [[ "$confidence" == "MEDIUM" ]]; then
-                                confidence="HIGH"
-                                finding_matched_pattern="unmanaged_exec_hook"
-                                finding_matched_string="$exec_hook"
-                                log_finding "Service has unmanaged binary in exec hook: $service_file [$exec_hook]"
-                            fi
-                        fi
-                    fi
-
-                    # Also check hook content for suspicious patterns directly
-                    if check_suspicious_patterns "$exec_hook" || quick_suspicious_check "$exec_hook"; then
+                    # Check the full hook string for suspicious patterns (covers all commands)
+                    if check_suspicious_patterns "$exec_hook_str" || quick_suspicious_check "$exec_hook_str"; then
                         if [[ "$confidence" != "CRITICAL" ]]; then
                             confidence="HIGH"
                             finding_matched_pattern="suspicious_exec_hook"
-                            finding_matched_string="$exec_hook"
-                            log_finding "Suspicious pattern in exec hook: $service_file [$exec_hook]"
+                            finding_matched_string="$exec_hook_str"
+                            log_finding "Suspicious pattern in exec hook: $service_file [$exec_hook_str]"
                         fi
                     fi
+
+                    # Process each individual hook command for binary verification.
+                    # exec_pre/exec_post are joined by tr '\n' ';' so we split on ';'
+                    # to get each hook command independently (avoids trailing-semicolon
+                    # corrupting the executable path when using awk '{print $1}').
+                    local hook_cmd
+                    while IFS= read -r hook_cmd; do
+                        # Trim leading/trailing whitespace
+                        hook_cmd="${hook_cmd## }"
+                        hook_cmd="${hook_cmd%% }"
+                        [[ -z "$hook_cmd" ]] && continue
+
+                        # Strip systemd exec modifiers (-, @, +, !, :)
+                        local hook_clean="$hook_cmd"
+                        while [[ "$hook_clean" =~ ^[@:+!-] ]]; do hook_clean="${hook_clean#?}"; done
+
+                        local hook_executable
+                        hook_executable=$(get_executable_from_command "$hook_clean") || true
+
+                        # Check if hook executable is unmanaged or modified
+                        if [[ -n "$hook_executable" ]]; then
+                            local hook_pkg_status hook_pkg_return=0
+                            hook_pkg_status=$(is_package_managed "$hook_executable") || hook_pkg_return=$?
+
+                            if [[ $hook_pkg_return -eq 2 ]]; then
+                                # Hook runs a MODIFIED binary - CRITICAL regardless of ExecStart
+                                confidence="CRITICAL"
+                                finding_matched_pattern="modified_exec_hook"
+                                finding_matched_string="$hook_cmd"
+                                log_finding "Service has MODIFIED binary in exec hook: $service_file [$hook_cmd]"
+                            elif [[ $hook_pkg_return -eq 1 ]]; then
+                                # Unmanaged binary in hook - suspicious, upgrade if not already HIGH+
+                                if [[ "$confidence" == "LOW" ]] || [[ "$confidence" == "MEDIUM" ]]; then
+                                    confidence="HIGH"
+                                    finding_matched_pattern="unmanaged_exec_hook"
+                                    finding_matched_string="$hook_cmd"
+                                    log_finding "Service has unmanaged binary in exec hook: $service_file [$hook_cmd]"
+                                fi
+                            fi
+                        fi
+                    done < <(echo "$exec_hook_str" | tr ';' '\n')
                 done
 
                 # Extract owner and permissions from metadata
