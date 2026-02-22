@@ -226,6 +226,8 @@ COMBINED_NETWORK_PATTERN=""
 COMBINED_COMMAND_PATTERN=""
 COMBINED_LOCATION_PATTERN=""
 COMBINED_FILE_PATTERN=""
+COMBINED_NEVER_WHITELIST_PATTERN=""
+COMBINED_KNOWN_GOOD_PATHS_PATTERN=""
 
 # Build combined regex patterns for faster matching
 build_combined_patterns() {
@@ -235,6 +237,8 @@ build_combined_patterns() {
     COMBINED_COMMAND_PATTERN="(${SUSPICIOUS_COMMANDS[*]})"
     COMBINED_LOCATION_PATTERN="(${SUSPICIOUS_LOCATIONS[*]})"
     COMBINED_FILE_PATTERN="(${SUSPICIOUS_FILES[*]})"
+    COMBINED_NEVER_WHITELIST_PATTERN="(${NEVER_WHITELIST_PATTERNS[*]})"
+    COMBINED_KNOWN_GOOD_PATHS_PATTERN="(${KNOWN_GOOD_EXECUTABLE_PATHS[*]})"
 }
 
 # Helper: Check single category and set match info
@@ -847,23 +851,12 @@ analyze_script_content() {
     local script_content
     script_content=$(head -n 1000 "$script_file" 2>/dev/null | tr -d '\0') || true
 
-    # Build combined pattern from NEVER_WHITELIST_PATTERNS (joined with |)
-    local never_whitelist_combined=""
-    for pattern in "${NEVER_WHITELIST_PATTERNS[@]}"; do
-        if [[ -n "$never_whitelist_combined" ]]; then
-            never_whitelist_combined="${never_whitelist_combined}|${pattern}"
-        else
-            never_whitelist_combined="$pattern"
-        fi
-    done
-
-    # Check all dangerous patterns in single grep call
-    if [[ -n "$never_whitelist_combined" ]]; then
+    # Check dangerous patterns using pre-built combined pattern (built once at startup)
+    if [[ -n "$COMBINED_NEVER_WHITELIST_PATTERN" ]]; then
         local full_line
-        full_line=$(echo "$script_content" | grep -iE "$never_whitelist_combined" | head -1) || true
+        full_line=$(echo "$script_content" | grep -iE "$COMBINED_NEVER_WHITELIST_PATTERN" | head -1) || true
         if [[ -n "$full_line" ]]; then
             MATCHED_PATTERN="never_whitelist"
-            # Trim whitespace and limit length for readability
             MATCHED_STRING=$(echo "$full_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
             return 0  # SUSPICIOUS - found dangerous pattern
         fi
@@ -1002,17 +995,9 @@ analyze_inline_code() {
         return 0
     fi
 
-    # Check NEVER_WHITELIST patterns
-    local never_whitelist_combined=""
-    for pattern in "${NEVER_WHITELIST_PATTERNS[@]}"; do
-        if [[ -n "$never_whitelist_combined" ]]; then
-            never_whitelist_combined="${never_whitelist_combined}|${pattern}"
-        else
-            never_whitelist_combined="$pattern"
-        fi
-    done
-    if [[ -n "$never_whitelist_combined" ]]; then
-        if echo "$inline_code" | grep -qiE "$never_whitelist_combined"; then
+    # Check NEVER_WHITELIST patterns using pre-built combined pattern
+    if [[ -n "$COMBINED_NEVER_WHITELIST_PATTERN" ]]; then
+        if echo "$inline_code" | grep -qiE "$COMBINED_NEVER_WHITELIST_PATTERN"; then
             INLINE_CODE_REASON="dangerous_pattern"
             return 0
         fi
@@ -1068,41 +1053,37 @@ is_command_safe() {
     local command="$1"
 
     # First check: Does it contain NEVER_WHITELIST patterns?
-    # This check ALWAYS takes precedence - even package-managed files with dangerous patterns are flagged
-    for pattern in "${NEVER_WHITELIST_PATTERNS[@]}"; do
-        if echo "$command" | grep -qiE "$pattern"; then
+    # Uses pre-built combined pattern for O(1) instead of O(n) grep calls
+    if [[ -n "$COMBINED_NEVER_WHITELIST_PATTERN" ]]; then
+        if echo "$command" | grep -qiE "$COMBINED_NEVER_WHITELIST_PATTERN"; then
             return 1  # DANGEROUS - never whitelist
         fi
-    done
+    fi
 
     # Extract executable for subsequent checks
     local executable=$(get_executable_from_command "$command")
 
-    # Second check: Path-based validation (CRITICAL FIX)
+    # Second check: Path-based validation (uses pre-built combined pattern)
     # A path is only safe if it's BOTH in a standard location AND package-managed
-    # This prevents /usr/bin/evil_miner from being marked safe just because it's in /usr/bin
-    for path in "${KNOWN_GOOD_EXECUTABLE_PATHS[@]}"; do
-        if echo "$command" | grep -qE "$path"; then
+    if [[ -n "$COMBINED_KNOWN_GOOD_PATHS_PATTERN" ]]; then
+        if echo "$command" | grep -qE "$COMBINED_KNOWN_GOOD_PATHS_PATTERN"; then
             # Path matches known-good location, but we MUST verify it's package-managed
             if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
                 local pkg_status pkg_return=0
                 pkg_status=$(is_package_managed "$executable") || pkg_return=$?
 
-                # Only trust if package-managed AND not modified
                 if [[ $pkg_return -eq 0 ]]; then
                     return 0  # Safe - standard path AND package-managed
                 elif [[ $pkg_return -eq 2 ]]; then
-                    # Package file was MODIFIED - treat as dangerous
                     return 1  # DANGEROUS - modified package file
                 fi
-                # If pkg_return=1 (unmanaged), fall through to continue checking
+                # If pkg_return=1 (unmanaged), continue checking
             fi
-            # Path matched but file not package-managed - NOT automatically safe
-            # Continue to other checks
         fi
-    done
+    fi
 
     # Third check: Does it match known-good command patterns?
+    # Note: This array is small (~10) and patterns are simple, loop is acceptable
     for pattern in "${KNOWN_GOOD_COMMAND_PATTERNS[@]}"; do
         if echo "$command" | grep -qE "$pattern"; then
             return 0  # Safe - benign command pattern
@@ -1281,12 +1262,18 @@ add_finding() {
     local matched_pattern="${10:-}"    # The pattern that triggered detection
     local matched_string="${11:-}"     # The actual string that matched
 
-    # Extract structured fields from metadata and additional_info
-    local owner=$(echo "$metadata" | grep -oP 'owner:\K[^|]+' | head -1 || echo "N/A")
-    local permissions=$(echo "$metadata" | grep -oP 'mode:\K[^|]+' | head -1 || echo "N/A")
-    local days_old=$(echo "$additional_info" | grep -oP 'days_old=\K[0-9]+' | head -1 || echo "N/A")
-    local package_status=$(echo "$additional_info" | grep -oP 'package=\K[^|]+' | head -1 || echo "unmanaged")
-    local enabled=$(echo "$additional_info" | grep -oP 'enabled=\K[^|]+' | head -1 || echo "")
+    # Extract structured fields using bash parameter expansion (faster than grep -oP)
+    # Metadata format: mode:xxx|owner:user:group|size:xxx|modified:xxx|...
+    local owner="N/A" permissions="N/A" days_old="N/A" package_status="unmanaged" enabled=""
+
+    # Parse metadata with single read
+    if [[ "$metadata" =~ owner:([^|]+) ]]; then owner="${BASH_REMATCH[1]}"; fi
+    if [[ "$metadata" =~ mode:([^|]+) ]]; then permissions="${BASH_REMATCH[1]}"; fi
+
+    # Parse additional_info with single read
+    if [[ "$additional_info" =~ days_old=([0-9]+) ]]; then days_old="${BASH_REMATCH[1]}"; fi
+    if [[ "$additional_info" =~ package=([^|]+) ]]; then package_status="${BASH_REMATCH[1]}"; fi
+    if [[ "$additional_info" =~ enabled=([^|]+) ]]; then enabled="${BASH_REMATCH[1]}"; fi
 
     # Try to extract command from description (ExecStart: or preview= patterns)
     local command=""
@@ -2131,21 +2118,26 @@ check_cron() {
                 local hidden_flag=""
 
                 # Check if this job was NOT visible in atq (hidden job)
+                # Note: If atq_job_ids is empty, atd might not be running - skip hidden check
                 local in_atq=false
-                for known_id in "${atq_job_ids[@]}"; do
-                    if [[ "$spool_name" == *"$known_id"* ]] || [[ "$known_id" == *"$spool_name"* ]]; then
-                        in_atq=true
-                        break
-                    fi
-                done
+                if [[ ${#atq_job_ids[@]} -gt 0 ]]; then
+                    for known_id in "${atq_job_ids[@]}"; do
+                        # At spool files are named with the job ID embedded (format varies by system)
+                        # Check if numeric job ID matches anywhere in spool filename
+                        if [[ "$spool_name" == *"$known_id"* ]]; then
+                            in_atq=true
+                            break
+                        fi
+                    done
 
-                if [[ "$in_atq" == "false" ]]; then
-                    # Job exists in spool but was NOT shown by atq - highly suspicious
-                    confidence="HIGH"
-                    finding_matched_pattern="hidden_at_job"
-                    finding_matched_string="$spool_name (not in atq output)"
-                    hidden_flag="hidden=true"
-                    log_finding "At job in spool not visible in atq (possible hidden job): $spool_file"
+                    if [[ "$in_atq" == "false" ]]; then
+                        # Job exists in spool but NOT in atq - suspicious but could be timing/format issue
+                        confidence="MEDIUM"  # MEDIUM not HIGH - could be false positive
+                        finding_matched_pattern="hidden_at_job"
+                        finding_matched_string="$spool_name (not in atq output)"
+                        hidden_flag="hidden=true"
+                        log_finding "At job in spool not visible in atq (possible hidden job): $spool_file"
+                    fi
                 fi
 
                 if quick_suspicious_check "$content"; then
