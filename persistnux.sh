@@ -534,6 +534,31 @@ is_package_managed() {
             [[ -n "$dpkg_output" ]] && file="$original_file"
         fi
 
+        # dpkg does NOT resolve symlinks in -S queries. On merged-/usr systems
+        # (Ubuntu 22.04+) /lib -> usr/lib, so dpkg stores /usr/lib/... paths.
+        # On pre-merge systems, dpkg stores /lib/... paths.
+        # Try the alternate form so both generations of Ubuntu work correctly.
+        if [[ -z "$dpkg_output" ]]; then
+            local alt_path=""
+            if [[ "$file" == /usr/lib/* ]]; then
+                alt_path="/lib/${file#/usr/lib/}"
+            elif [[ "$file" == /usr/bin/* ]]; then
+                alt_path="/bin/${file#/usr/bin/}"
+            elif [[ "$file" == /usr/sbin/* ]]; then
+                alt_path="/sbin/${file#/usr/sbin/}"
+            elif [[ "$file" == /lib/* ]]; then
+                alt_path="/usr/lib/${file#/lib/}"
+            elif [[ "$file" == /bin/* ]]; then
+                alt_path="/usr/bin/${file#/bin/}"
+            elif [[ "$file" == /sbin/* ]]; then
+                alt_path="/usr/sbin/${file#/sbin/}"
+            fi
+            if [[ -n "$alt_path" ]]; then
+                dpkg_output=$(dpkg -S "$alt_path" 2>/dev/null) || true
+                [[ -n "$dpkg_output" ]] && file="$alt_path"
+            fi
+        fi
+
         if [[ -n "$dpkg_output" ]]; then
             local package=$(echo "$dpkg_output" | cut -d':' -f1 | head -n1)
 
@@ -1346,11 +1371,10 @@ check_systemd() {
     # Initialize systemctl cache for faster enabled status lookups
     init_systemctl_cache
 
-    # NOTE: /lib/systemd is omitted since /lib -> usr/lib on modern systems
-    # dpkg stores paths as /lib/... but we scan /usr/lib/... to avoid duplicates
     local systemd_paths=(
         "/etc/systemd/system"
         "/usr/lib/systemd/system"
+        "/lib/systemd/system"
         "/run/systemd/system"
         "/etc/systemd/user"
         "/usr/lib/systemd/user"
@@ -1371,8 +1395,21 @@ check_systemd() {
         done < /etc/passwd
     fi
 
+    # Track scanned real paths to avoid double-scanning /lib/ and /usr/lib/ on merged-/usr
+    local scanned_systemd_paths=()
+
     for path in "${systemd_paths[@]}"; do
         if [[ -d "$path" ]]; then
+            local real_path
+            real_path=$(realpath "$path" 2>/dev/null) || real_path="$path"
+            local _already=false
+            local _prev
+            for _prev in "${scanned_systemd_paths[@]}"; do
+                [[ "$_prev" == "$real_path" ]] && _already=true && break
+            done
+            "$_already" && continue
+            scanned_systemd_paths+=("$real_path")
+
             while IFS= read -r -d '' service_file; do
                 local metadata=$(get_file_metadata "$service_file")
                 local service_name=$(basename "$service_file")
@@ -1682,17 +1719,30 @@ check_systemd() {
     # They can dynamically create service unit files, making them a powerful and
     # stealthy persistence vector - the actual generated units are ephemeral.
     # ═══════════════════════════════════════════════════════════════════════════
-    # NOTE: /lib/systemd is omitted since /lib -> usr/lib on modern systems
     local generator_dirs=(
         "/etc/systemd/system-generators"
         "/usr/lib/systemd/system-generators"
+        "/lib/systemd/system-generators"
         "/run/systemd/system-generators"
         "/etc/systemd/user-generators"
         "/usr/lib/systemd/user-generators"
     )
 
+    # Track scanned real paths to avoid double-scanning /lib/ and /usr/lib/ on merged-/usr
+    local scanned_gen_dirs=()
+
     for gen_dir in "${generator_dirs[@]}"; do
         if [[ -d "$gen_dir" ]]; then
+            local real_gen_dir
+            real_gen_dir=$(realpath "$gen_dir" 2>/dev/null) || real_gen_dir="$gen_dir"
+            local _already=false
+            local _prev
+            for _prev in "${scanned_gen_dirs[@]}"; do
+                [[ "$_prev" == "$real_gen_dir" ]] && _already=true && break
+            done
+            "$_already" && continue
+            scanned_gen_dirs+=("$real_gen_dir")
+
             while IFS= read -r -d '' gen_file; do
                 local pkg_status pkg_return=0
                 pkg_status=$(is_package_managed "$gen_file") || pkg_return=$?
@@ -2923,14 +2973,17 @@ check_additional_persistence() {
     # Check for PAM backdoors
     # Verify actual PAM module .so files, not just config references
     if [[ -d "/etc/pam.d" ]]; then
-        # Common PAM module directories
-        # NOTE: /lib -> usr/lib on modern merged-/usr systems, so we only scan /usr/lib
-        # to avoid duplicates; the fallback in is_package_managed handles dpkg's /lib paths
+        # Common PAM module directories - checked in order, first match wins (break below)
+        # /usr/lib listed before /lib so merged-/usr systems pick the canonical path
         local pam_lib_dirs=(
-            "/usr/lib/security"
-            "/usr/lib64/security"
             "/usr/lib/x86_64-linux-gnu/security"
             "/usr/lib/aarch64-linux-gnu/security"
+            "/usr/lib/security"
+            "/usr/lib64/security"
+            "/lib/x86_64-linux-gnu/security"
+            "/lib/aarch64-linux-gnu/security"
+            "/lib/security"
+            "/lib64/security"
         )
 
         # Find the actual PAM lib directory on this system
