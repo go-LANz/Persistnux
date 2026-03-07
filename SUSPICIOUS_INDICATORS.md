@@ -182,11 +182,15 @@ system([COMMAND])
 - Obfuscation techniques
 - Execution from temporary directories
 
-### CRITICAL (Reserved for Future Use)
-- Multiple HIGH confidence indicators
-- Known malware signatures
-- Active exploitation indicators
-- Confirmed malicious activity
+### CRITICAL
+- Package-managed file has failed integrity verification (dpkg/rpm/pacman --verify)
+  — indicates a replaced or tampered system binary or config (rootkit indicator)
+- SUID or SGID bit set on a file that also matches a suspicious pattern
+  — attacker-controlled setuid binary is the most dangerous persistence combination
+- Systemd generator in a suspicious/ephemeral location (/tmp, /dev/shm, /run)
+- PAM module (.so file) is unmanaged or has failed package integrity verification
+- pam_exec.so script located in a temp directory or contains suspicious content
+- Inline interpreter code (-c/-e flag) with suspicious patterns or high-entropy payload
 
 ## Pattern Matching Strategy
 
@@ -249,5 +253,5 @@ Found a new suspicious pattern or false positive? Please contribute:
 
 ---
 
-**Last Updated**: 2026-01-23
-**Version**: 1.1.0
+**Last Updated**: 2026-03-05
+**Version**: 1.9.0

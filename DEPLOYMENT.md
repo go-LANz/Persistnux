@@ -35,7 +35,7 @@ If you're working from a local repository:
 
 ```bash
 # From your Mac/development machine, copy to Linux server
-scp /Users/golanagi/Documents/GitHub/Persistnux/persistnux.sh user@server:/home/user/
+scp /path/to/persistnux/persistnux.sh user@server:/home/user/
 
 # On the Linux server
 chmod +x persistnux.sh
@@ -50,7 +50,7 @@ If you're testing on a local Linux machine (not remote):
 
 ```bash
 # Copy from current directory
-cp /Users/golanagi/Documents/GitHub/Persistnux/persistnux.sh ~/Desktop/
+cp /path/to/persistnux/persistnux.sh ~/Desktop/
 
 # Make executable
 chmod +x ~/Desktop/persistnux.sh
@@ -250,7 +250,7 @@ After deployment, verify the tool works:
 ./persistnux.sh --help | head -3
 
 # Should show:
-# Persistnux - Linux Persistence Detection Tool v1.2.0
+# Persistnux - Linux Persistence Detection Tool v1.9.0
 # Comprehensive DFIR tool to detect Linux persistence mechanisms
 
 # Run syntax check
@@ -284,6 +284,5 @@ sudo crontab -e
 
 ## Support
 
-- **Documentation**: See README.md, DFIR_GUIDE.md, FILTERING_GUIDE.md
+- **Documentation**: See README.md, DFIR_GUIDE.md, DETECTION_LOGIC.md
 - **Issues**: https://github.com/yourusername/persistnux/issues
-- **Current Status**: See CURRENT_STATUS.md for what the tool does

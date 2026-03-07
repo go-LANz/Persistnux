@@ -107,6 +107,7 @@ declare -a SUSPICIOUS_COMMANDS=(
     "\. .*/dev/shm/"              # POSIX dot-source from /dev/shm
     "nohup .*/tmp/"               # Background execution of /tmp payload
     "nohup .*/dev/shm/"           # Background execution of /dev/shm payload
+    "nohup.*setsid"               # Process detachment chain (survives logout, any path)
     "tftp.*-g"                    # TFTP get (worm propagation)
     "dd if=/tmp/"                 # dd reading from /tmp staging area
     "dd if=/dev/shm/"             # dd reading from /dev/shm
@@ -231,7 +232,8 @@ declare -a NEVER_WHITELIST_PATTERNS=(
     "tr.*[A-Za-z].*\|.*(bash|sh)" # tr-based cipher decode to shell (ROT13/ROT47)
     "eval.*\$\(.*curl"           # eval with curl command substitution (download+exec)
     "eval.*\$\(.*wget"           # eval with wget command substitution (download+exec)
-    "LD_PRELOAD=.*/(tmp|dev/shm|var/tmp)/"  # LD_PRELOAD pointing to staging dirs
+    "LD_PRELOAD=.*/(tmp|dev/shm|var/tmp)/"     # LD_PRELOAD pointing to staging dirs
+    "LD_LIBRARY_PATH=.*/(tmp|dev/shm|var/tmp)/" # LD_LIBRARY_PATH pointing to staging dirs
 )
 
 # Multi-line suspicious patterns (for heredocs, split commands, etc.)
@@ -768,7 +770,7 @@ is_package_managed() {
                 PKG_VERIFY_CACHE["$package"]="$full_verify"
             fi
             local verify_output
-            verify_output=$(echo "$full_verify" | grep -F "$file")
+            verify_output=$(echo "$full_verify" | grep -F " $file")
             if [[ -n "$verify_output" ]]; then
                 result="pacman:$package:MODIFIED"
                 ret_code=2
@@ -1270,7 +1272,7 @@ analyze_script_content() {
             # Standalone high entropy without execution context: skip (too many FPs)
         fi
 
-    done <<< "$script_content"
+    done <<< "$script_content_clean"
 
     return 1  # Clean - no suspicious patterns found
 }
@@ -1312,6 +1314,20 @@ analyze_inline_code() {
         # Strip any leading/trailing quotes that might have been included
         inline_code="${inline_code#[\"\']}"
         inline_code="${inline_code%[\"\']}"
+    fi
+
+    # Also try env -S/--split-string evasion: the quoted argument is the split-string payload
+    if [[ -z "$inline_code" ]]; then
+        local _env_sq_pat
+        _env_sq_pat="[[:space:]](-S|--split-string)[[:space:]]+'([^']+)'"
+        local _env_dq_pat='[[:space:]](-S|--split-string)[[:space:]]+"([^"]+)"'
+        if [[ "$full_command" =~ $_env_sq_pat ]]; then
+            inline_code="${BASH_REMATCH[2]}"
+        elif [[ "$full_command" =~ $_env_dq_pat ]]; then
+            inline_code="${BASH_REMATCH[2]}"
+        elif [[ "$full_command" =~ [[:space:]](-S|--split-string)[[:space:]]+(.+)$ ]]; then
+            inline_code="${BASH_REMATCH[2]}"
+        fi
     fi
 
     [[ -z "$inline_code" ]] && return 1  # No inline code found
@@ -1626,7 +1642,7 @@ check_systemd() {
     # compromising non-privileged accounts (www-data, service accounts, etc.)
     if [[ $EUID_CHECK -eq 0 ]]; then
         while IFS=: read -r username _ uid _ _ homedir _; do
-            if [[ $uid -ge 1000 ]] || [[ $uid -eq 0 ]]; then
+            if [[ $uid -ge 0 ]]; then
                 local user_systemd_dir="$homedir/.config/systemd/user"
                 if [[ -d "$user_systemd_dir" ]] && [[ "$user_systemd_dir" != "$HOME/.config/systemd/user" ]]; then
                     systemd_paths+=("$user_systemd_dir")
@@ -1676,7 +1692,20 @@ check_systemd() {
                 enabled_status=$(get_systemctl_enabled_status "$service_name")
 
                 # Skip disabled services - not active, not a persistence risk
-                [[ "$enabled_status" == "disabled" ]] && continue
+                # Exception: timer-activated services appear "disabled" but run on schedule
+                # If a matching .timer file exists in any systemd path, analyze the service anyway
+                if [[ "$enabled_status" == "disabled" ]]; then
+                    local _timer_basename="${service_name%.service}.timer"
+                    local _timer_found=false
+                    local _tdir
+                    for _tdir in "$(dirname "$service_file")" /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system /run/systemd/system /etc/systemd/user /usr/lib/systemd/user; do
+                        if [[ -f "${_tdir}/${_timer_basename}" ]]; then
+                            _timer_found=true
+                            break
+                        fi
+                    done
+                    [[ "$_timer_found" == "false" ]] && continue
+                fi
 
                 local confidence="MEDIUM"
                 local finding_matched_pattern=""
@@ -1777,7 +1806,7 @@ check_systemd() {
                                 fi
                             else
                                 # Interpreter with no file argument - check for inline code
-                                if [[ "$exec_start" =~ \ -[ce]\  ]] || [[ "$exec_start" =~ \ -[ce]$ ]]; then
+                                if [[ "$exec_start" =~ \ -[ce]\  ]] || [[ "$exec_start" =~ \ -[ce]$ ]] || [[ "$exec_start" =~ [[:space:]](-S|--split-string)([[:space:]]|$) ]]; then
                                     # Analyze the inline code content for patterns and obfuscation
                                     if analyze_inline_code "$exec_start"; then
                                         confidence="CRITICAL"
@@ -2123,7 +2152,7 @@ analyze_cron_command() {
 
             # Script is UNMANAGED - analyze content and location
             # Check suspicious location first
-            if [[ "$script_file" =~ ^/(tmp|dev/shm|var/tmp) ]]; then
+            if [[ "$script_file" =~ ^/(tmp|dev/shm|var/tmp|run/user/) ]] || [[ "$script_file" =~ /\.[a-zA-Z] ]]; then
                 CRON_ANALYSIS_REASON="suspicious_location:$script_file"
                 return 0
             fi
@@ -2144,8 +2173,8 @@ analyze_cron_command() {
             return 0
 
         else
-            # No script file - check for INLINE CODE (-c/-e flags)
-            if [[ "$cron_command" =~ \ -[ce]\  ]] || [[ "$cron_command" =~ \ -[ce]$ ]]; then
+            # No script file - check for INLINE CODE (-c/-e flags or env -S)
+            if [[ "$cron_command" =~ \ -[ce]\  ]] || [[ "$cron_command" =~ \ -[ce]$ ]] || [[ "$cron_command" =~ [[:space:]](-S|--split-string)([[:space:]]|$) ]]; then
                 # FLOW-3 fix: check if the interpreter ITSELF is in a suspicious location
                 # (e.g. /tmp/bash -c 'code' should flag the interpreter, not just the code)
                 if [[ "$executable" =~ ^/(tmp|dev/shm|var/tmp) ]] || [[ "$executable" =~ /\.[a-z] ]]; then
@@ -2200,7 +2229,7 @@ analyze_cron_command() {
 
     # Binary is UNMANAGED - analyze location and content
     # Check suspicious location
-    if [[ "$executable" =~ ^/(tmp|dev/shm|var/tmp) ]]; then
+    if [[ "$executable" =~ ^/(tmp|dev/shm|var/tmp|run/user/) ]] || [[ "$executable" =~ /\.[a-zA-Z] ]]; then
         CRON_ANALYSIS_REASON="suspicious_location:$executable"
         return 0
     fi
@@ -2297,7 +2326,7 @@ check_cron() {
             while IFS= read -r cron_line; do
                 [[ -z "$cron_line" ]] && continue
                 local cron_command
-                cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}') || true
+                cron_command=$(echo "$cron_line" | awk '{for(i=7;i<=NF;i++) printf "%s ", $i; print ""}') || true
                 if analyze_cron_command "$cron_command" "$cron_path"; then
                     [[ "$confidence" != "CRITICAL" ]] && confidence="HIGH"
                     # Extract pattern and string from CRON_ANALYSIS_REASON (format: pattern:value)
@@ -2350,7 +2379,7 @@ check_cron() {
                 while IFS= read -r cron_line; do
                     [[ -z "$cron_line" ]] && continue
                     local cron_command
-                    cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}') || true
+                    cron_command=$(echo "$cron_line" | awk '{for(i=7;i<=NF;i++) printf "%s ", $i; print ""}') || true
                     if analyze_cron_command "$cron_command" "$cron_file"; then
                         [[ "$confidence" != "CRITICAL" ]] && confidence="HIGH"
                         finding_matched_pattern="${CRON_ANALYSIS_REASON%%:*}"
@@ -2437,7 +2466,7 @@ check_cron() {
     # Analyze each entry with the full execution chain (same flow as /etc/crontab and /etc/cron.d)
     if [[ $EUID_CHECK -eq 0 ]]; then
         while IFS=: read -r username _ uid _; do
-            if [[ $uid -ge 1000 ]] || [[ $uid -eq 0 ]]; then
+            if [[ $uid -ge 0 ]]; then
                 local user_cron
                 user_cron=$(crontab -u "$username" -l 2>/dev/null || echo "")
                 if [[ -n "$user_cron" ]]; then
@@ -2771,13 +2800,14 @@ check_shell_profiles() {
         ".zprofile"
         ".zlogin"
         ".zshenv"              # Most powerful zsh config - sourced for ALL invocations including non-interactive
+        ".bash_logout"         # Executed on logout — can persist cleanup scripts or beacons
         ".config/fish/config.fish"
     )
 
     # Check for all users if root
     if [[ $EUID_CHECK -eq 0 ]]; then
         while IFS=: read -r username _ uid _ _ homedir _; do
-            if [[ $uid -ge 1000 ]] || [[ $uid -eq 0 ]]; then
+            if [[ $uid -ge 0 ]]; then
                 for user_profile in "${user_profiles[@]}"; do
                     local profile_path="$homedir/$user_profile"
                     if [[ -f "$profile_path" ]]; then
@@ -2834,11 +2864,11 @@ check_shell_profiles() {
                 local finding_matched_pattern=""
                 local finding_matched_string=""
                 if quick_suspicious_check "$content"; then
-                    confidence="MEDIUM"
+                    confidence="HIGH"
                     finding_matched_pattern="$MATCHED_PATTERN"
                     finding_matched_string="$MATCHED_STRING"
                 elif analyze_script_content "$profile_path"; then
-                    confidence="MEDIUM"
+                    confidence="HIGH"
                     finding_matched_pattern="$MATCHED_PATTERN"
                     finding_matched_string="$MATCHED_STRING"
                 fi
@@ -3173,6 +3203,65 @@ check_kernel_and_preload() {
     done
 
     # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 2b: Shared objects at non-standard paths listed in ld.so.conf.d
+    # The conf-file integrity check above catches tampered config files, but an
+    # attacker can add a NEW unmanaged conf pointing to /opt/lib/ or similar,
+    # drop a malicious libssl.so.1.1 there, and the conf gets MEDIUM confidence
+    # (deprioritized). We must also scan the actual .so files at those paths.
+    # Standard dirs (/usr/lib, /lib, /usr/lib64, /lib64) are already covered by
+    # package verification elsewhere — we only scan non-standard additions.
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Standard lib dirs to skip (already covered by package manager checks)
+    local _std_lib_dirs_pattern="^(/usr/lib|/lib|/usr/lib64|/lib64)(/|$)"
+
+    # Collect all non-standard paths from all ld conf files
+    local _ld_extra_paths=()
+    declare -A _ld_seen_paths=()
+    for _ldcf in "${ld_conf_files[@]}"; do
+        while IFS= read -r _ldpath; do
+            [[ -z "$_ldpath" ]] && continue
+            # Skip comment and include lines
+            [[ "$_ldpath" =~ ^# ]] && continue
+            [[ "$_ldpath" =~ ^include ]] && continue
+            # Skip standard dirs — already covered
+            [[ "$_ldpath" =~ $_std_lib_dirs_pattern ]] && continue
+            # O(1) dedup via associative array
+            [[ -n "${_ld_seen_paths[$_ldpath]+set}" ]] && continue
+            _ld_seen_paths[$_ldpath]=1
+            _ld_extra_paths+=("$_ldpath")
+        done < <(grep -v "^#" "$_ldcf" 2>/dev/null)
+    done
+
+    for _lddir in "${_ld_extra_paths[@]}"; do
+        [[ -d "$_lddir" ]] || continue
+        while IFS= read -r -d '' _so_file; do
+            local so_pkg_status so_pkg_return=0
+            so_pkg_status=$(is_package_managed "$_so_file") || so_pkg_return=$?
+            [[ $so_pkg_return -eq 0 ]] && continue  # Verified package .so — fine
+
+            local so_hash so_metadata
+            so_hash=$(get_file_hash "$_so_file") || true
+            so_metadata=$(get_file_metadata "$_so_file") || true
+            local so_confidence so_pattern
+
+            if [[ $so_pkg_return -eq 2 ]]; then
+                so_confidence="CRITICAL"
+                so_pattern="modified_lib_at_ld_path"
+                log_finding "MODIFIED package .so at non-standard ld path: $_so_file"
+            else
+                so_confidence="HIGH"
+                so_pattern="unmanaged_lib_at_ld_path"
+                log_finding "Unmanaged .so at non-standard ld path: $_so_file"
+            fi
+
+            add_finding "Preload" "LDPath" "so_at_ld_path" "$_so_file" \
+                "Unverified .so at non-standard ld path: $_lddir" "$so_confidence" \
+                "$so_hash" "$so_metadata" "package=$so_pkg_status" \
+                "$so_pattern" "$_so_file"
+        done < <(find "$_lddir" -maxdepth 1 -name "*.so*" \( -type f -o -type l \) -print0 2>/dev/null)
+    done
+
+    # ═══════════════════════════════════════════════════════════════════════════
     # TYPE 3: Loaded kernel modules - verify each module file
     # ═══════════════════════════════════════════════════════════════════════════
     if [[ $EUID_CHECK -eq 0 ]] && command -v lsmod &>/dev/null; then
@@ -3268,6 +3357,9 @@ check_kernel_and_preload() {
         done < <(find "/etc/modules-load.d" -type f -print0 2>/dev/null)
     fi
 
+    # Track resolved module names across all configs to avoid duplicate modinfo calls
+    declare -A _seen_ko_modules=()
+
     for mod_config in "${module_configs[@]}"; do
         [[ ! -f "$mod_config" ]] && continue
 
@@ -3302,6 +3394,193 @@ check_kernel_and_preload() {
         fi
 
         add_finding "Kernel" "ModuleConfig" "module_config" "$mod_config" "Module auto-load config: $(basename "$mod_config")" "$confidence" "$hash" "$metadata" "package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
+
+        # ISC-21/D: Extract module names from this config and verify their .ko files.
+        # The config-file integrity check only confirms the LIST hasn't changed;
+        # it doesn't verify the actual kernel module binaries referenced by name.
+        while IFS= read -r _modname; do
+            [[ -z "$_modname" ]] && continue
+            # Skip module names already resolved from a previous config file
+            [[ -n "${_seen_ko_modules[$_modname]+set}" ]] && continue
+            _seen_ko_modules[$_modname]=1
+            local _ko_path
+            _ko_path=$(modinfo -F filename "$_modname" 2>/dev/null) || true
+            # Skip builtins and unresolvable names
+            { [[ -z "$_ko_path" ]] || [[ "$_ko_path" == "(builtin)" ]]; } && continue
+            # Strip compression suffix for existence check (module may be .ko.zst, .ko.xz)
+            # Use %.ko.* (not %%.*) to strip only the compression part, not the version dirs
+            local _ko_base="${_ko_path%.ko.*}.ko"
+            local _ko_exists=""
+            [[ -f "$_ko_path" ]] && _ko_exists="$_ko_path"
+            [[ -z "$_ko_exists" ]] && [[ -f "$_ko_base" ]] && _ko_exists="$_ko_base"
+
+            if [[ -z "$_ko_exists" ]]; then
+                add_finding "Kernel" "Module" "module_missing_ko" "$_ko_path" \
+                    "Module listed in config has no .ko file: $_modname" "MEDIUM" \
+                    "N/A" "N/A" "" "module_missing_ko" "$_modname"
+                continue
+            fi
+
+            # Location check before package check
+            if [[ ! "$_ko_exists" =~ ^/(lib|usr/lib)/modules/ ]]; then
+                local _ko_hash _ko_meta
+                _ko_hash=$(get_file_hash "$_ko_exists") || true
+                _ko_meta=$(get_file_metadata "$_ko_exists") || true
+                log_finding "Module .ko outside standard path: $_ko_exists"
+                add_finding "Kernel" "Module" "module_nonstandard_ko" "$_ko_exists" \
+                    "Module .ko at non-standard path: $_modname" "HIGH" \
+                    "$_ko_hash" "$_ko_meta" "" "module_nonstandard_location" "$_ko_exists"
+                continue
+            fi
+
+            local _ko_pkg_status _ko_pkg_return=0
+            _ko_pkg_status=$(is_package_managed "$_ko_exists") || _ko_pkg_return=$?
+            [[ $_ko_pkg_return -eq 0 ]] && continue  # Verified — fine
+
+            local _ko_hash _ko_meta
+            _ko_hash=$(get_file_hash "$_ko_exists") || true
+            _ko_meta=$(get_file_metadata "$_ko_exists") || true
+
+            if [[ $_ko_pkg_return -eq 2 ]]; then
+                log_finding "Module .ko is MODIFIED package file: $_ko_exists"
+                add_finding "Kernel" "Module" "modified_ko_file" "$_ko_exists" \
+                    "Module .ko MODIFIED (config: $(basename "$mod_config")): $_modname" "CRITICAL" \
+                    "$_ko_hash" "$_ko_meta" "package=$_ko_pkg_status" \
+                    "modified_kernel_module" "$_ko_exists"
+            else
+                add_finding "Kernel" "Module" "unmanaged_ko_file" "$_ko_exists" \
+                    "Module .ko unmanaged (config: $(basename "$mod_config")): $_modname" "MEDIUM" \
+                    "$_ko_hash" "$_ko_meta" "package=$_ko_pkg_status" \
+                    "unmanaged_kernel_module" "$_ko_exists"
+            fi
+        done < <(grep -vE "^#|^$" "$mod_config" 2>/dev/null)
+    done
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TYPE 5: /etc/modprobe.d/ and /etc/modprobe.conf — kernel module parameters
+    # This directory is the primary attack surface for kernel-level persistence:
+    # - `install` directives execute arbitrary commands instead of loading a module
+    #   (e.g., `install kvm /usr/local/bin/backdoor.sh` runs on every `modprobe kvm`)
+    # - `blacklist` directives can silence security modules (apparmor, seccomp, lockdown)
+    # - The files themselves may be modified package files (integrity check needed)
+    # ═══════════════════════════════════════════════════════════════════════════
+    local modprobe_configs=()
+    [[ -f "/etc/modprobe.conf" ]] && modprobe_configs+=("/etc/modprobe.conf")
+    if [[ -d "/etc/modprobe.d" ]]; then
+        while IFS= read -r -d '' _mpf; do
+            modprobe_configs+=("$_mpf")
+        done < <(find /etc/modprobe.d -type f -print0 2>/dev/null)
+    fi
+
+    # Security modules whose blacklisting is always suspicious
+    local _security_modules_pattern="apparmor|selinux|seccomp|lockdown|integrity|ima|evm|audit"
+
+    for mp_config in "${modprobe_configs[@]}"; do
+        local mp_hash mp_metadata
+        mp_hash=$(get_file_hash "$mp_config") || true
+        mp_metadata=$(get_file_metadata "$mp_config") || true
+        local mp_pkg_status mp_pkg_return=0
+        mp_pkg_status=$(is_package_managed "$mp_config") || mp_pkg_return=$?
+
+        local mp_confidence="LOW"
+        local mp_pattern="" mp_matched=""
+
+        if [[ $mp_pkg_return -eq 2 ]]; then
+            mp_confidence="CRITICAL"
+            mp_pattern="modified_modprobe_config"
+            mp_matched="$mp_config"
+            log_finding "modprobe config is MODIFIED package file: $mp_config"
+        elif [[ $mp_pkg_return -eq 1 ]]; then
+            mp_confidence="MEDIUM"
+            mp_pattern="unmanaged_modprobe_config"
+            mp_matched="$mp_config"
+        else
+            # Verified — still scan content for dangerous directives below
+            :
+        fi
+
+        add_finding "Kernel" "ModprobeConfig" "modprobe_config" "$mp_config" \
+            "modprobe config: $(basename "$mp_config")" "$mp_confidence" \
+            "$mp_hash" "$mp_metadata" "package=$mp_pkg_status" \
+            "$mp_pattern" "$mp_matched"
+
+        # ── Single pass: collect install + blacklist lines from this config ────
+        # One grep covers both directive types, avoiding two separate file reads.
+        local _mp_install_lines=() _mp_blacklist_lines=()
+        while IFS= read -r _mp_line; do
+            local _mp_verb
+            _mp_verb=$(echo "$_mp_line" | awk '{print tolower($1)}') || true
+            case "$_mp_verb" in
+                install)   _mp_install_lines+=("$_mp_line") ;;
+                blacklist) _mp_blacklist_lines+=("$_mp_line") ;;
+            esac
+        done < <(grep -iE "^[[:space:]]*(install|blacklist)[[:space:]]+" "$mp_config" 2>/dev/null)
+
+        # ── install directives: arbitrary command execution on module load ───────
+        for _install_line in "${_mp_install_lines[@]}"; do
+            # Format: install <module_name> <command> [args...]
+            # Extract the command (3rd token); awk handles leading whitespace correctly
+            local _install_cmd
+            _install_cmd=$(echo "$_install_line" | awk '{print $3}') || true
+            [[ -z "$_install_cmd" ]] && continue
+            # Skip legitimate no-op installs (/bin/true, :, /bin/false)
+            [[ "$_install_cmd" == ":" ]] && continue
+            [[ "$_install_cmd" =~ ^/(bin|usr/bin)/(true|false)$ ]] && continue
+            # Must be an absolute path to be actionable
+            [[ "$_install_cmd" =~ ^/ ]] || continue
+
+            local ic_confidence="CRITICAL"
+            local ic_pattern="modprobe_install_directive"
+            local ic_matched="$_install_cmd"
+
+            if [[ ! -e "$_install_cmd" ]]; then
+                ic_pattern="modprobe_install_missing_cmd"
+                log_finding "modprobe install directive references missing command: $_install_cmd ($mp_config)"
+            elif [[ "$_install_cmd" =~ $suspicious_locations_pattern ]]; then
+                ic_pattern="modprobe_install_suspicious_location"
+                log_finding "modprobe install directive in suspicious location: $_install_cmd ($mp_config)"
+            else
+                local ic_pkg_status ic_pkg_return=0
+                ic_pkg_status=$(is_package_managed "$_install_cmd") || ic_pkg_return=$?
+                if [[ $ic_pkg_return -eq 0 ]]; then
+                    ic_confidence="LOW"
+                    ic_pattern="modprobe_install_verified_cmd"
+                elif [[ $ic_pkg_return -eq 2 ]]; then
+                    ic_pattern="modprobe_install_modified_cmd"
+                    log_finding "modprobe install uses MODIFIED package binary: $_install_cmd ($mp_config)"
+                else
+                    ic_pattern="modprobe_install_unmanaged_cmd"
+                    log_finding "modprobe install uses unmanaged command: $_install_cmd ($mp_config)"
+                fi
+            fi
+
+            local ic_hash="N/A" ic_meta="N/A"
+            if [[ -e "$_install_cmd" ]]; then
+                ic_hash=$(get_file_hash "$_install_cmd") || true
+                ic_meta=$(get_file_metadata "$_install_cmd") || true
+            fi
+
+            add_finding "Kernel" "ModprobeInstall" "modprobe_install" "$_install_cmd" \
+                "modprobe install hook in $(basename "$mp_config")" "$ic_confidence" \
+                "$ic_hash" "$ic_meta" "" "$ic_pattern" "$ic_matched"
+        done
+
+        # ── blacklist of security modules ─────────────────────────────────────
+        local _bl_security=""
+        for _bl_line in "${_mp_blacklist_lines[@]}"; do
+            local _bl_mod
+            _bl_mod=$(echo "$_bl_line" | awk '{print $2}') || true
+            [[ "$_bl_mod" =~ ^($_security_modules_pattern)$ ]] && _bl_security="$_bl_line" && break
+        done
+        if [[ -n "$_bl_security" ]]; then
+            local _bl_module
+            _bl_module=$(echo "$_bl_security" | awk '{print $2}' | head -1)
+            log_finding "Security module blacklisted in modprobe config: $_bl_module ($mp_config)"
+            add_finding "Kernel" "ModprobeBlacklist" "modprobe_security_blacklist" "$mp_config" \
+                "Security module blacklisted: $_bl_module" "HIGH" \
+                "$mp_hash" "$mp_metadata" "package=$mp_pkg_status" \
+                "security_module_blacklist" "$_bl_security"
+        fi
     done
 }
 
@@ -3314,6 +3593,16 @@ check_additional_persistence() {
         "/etc/xdg/autostart"
         "$HOME/.config/autostart"
     )
+
+    # When running as root, scan all users' XDG autostart directories
+    if [[ $EUID_CHECK -eq 0 ]]; then
+        while IFS=: read -r _ _ _ _ _ homedir _; do
+            local _user_autostart="$homedir/.config/autostart"
+            if [[ "$_user_autostart" != "$HOME/.config/autostart" ]] && [[ -d "$_user_autostart" ]]; then
+                autostart_dirs+=("$_user_autostart")
+            fi
+        done < /etc/passwd
+    fi
 
     for autostart_dir in "${autostart_dirs[@]}"; do
         if [[ -d "$autostart_dir" ]]; then
@@ -3383,7 +3672,7 @@ check_additional_persistence() {
                                 fi
                             else
                                 # Interpreter with no script arg — check for inline code
-                                if [[ "$exec_line" =~ \ -[ce]\  ]] || [[ "$exec_line" =~ \ -[ce]$ ]]; then
+                                if [[ "$exec_line" =~ \ -[ce]\  ]] || [[ "$exec_line" =~ \ -[ce]$ ]] || [[ "$exec_line" =~ [[:space:]](-S|--split-string)([[:space:]]|$) ]]; then
                                     if analyze_inline_code "$exec_line"; then
                                         confidence="CRITICAL"
                                         finding_matched_pattern="inline_code_suspicious"
@@ -3483,6 +3772,44 @@ check_additional_persistence() {
         fi
 
         add_finding "Environment" "System" "environment_file" "/etc/environment" "System environment file" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
+
+        # ── Extract and verify the actual LD_PRELOAD library path ────────────
+        # The finding above flags the environment file itself. This block extracts
+        # the library path from LD_PRELOAD and verifies it independently — the
+        # library file is the actual payload and needs its own integrity check.
+        local _env_ld_paths
+        _env_ld_paths=$(grep -iE "^LD_PRELOAD[[:space:]]*=" /etc/environment 2>/dev/null | \
+            grep -oE '/[^[:space:]"'"'"']+') || true
+
+        for _env_lib in $_env_ld_paths; do
+            [[ -z "$_env_lib" ]] && continue
+
+            local env_lib_pkg env_lib_return=0
+            env_lib_pkg=$(is_package_managed "$_env_lib") || env_lib_return=$?
+
+            local env_lib_confidence env_lib_pattern
+            if [[ $env_lib_return -eq 0 ]]; then
+                env_lib_confidence="LOW"
+                env_lib_pattern="env_ld_preload_verified"
+            elif [[ $env_lib_return -eq 2 ]]; then
+                env_lib_confidence="CRITICAL"
+                env_lib_pattern="env_ld_preload_modified"
+                log_finding "/etc/environment LD_PRELOAD is MODIFIED package library: $_env_lib"
+            else
+                env_lib_confidence="CRITICAL"
+                env_lib_pattern="env_ld_preload_unmanaged"
+                log_finding "/etc/environment LD_PRELOAD unmanaged library: $_env_lib"
+            fi
+
+            local env_lib_hash env_lib_meta
+            env_lib_hash=$(get_file_hash "$_env_lib") || true
+            env_lib_meta=$(get_file_metadata "$_env_lib") || true
+
+            add_finding "Environment" "LDPreload" "env_ld_preload_lib" "$_env_lib" \
+                "/etc/environment LD_PRELOAD library" "$env_lib_confidence" \
+                "$env_lib_hash" "$env_lib_meta" "package=$env_lib_pkg" \
+                "$env_lib_pattern" "$_env_lib"
+        done
     fi
 
     # Check sudoers for persistence
@@ -3490,23 +3817,47 @@ check_additional_persistence() {
         if [[ -f "/etc/sudoers" ]]; then
             local hash=$(get_file_hash "/etc/sudoers")
             local metadata=$(get_file_metadata "/etc/sudoers")
+            local content=$(cat "/etc/sudoers" 2>/dev/null || echo "")
 
-            add_finding "Privilege" "Sudoers" "sudoers_file" "/etc/sudoers" "Sudoers configuration" "LOW" "$hash" "$metadata" ""
+            local confidence="LOW"
+            local finding_matched_pattern=""
+            local finding_matched_string=""
+            local danger_match=$(echo "$content" | grep -v "^#" | grep -iE "(NOPASSWD|ALL=\(ALL\)|ALL:ALL)" | head -1) || true
+            if [[ -n "$danger_match" ]]; then
+                confidence="HIGH"
+                finding_matched_pattern="dangerous_sudoers_rule"
+                finding_matched_string="$danger_match"
+                log_finding "Dangerous sudoers rule: /etc/sudoers"
+            fi
+
+            add_finding "Privilege" "Sudoers" "sudoers_file" "/etc/sudoers" "Sudoers configuration" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
         fi
 
         if [[ -d "/etc/sudoers.d" ]]; then
             while IFS= read -r -d '' sudoers_file; do
                 local hash=$(get_file_hash "$sudoers_file")
                 local metadata=$(get_file_metadata "$sudoers_file")
+                local content=$(cat "$sudoers_file" 2>/dev/null || echo "")
 
-                add_finding "Privilege" "Sudoers" "sudoers_drop_in" "$sudoers_file" "Sudoers drop-in: $(basename "$sudoers_file")" "MEDIUM" "$hash" "$metadata" ""
+                local confidence="MEDIUM"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
+                local danger_match=$(echo "$content" | grep -v "^#" | grep -iE "(NOPASSWD|ALL=\(ALL\)|ALL:ALL)" | head -1) || true
+                if [[ -n "$danger_match" ]]; then
+                    confidence="HIGH"
+                    finding_matched_pattern="dangerous_sudoers_rule"
+                    finding_matched_string="$danger_match"
+                    log_finding "Dangerous sudoers rule: $sudoers_file"
+                fi
+
+                add_finding "Privilege" "Sudoers" "sudoers_drop_in" "$sudoers_file" "Sudoers drop-in: $(basename "$sudoers_file")" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
             done < <(find /etc/sudoers.d -type f -print0 2>/dev/null)
         fi
     fi
 
     # Check for PAM backdoors
     # Verify actual PAM module .so files, not just config references
-    if [[ -d "/etc/pam.d" ]]; then
+    if [[ -d "/etc/pam.d" ]] || [[ -f "/etc/pam.conf" ]]; then
         # Common PAM module directories - checked in order, first match wins (break below)
         # /usr/lib listed before /lib so merged-/usr systems pick the canonical path
         local pam_lib_dirs=(
@@ -3532,15 +3883,60 @@ check_additional_persistence() {
         # Track which modules we've already checked (avoid duplicates)
         declare -A checked_modules
 
-        while IFS= read -r -d '' pam_file; do
-            # Extract PAM module names from config (e.g., pam_unix.so)
+        # ─────────────────────────────────────────────────────────────────────
+        # ISC-9/ISC-10 FIX: Build complete list of PAM config files to analyze.
+        # Includes /etc/pam.conf (legacy single-file format) and follows
+        # @include directives pointing outside /etc/pam.d/.
+        # ─────────────────────────────────────────────────────────────────────
+        local _all_pam_files=()
+        if [[ -d "/etc/pam.d" ]]; then
+            while IFS= read -r -d '' _pf; do
+                _all_pam_files+=("$_pf")
+            done < <(find /etc/pam.d -type f -print0 2>/dev/null)
+        fi
+        [[ -f "/etc/pam.conf" ]] && _all_pam_files+=("/etc/pam.conf")
+
+        # Follow @include directives one level deep (with cycle detection)
+        local _include_queue=() _include_path
+        for _pf in "${_all_pam_files[@]}"; do
+            while IFS= read -r _include_path; do
+                [[ -f "$_include_path" ]] || continue
+                local _dup=0
+                for _ef in "${_all_pam_files[@]}" "${_include_queue[@]}"; do
+                    [[ "$_ef" == "$_include_path" ]] && _dup=1 && break
+                done
+                [[ $_dup -eq 0 ]] && _include_queue+=("$_include_path")
+            done < <(grep -oE "@include[[:space:]]+(/[^[:space:]]+)" "$_pf" 2>/dev/null | grep -oE "(/[^[:space:]]+)$")
+        done
+        _all_pam_files+=("${_include_queue[@]}")
+
+        # _pam_cfg_content: unified content from all PAM files (strips service-name
+        # column from /etc/pam.conf lines; used by pam_exec and relay detection).
+        # Built inline in the module loop below to avoid reading each file twice.
+        local _pam_cfg_content=""
+        local _pam_script_used=0
+
+        for pam_file in "${_all_pam_files[@]}"; do
+            # Read file once; strip comments and pam.conf service column in one pass
+            local _pam_file_content
+            if [[ "$pam_file" == "/etc/pam.conf" ]]; then
+                _pam_file_content=$(grep -v "^#" "$pam_file" 2>/dev/null | awk '{$1=""; print}') || true
+            else
+                _pam_file_content=$(grep -v "^#" "$pam_file" 2>/dev/null) || true
+            fi
+            _pam_cfg_content+=$'\n'"$_pam_file_content"
+
+            # Extract named PAM modules (pam_*.so)
             local modules
-            modules=$(grep -v "^#" "$pam_file" 2>/dev/null | grep -oE "pam_[a-zA-Z0-9_]+\.so" | sort -u) || true
+            modules=$(echo "$_pam_file_content" | grep -oE "pam_[a-zA-Z0-9_]+\.so" | sort -u) || true
+
+            # ISC-3 FIX: Also extract absolute-path .so references (e.g. /usr/lib/custom/auth.so)
+            local abs_modules
+            abs_modules=$(echo "$_pam_file_content" | grep -oE "(/[a-zA-Z0-9/_.-]+\.so)" | grep -vE "/pam_[a-zA-Z0-9_]+\.so$" | sort -u) || true
 
             for module in $modules; do
-                # Skip if already checked
-                [[ -n "${checked_modules[$module]}" ]] && continue
-                checked_modules[$module]=1
+                # ISC-6 FIX: Track if pam_script.so is referenced (hook files checked after loop)
+                [[ "$module" == "pam_script.so" ]] && _pam_script_used=1
 
                 # Find the actual .so file
                 local module_path=""
@@ -3558,6 +3954,10 @@ check_additional_persistence() {
 
                 # If module file doesn't exist, skip (might be optional/conditional)
                 [[ -z "$module_path" ]] && continue
+
+                # ISC-13 FIX: Dedup by full resolved path, not module name
+                [[ -n "${checked_modules[$module_path]}" ]] && continue
+                checked_modules[$module_path]=1
 
                 # Check package status of the actual .so file
                 local pkg_status pkg_return=0
@@ -3590,7 +3990,122 @@ check_additional_persistence() {
 
                 add_finding "PAM" "Module" "pam_module" "$module_path" "PAM module: $module" "$confidence" "$hash" "$metadata" "package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
             done
-        done < <(find /etc/pam.d -type f -print0 2>/dev/null)
+
+            # ISC-3 FIX: Check absolute-path .so module references
+            for abs_module in $abs_modules; do
+                [[ -f "$abs_module" ]] || continue
+                [[ -n "${checked_modules[$abs_module]}" ]] && continue
+                checked_modules[$abs_module]=1
+
+                local pkg_status pkg_return=0
+                pkg_status=$(is_package_managed "$abs_module") || pkg_return=$?
+                [[ $pkg_return -eq 0 ]] && continue
+
+                local hash=$(get_file_hash "$abs_module")
+                local metadata=$(get_file_metadata "$abs_module")
+                local confidence="MEDIUM"
+                local finding_matched_pattern=""
+                local finding_matched_string=""
+
+                if [[ $pkg_return -eq 2 ]]; then
+                    confidence="CRITICAL"
+                    finding_matched_pattern="modified_pam_module"
+                    finding_matched_string="$abs_module"
+                    log_finding "PAM module is MODIFIED package file: $abs_module"
+                else
+                    confidence="HIGH"
+                    finding_matched_pattern="unmanaged_pam_module"
+                    finding_matched_string="$abs_module"
+                    log_finding "Unmanaged PAM module (absolute path): $abs_module"
+                fi
+
+                add_finding "PAM" "Module" "pam_module" "$abs_module" \
+                    "PAM module: $(basename "$abs_module")" "$confidence" \
+                    "$hash" "$metadata" "package=$pkg_status" \
+                    "$finding_matched_pattern" "$finding_matched_string"
+            done
+        done
+
+        # ─────────────────────────────────────────────────────────────────────
+        # ISC-6 FIX: pam_script.so hook file detection.
+        # pam_script.so executes fixed-path scripts in /etc/security/ on every
+        # auth event. Unlike pam_exec.so, the script path is not in the config
+        # line — it reads from well-known hook file paths directly.
+        # ─────────────────────────────────────────────────────────────────────
+        if [[ $_pam_script_used -eq 1 ]]; then
+            local _pam_script_hooks=(
+                "/etc/security/pam_script_auth"
+                "/etc/security/pam_script_acct"
+                "/etc/security/pam_script_ses"
+                "/etc/security/pam_script_passwd"
+                "/etc/security/pam_script_session"
+            )
+            for hook_file in "${_pam_script_hooks[@]}"; do
+                [[ -f "$hook_file" ]] || continue
+
+                local hook_pkg_status hook_pkg_return=0
+                hook_pkg_status=$(is_package_managed "$hook_file") || hook_pkg_return=$?
+
+                local confidence="HIGH"
+                local finding_matched_pattern="pam_script_hook"
+                local finding_matched_string="$hook_file"
+
+                if [[ $hook_pkg_return -eq 0 ]]; then
+                    confidence="LOW"
+                    finding_matched_pattern="pam_script_hook_verified"
+                elif [[ $hook_pkg_return -eq 2 ]]; then
+                    confidence="CRITICAL"
+                    finding_matched_pattern="pam_script_hook_modified"
+                    log_finding "pam_script.so hook file is MODIFIED package file: $hook_file"
+                elif analyze_script_content "$hook_file"; then
+                    confidence="CRITICAL"
+                    finding_matched_pattern="$MATCHED_PATTERN"
+                    finding_matched_string="$MATCHED_STRING"
+                    log_finding "pam_script.so hook contains suspicious content: $hook_file"
+                else
+                    log_finding "pam_script.so hook file present (unmanaged): $hook_file"
+                fi
+
+                local hook_hash="DEFER"
+                local hook_metadata
+                hook_metadata=$(get_file_metadata "$hook_file") || true
+
+                add_finding "PAM" "Exec" "pam_script_hook" "$hook_file" \
+                    "pam_script.so hook script" "$confidence" \
+                    "$hook_hash" "$hook_metadata" "package=$hook_pkg_status" \
+                    "$finding_matched_pattern" "$finding_matched_string"
+            done
+        fi
+
+        # ─────────────────────────────────────────────────────────────────────
+        # ISC-11/ISC-19 FIX: PAM config file integrity check.
+        # The .so module check above only verifies module binaries. The config
+        # files themselves (/etc/pam.d/common-auth, sshd, sudo, etc.) are
+        # package-owned on Debian/Ubuntu/RHEL. An attacker who adds a pam_exec
+        # line to common-auth modifies a package file — dpkg -V catches it, but
+        # only if we call is_package_managed() on the config file itself.
+        # ─────────────────────────────────────────────────────────────────────
+        # Note: unmanaged (return 1) files are intentionally NOT reported here.
+        # Many /etc/pam.d/ files (common-auth, common-session, etc.) are generated
+        # by pam-auth-update and are not tracked by dpkg, so they show as "unmanaged"
+        # on every clean system — reporting them would produce constant false positives.
+        # Only package-owned files that have been MODIFIED are meaningful findings.
+        for pam_cfg_file in "${_all_pam_files[@]}"; do
+            local cfg_pkg_status cfg_pkg_return=0
+            cfg_pkg_status=$(is_package_managed "$pam_cfg_file") || cfg_pkg_return=$?
+            [[ $cfg_pkg_return -eq 2 ]] || continue
+
+            # Package-owned config was MODIFIED — attacker may have inserted a line
+            local cfg_hash cfg_metadata
+            cfg_hash=$(get_file_hash "$pam_cfg_file") || true
+            cfg_metadata=$(get_file_metadata "$pam_cfg_file") || true
+
+            log_finding "PAM config file is MODIFIED package file: $pam_cfg_file"
+            add_finding "PAM" "Config" "pam_config_modified" "$pam_cfg_file" \
+                "PAM config file modified (package tamper)" "CRITICAL" \
+                "$cfg_hash" "$cfg_metadata" "package=$cfg_pkg_status" \
+                "modified_pam_config" "$pam_cfg_file"
+        done
 
         # ─────────────────────────────────────────────────────────────────────
         # Special case: pam_exec.so is a relay module - its .so file is always
@@ -3600,13 +4115,13 @@ check_additional_persistence() {
         #           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
         #           verified package file (we skip)  ACTUAL PAYLOAD (we were missing this)
         # ─────────────────────────────────────────────────────────────────────
-        if [[ -d "/etc/pam.d" ]]; then
+        if [[ ${#_all_pam_files[@]} -gt 0 ]]; then
             # Extract all script paths passed to pam_exec.so from all PAM config files
-            # Format: "auth optional pam_exec.so [--option] /path/to/script [args]"
+            # Uses _pam_cfg_content which includes /etc/pam.conf and @include targets (ISC-9/10)
             local pam_exec_scripts
-            pam_exec_scripts=$(grep -h -v "^#" /etc/pam.d/* 2>/dev/null | \
+            pam_exec_scripts=$(echo "$_pam_cfg_content" | \
                 grep "pam_exec\.so" | \
-                grep -oE 'pam_exec\.so([[:space:]]--[a-z_-]+)*[[:space:]]+(/[^[:space:]]+)' | \
+                grep -oE 'pam_exec\.so([[:space:]]+[^/[:space:]][^[:space:]]*)*[[:space:]]+(/[^[:space:]]+)' | \
                 grep -oE '(/[^[:space:]]+)$' | \
                 sort -u) || true
 
@@ -3616,7 +4131,7 @@ check_additional_persistence() {
                 local exec_pkg_status exec_pkg_return=0
                 exec_pkg_status=$(is_package_managed "$exec_script") || exec_pkg_return=$?
 
-                local confidence="HIGH"
+                local confidence="CRITICAL"
                 local finding_matched_pattern="pam_exec_script"
                 local finding_matched_string="$exec_script"
 
@@ -3630,11 +4145,16 @@ check_additional_persistence() {
                     finding_matched_pattern="pam_exec_modified_script"
                     log_finding "pam_exec.so executes MODIFIED package script: $exec_script"
                 else
-                    # UNMANAGED script - check location and content
-                    if [[ "$exec_script" =~ ^/(tmp|dev/shm|var/tmp) ]]; then
+                    # UNMANAGED script - check existence, location, and content
+                    if [[ ! -e "$exec_script" ]]; then
+                        confidence="CRITICAL"
+                        finding_matched_pattern="pam_exec_missing_script"
+                        finding_matched_string="$exec_script"
+                        log_finding "pam_exec.so references non-existent script (post-compromise cleanup?): $exec_script"
+                    elif [[ "$exec_script" =~ ^/(tmp|dev/shm|var/tmp|run/user/) ]] || [[ "$exec_script" =~ /\.[a-zA-Z] ]]; then
                         confidence="CRITICAL"
                         finding_matched_pattern="pam_exec_suspicious_location"
-                        log_finding "pam_exec.so executes script from temp location: $exec_script"
+                        log_finding "pam_exec.so executes script from suspicious location: $exec_script"
                     elif [[ -f "$exec_script" ]] && analyze_script_content "$exec_script"; then
                         confidence="CRITICAL"
                         finding_matched_pattern="$MATCHED_PATTERN"
@@ -3652,6 +4172,204 @@ check_additional_persistence() {
                 add_finding "PAM" "Exec" "pam_exec_script" "$exec_script" "pam_exec.so target script" "$confidence" "$exec_hash" "$exec_metadata" "package=$exec_pkg_status" "$finding_matched_pattern" "$finding_matched_string"
             done
         fi
+
+        # ─────────────────────────────────────────────────────────────────────
+        # ISC-4/ISC-5 FIX: pam_python.so and pam_perl.so relay detection.
+        # Like pam_exec.so, these modules execute external scripts on every auth
+        # event. Their .so files are package-managed (verified → skipped above).
+        # We must extract and analyze the script path argument instead.
+        # ─────────────────────────────────────────────────────────────────────
+        for relay_module in pam_python pam_perl; do
+            local relay_scripts
+            relay_scripts=$(echo "$_pam_cfg_content" | \
+                grep "${relay_module}\.so" | \
+                grep -oE "${relay_module}\.so[[:space:]]+(/[^[:space:]]+)" | \
+                grep -oE '(/[^[:space:]]+)$' | \
+                sort -u) || true
+
+            for relay_script in $relay_scripts; do
+                [[ -z "$relay_script" ]] && continue
+
+                local relay_pkg_status relay_pkg_return=0
+                relay_pkg_status=$(is_package_managed "$relay_script") || relay_pkg_return=$?
+
+                local confidence="CRITICAL"
+                local finding_matched_pattern="${relay_module}_script"
+                local finding_matched_string="$relay_script"
+
+                if [[ $relay_pkg_return -eq 0 ]]; then
+                    confidence="LOW"
+                    finding_matched_pattern="${relay_module}_verified_script"
+                elif [[ $relay_pkg_return -eq 2 ]]; then
+                    confidence="CRITICAL"
+                    finding_matched_pattern="${relay_module}_modified_script"
+                    log_finding "${relay_module}.so executes MODIFIED package script: $relay_script"
+                else
+                    if [[ ! -e "$relay_script" ]]; then
+                        confidence="CRITICAL"
+                        finding_matched_pattern="${relay_module}_missing_script"
+                        finding_matched_string="$relay_script"
+                        log_finding "${relay_module}.so references non-existent script (post-compromise cleanup?): $relay_script"
+                    elif [[ "$relay_script" =~ ^/(tmp|dev/shm|var/tmp|run/user/) ]] || [[ "$relay_script" =~ /\.[a-zA-Z] ]]; then
+                        confidence="CRITICAL"
+                        finding_matched_pattern="${relay_module}_suspicious_location"
+                        log_finding "${relay_module}.so executes script from suspicious location: $relay_script"
+                    elif [[ -f "$relay_script" ]] && analyze_script_content "$relay_script"; then
+                        confidence="CRITICAL"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
+                        log_finding "${relay_module}.so script contains suspicious content: $relay_script"
+                    else
+                        log_finding "${relay_module}.so executes unmanaged script: $relay_script"
+                    fi
+                fi
+
+                local relay_hash="DEFER"
+                local relay_metadata
+                relay_metadata=$(get_file_metadata "$relay_script") || true
+
+                add_finding "PAM" "Exec" "${relay_module}_script" "$relay_script" \
+                    "${relay_module}.so target script" "$confidence" \
+                    "$relay_hash" "$relay_metadata" "package=$relay_pkg_status" \
+                    "$finding_matched_pattern" "$finding_matched_string"
+            done
+        done
+
+        # ─────────────────────────────────────────────────────────────────────
+        # ISC-7 FIX: /etc/security/pam_env.conf LD_PRELOAD injection detection.
+        # pam_env.so reads this file and sets session environment variables for
+        # every PAM-authenticated process. An attacker can inject LD_PRELOAD
+        # pointing to a malicious shared library, preloaded into every auth process.
+        # Format: LD_PRELOAD   DEFAULT=/path/to/lib.so
+        # ─────────────────────────────────────────────────────────────────────
+        if [[ -f "/etc/security/pam_env.conf" ]]; then
+            local ld_preload_paths
+            ld_preload_paths=$(grep -v "^#" /etc/security/pam_env.conf 2>/dev/null | \
+                grep -i "^LD_PRELOAD" | \
+                grep -oE '/[^[:space:]]+' | \
+                sort -u) || true
+
+            for ld_lib in $ld_preload_paths; do
+                [[ -z "$ld_lib" ]] && continue
+
+                local ld_pkg_status ld_pkg_return=0
+                ld_pkg_status=$(is_package_managed "$ld_lib") || ld_pkg_return=$?
+
+                local confidence="CRITICAL"
+                local finding_matched_pattern="pam_env_ld_preload"
+                local finding_matched_string="$ld_lib"
+
+                if [[ $ld_pkg_return -eq 0 ]]; then
+                    confidence="LOW"
+                    finding_matched_pattern="pam_env_ld_preload_verified"
+                elif [[ $ld_pkg_return -eq 2 ]]; then
+                    log_finding "pam_env.conf LD_PRELOAD points to MODIFIED package library: $ld_lib"
+                else
+                    log_finding "pam_env.conf LD_PRELOAD points to unmanaged library: $ld_lib"
+                fi
+
+                local ld_hash="DEFER"
+                local ld_metadata
+                ld_metadata=$(get_file_metadata "$ld_lib") || true
+
+                add_finding "PAM" "Env" "pam_env_ld_preload" "$ld_lib" \
+                    "pam_env.conf LD_PRELOAD library" "$confidence" \
+                    "$ld_hash" "$ld_metadata" "package=$ld_pkg_status" \
+                    "$finding_matched_pattern" "$finding_matched_string"
+            done
+        fi
+
+        # ─────────────────────────────────────────────────────────────────────
+        # ISC-8 FIX: Per-user ~/.pam_environment LD_PRELOAD injection detection.
+        # pam_env.so also reads ~/.pam_environment for each authenticating user.
+        # An attacker with access to any account can inject LD_PRELOAD there,
+        # preloading a malicious library into every process in that user's session.
+        # ─────────────────────────────────────────────────────────────────────
+        if [[ $EUID_CHECK -eq 0 ]]; then
+            while IFS=: read -r _uname _ _uid _ _ _home _; do
+                { [[ -z "$_home" ]] || [[ "$_home" == "/" ]]; } && continue
+                local _user_pam_env="$_home/.pam_environment"
+                [[ -f "$_user_pam_env" ]] || continue
+
+                local _user_ld_paths
+                _user_ld_paths=$(grep -v "^#" "$_user_pam_env" 2>/dev/null | \
+                    grep -i "^LD_PRELOAD" | \
+                    grep -oE '/[^[:space:]]+' | \
+                    sort -u) || true
+
+                for ld_lib in $_user_ld_paths; do
+                    [[ -z "$ld_lib" ]] && continue
+
+                    local ld_pkg_status ld_pkg_return=0
+                    ld_pkg_status=$(is_package_managed "$ld_lib") || ld_pkg_return=$?
+
+                    local confidence="CRITICAL"
+                    local finding_matched_pattern="pam_env_user_ld_preload"
+                    local finding_matched_string="$ld_lib"
+
+                    if [[ $ld_pkg_return -eq 0 ]]; then
+                        confidence="LOW"
+                        finding_matched_pattern="pam_env_user_ld_preload_verified"
+                    elif [[ $ld_pkg_return -eq 2 ]]; then
+                        log_finding "~/.pam_environment LD_PRELOAD points to MODIFIED library ($_uname): $ld_lib"
+                    else
+                        log_finding "~/.pam_environment LD_PRELOAD points to unmanaged library ($_uname): $ld_lib"
+                    fi
+
+                    local ld_hash="DEFER"
+                    local ld_metadata
+                    ld_metadata=$(get_file_metadata "$ld_lib") || true
+
+                    add_finding "PAM" "Env" "pam_env_user_ld_preload" "$ld_lib" \
+                        "~/.pam_environment LD_PRELOAD ($_uname)" "$confidence" \
+                        "$ld_hash" "$ld_metadata" "package=$ld_pkg_status" \
+                        "$finding_matched_pattern" "$finding_matched_string"
+                done
+            done < /etc/passwd
+        fi
+
+        # ─────────────────────────────────────────────────────────────────────
+        # ISC-12 FIX: /etc/security/ directory scan.
+        # This directory contains PAM support files — pam_env.conf (covered by
+        # ISC-7), pam_script_* hooks (covered by ISC-6), plus access.conf,
+        # limits.conf, and others. Modified package-owned files or unmanaged
+        # executables here are suspicious.
+        # ─────────────────────────────────────────────────────────────────────
+        if [[ -d "/etc/security" ]]; then
+            while IFS= read -r -d '' sec_file; do
+                local sec_pkg_status sec_pkg_return=0
+                sec_pkg_status=$(is_package_managed "$sec_file") || sec_pkg_return=$?
+
+                if [[ $sec_pkg_return -eq 2 ]]; then
+                    local sec_hash sec_metadata
+                    sec_hash=$(get_file_hash "$sec_file") || true
+                    sec_metadata=$(get_file_metadata "$sec_file") || true
+                    log_finding "/etc/security/ file is MODIFIED package file: $sec_file"
+                    add_finding "PAM" "Security" "pam_security_modified" "$sec_file" \
+                        "/etc/security/ file modified (package tamper)" "CRITICAL" \
+                        "$sec_hash" "$sec_metadata" "package=$sec_pkg_status" \
+                        "modified_pam_security" "$sec_file"
+                elif [[ $sec_pkg_return -eq 1 ]] && [[ -x "$sec_file" ]]; then
+                    # Unmanaged executable in /etc/security/ — suspicious
+                    local sec_hash sec_metadata
+                    sec_hash=$(get_file_hash "$sec_file") || true
+                    sec_metadata=$(get_file_metadata "$sec_file") || true
+                    local confidence="HIGH"
+                    local finding_matched_pattern="pam_security_unmanaged_exec"
+                    local finding_matched_string="$sec_file"
+                    if analyze_script_content "$sec_file"; then
+                        confidence="CRITICAL"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
+                    fi
+                    log_finding "Unmanaged executable in /etc/security/: $sec_file"
+                    add_finding "PAM" "Security" "pam_security_unmanaged_exec" "$sec_file" \
+                        "Unmanaged executable in /etc/security/" "$confidence" \
+                        "$sec_hash" "$sec_metadata" "package=$sec_pkg_status" \
+                        "$finding_matched_pattern" "$finding_matched_string"
+                fi
+            done < <(find /etc/security -type f -print0 2>/dev/null)
+        fi
     fi
 
     # Check MOTD scripts
@@ -3665,22 +4383,39 @@ check_additional_persistence() {
             while IFS= read -r -d '' motd_script; do
                 local hash=$(get_file_hash "$motd_script")
                 local metadata=$(get_file_metadata "$motd_script")
-                # Strip null bytes to prevent bash warnings with binary content
-                local content=$(head -n 100 "$motd_script" 2>/dev/null | tr -d '\0' || echo "")
 
                 local confidence="LOW"
                 local finding_matched_pattern=""
                 local finding_matched_string=""
-                if quick_suspicious_check "$content"; then
-                    confidence="HIGH"
-                    finding_matched_pattern="$MATCHED_PATTERN"
-                    finding_matched_string="$MATCHED_STRING"
-                    log_finding "Suspicious MOTD script: $motd_script"
-                elif analyze_script_content "$motd_script"; then
-                    confidence="HIGH"
-                    finding_matched_pattern="$MATCHED_PATTERN"
-                    finding_matched_string="$MATCHED_STRING"
-                    log_finding "MOTD script contains suspicious patterns: $motd_script"
+
+                # Package verification: skip verified, escalate modified to CRITICAL
+                local motd_pkg_status
+                local motd_pkg_return=0
+                motd_pkg_status=$(is_package_managed "$motd_script") || motd_pkg_return=$?
+                if [[ $motd_pkg_return -eq 0 ]]; then
+                    continue
+                elif [[ $motd_pkg_return -eq 2 ]]; then
+                    confidence="CRITICAL"
+                    finding_matched_pattern="modified_package"
+                    finding_matched_string="$motd_script"
+                    log_finding "MOTD script is MODIFIED package file: $motd_script"
+                fi
+
+                # Content analysis for UNMANAGED or MODIFIED scripts
+                if [[ "$confidence" != "CRITICAL" ]]; then
+                    # Strip null bytes to prevent bash warnings with binary content
+                    local content=$(head -n 100 "$motd_script" 2>/dev/null | tr -d '\0' || echo "")
+                    if quick_suspicious_check "$content"; then
+                        confidence="HIGH"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
+                        log_finding "Suspicious MOTD script: $motd_script"
+                    elif analyze_script_content "$motd_script"; then
+                        confidence="HIGH"
+                        finding_matched_pattern="$MATCHED_PATTERN"
+                        finding_matched_string="$MATCHED_STRING"
+                        log_finding "MOTD script contains suspicious patterns: $motd_script"
+                    fi
                 fi
 
                 add_finding "MOTD" "Script" "motd_script" "$motd_script" "MOTD script: $(basename "$motd_script")" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
@@ -3742,6 +4477,268 @@ check_common_backdoors() {
         fi
     done
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # YUM / DNF Plugin persistence
+    # Plugins are Python scripts that run inside the package manager process.
+    # An attacker can drop a plugin .py with an `execute` hook that fires on
+    # every `yum`/`dnf` invocation — extremely stealthy on RPM-based systems.
+    # ═══════════════════════════════════════════════════════════════════════════
+    local yum_plugin_conf_dirs=(
+        "/etc/yum/pluginconf.d"
+        "/etc/dnf/pluginconf.d"
+    )
+    local yum_plugin_lib_dirs=(
+        "/usr/lib/yum-plugins"
+        "/usr/lib/python"          # glob-expanded below
+    )
+
+    for _ypcd in "${yum_plugin_conf_dirs[@]}"; do
+        [[ -d "$_ypcd" ]] || continue
+        while IFS= read -r -d '' _conf; do
+            local _conf_hash _conf_meta _conf_content _conf_pkg _conf_pkg_return=0
+            _conf_hash=$(get_file_hash "$_conf")
+            _conf_meta=$(get_file_metadata "$_conf")
+            _conf_content=$(cat "$_conf" 2>/dev/null || echo "")
+            _conf_pkg=$(is_package_managed "$_conf") || _conf_pkg_return=$?
+
+            local _yp_confidence="LOW"
+            local _yp_pattern="" _yp_string=""
+
+            # Flag plugins explicitly enabled in an unmanaged config
+            if [[ $_conf_pkg_return -eq 2 ]]; then
+                _yp_confidence="CRITICAL"
+                _yp_pattern="modified_plugin_conf"
+                _yp_string="$_conf"
+                log_finding "YUM/DNF plugin config is MODIFIED package file: $_conf"
+            elif [[ $_conf_pkg_return -eq 1 ]]; then
+                # Unmanaged — check if enabled and if the plugin .py has suspicious content
+                local _enabled
+                _enabled=$(grep -iE "^enabled[[:space:]]*=[[:space:]]*1" "$_conf" 2>/dev/null || echo "")
+                if [[ -n "$_enabled" ]]; then
+                    _yp_confidence="MEDIUM"
+                    _yp_pattern="unmanaged_plugin_enabled"
+                    _yp_string="enabled=1"
+                    log_finding "Unmanaged YUM/DNF plugin enabled: $_conf"
+
+                    # Try to find and scan the corresponding Python plugin script
+                    local _plugin_name
+                    _plugin_name=$(basename "$_conf" .conf)
+                    local _py_script=""
+                    # Check standard yum-plugins location
+                    [[ -f "/usr/lib/yum-plugins/${_plugin_name}.py" ]] && _py_script="/usr/lib/yum-plugins/${_plugin_name}.py"
+                    # Check dnf-plugins under any python version
+                    if [[ -z "$_py_script" ]]; then
+                        _py_script=$(find /usr/lib/python* /usr/lib64/python* -path "*/dnf-plugins/${_plugin_name}.py" 2>/dev/null | head -1 || true)
+                    fi
+                    if [[ -n "$_py_script" ]] && [[ -f "$_py_script" ]]; then
+                        local _py_hash _py_meta _py_pkg _py_pkg_return=0
+                        _py_hash=$(get_file_hash "$_py_script")
+                        _py_meta=$(get_file_metadata "$_py_script")
+                        _py_pkg=$(is_package_managed "$_py_script") || _py_pkg_return=$?
+                        local _py_confidence="MEDIUM"
+                        local _py_pattern="unmanaged_plugin_py" _py_string="$_py_script"
+                        if [[ $_py_pkg_return -eq 2 ]]; then
+                            _py_confidence="CRITICAL"
+                            _py_pattern="modified_plugin_py"
+                            log_finding "YUM/DNF plugin Python script is MODIFIED package file: $_py_script"
+                        elif [[ $_py_pkg_return -eq 1 ]]; then
+                            if check_suspicious_patterns "$( cat "$_py_script" 2>/dev/null || echo "" )"; then
+                                _py_confidence="HIGH"
+                                _py_pattern="$MATCHED_PATTERN"
+                                _py_string="$MATCHED_STRING"
+                                log_finding "YUM/DNF plugin script contains suspicious content: $_py_script"
+                            fi
+                        fi
+                        add_finding "PackageManager" "Plugin" "yum_plugin_py" "$_py_script" \
+                            "YUM/DNF plugin script: $(basename "$_py_script")" "$_py_confidence" \
+                            "$_py_hash" "$_py_meta" "package=$_py_pkg" "$_py_pattern" "$_py_string"
+                    fi
+                fi
+            fi
+
+            add_finding "PackageManager" "Plugin" "yum_plugin_conf" "$_conf" \
+                "YUM/DNF plugin config: $(basename "$_conf")" "$_yp_confidence" \
+                "$_conf_hash" "$_conf_meta" "package=$_conf_pkg" "$_yp_pattern" "$_yp_string"
+        done < <(find "$_ypcd" -type f -name "*.conf" -print0 2>/dev/null)
+    done
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # DPKG postinst scripts  (/var/lib/dpkg/info/*.postinst)
+    # Every installed Debian package can ship a post-install shell script that
+    # runs as root after apt install/upgrade. dpkg -S does NOT track these files
+    # (they are dpkg's internal metadata, not package-owned installed files), so
+    # is_package_managed() always returns "unmanaged" — useless here.
+    #
+    # WHY analyze_script_content() is NOT used here:
+    #   SUSPICIOUS_COMMANDS includes wget, curl, base64, chmod +x /tmp, etc.
+    #   Every legitimate package installer uses these — calling the full analyzer
+    #   produces hundreds of FPs. Postinst scripts are installation code, not
+    #   runtime persistence, so only a narrow set of patterns is meaningful.
+    #
+    # Detection uses two focused signals:
+    #   1. Postinst-specific content checks — only patterns that are never
+    #      legitimate in an installation script:
+    #        • NEVER_WHITELIST  : reverse shells, /dev/tcp/, nc -e, bash -i
+    #        • Download+execute : curl/wget piped directly to a shell
+    #        • Encoding obfusc. : hex/octal/ANSI-C sequences (no legit use)
+    #        • Process detach   : nohup+setsid (installers never detach)
+    #   2. Orphan postinst — script exists for a package that is NOT currently
+    #      installed. Classic TTP: `apt install evil && apt remove evil` —
+    #      payload survives in /var/lib/dpkg/info/ without purge.
+    # ═══════════════════════════════════════════════════════════════════════════
+    local dpkg_info_dir="/var/lib/dpkg/info"
+    if [[ -d "$dpkg_info_dir" ]]; then
+        while IFS= read -r -d '' _postinst; do
+            local _pi_confidence="LOW"
+            local _pi_pattern="" _pi_string=""
+            local _pi_is_orphan=false
+
+            # ── Signal 1: Orphan check ─────────────────────────────────────
+            local _pi_pkgname
+            _pi_pkgname=$(basename "$_postinst" .postinst)
+            _pi_pkgname="${_pi_pkgname%%:*}"   # strip :arch suffix (e.g. bash:amd64 → bash)
+
+            if command -v dpkg-query &>/dev/null; then
+                local _pi_status
+                _pi_status=$(dpkg-query -W -f='${Status}' "$_pi_pkgname" 2>/dev/null || echo "")
+                if [[ "$_pi_status" != *"install ok installed"* ]]; then
+                    _pi_is_orphan=true
+                    _pi_confidence="MEDIUM"
+                    _pi_pattern="orphan_postinst"
+                    _pi_string="package $_pi_pkgname not installed"
+                fi
+            fi
+
+            # ── Signal 2: Focused content analysis ────────────────────────
+            # Read content and strip comment lines to avoid FP on docs/examples
+            local _pi_content _pi_clean
+            _pi_content=$(head -n 500 "$_postinst" 2>/dev/null | tr -d '\0') || true
+            _pi_clean=$(echo "$_pi_content" | grep -Ev '^[[:space:]]*#') || true
+
+            local _pi_hit=""
+
+            # Check A: NEVER_WHITELIST — absolute red flags in any context
+            if [[ -n "$COMBINED_NEVER_WHITELIST_PATTERN" ]]; then
+                _pi_hit=$(echo "$_pi_clean" | grep -iE "$COMBINED_NEVER_WHITELIST_PATTERN" | head -1) || true
+                if [[ -n "$_pi_hit" ]]; then
+                    _pi_confidence="HIGH"
+                    _pi_pattern="never_whitelist"
+                    _pi_string=$(echo "$_pi_hit" | sed 's/^[[:space:]]*//' | head -c 200)
+                fi
+            fi
+
+            # Check B: Download-and-execute — curl/wget piped to a shell
+            # (legitimate postinst scripts download files but never pipe them straight to bash)
+            if [[ -z "$_pi_hit" ]]; then
+                _pi_hit=$(echo "$_pi_clean" | grep -iE \
+                    "(curl|wget)[^|]*\|[[:space:]]*(bash|sh|dash|zsh|exec)|eval[[:space:]]*\$\((curl|wget)" \
+                    | head -1) || true
+                if [[ -n "$_pi_hit" ]]; then
+                    _pi_confidence="HIGH"
+                    _pi_pattern="download_execute"
+                    _pi_string=$(echo "$_pi_hit" | sed 's/^[[:space:]]*//' | head -c 200)
+                fi
+            fi
+
+            # Check C: Encoding obfuscation — hex/octal sequences
+            # Legitimate package scripts have zero reason to encode strings this way
+            if [[ -z "$_pi_hit" ]]; then
+                _pi_hit=$(echo "$_pi_clean" | grep -E \
+                    '(\\x[0-9a-fA-F]{2}){4,}|(\\[0-7]{3}){4,}' | head -1) || true
+                if [[ -n "$_pi_hit" ]]; then
+                    _pi_confidence="HIGH"
+                    _pi_pattern="encoding_obfuscation"
+                    _pi_string=$(echo "$_pi_hit" | sed 's/^[[:space:]]*//' | head -c 200)
+                fi
+            fi
+
+            # Check D: Process detachment chain — nohup+setsid
+            # Package installers never need to detach from the controlling terminal
+            if [[ -z "$_pi_hit" ]]; then
+                _pi_hit=$(echo "$_pi_clean" | grep -iE "nohup.*setsid|setsid.*nohup" | head -1) || true
+                if [[ -n "$_pi_hit" ]]; then
+                    _pi_confidence="HIGH"
+                    _pi_pattern="process_detachment"
+                    _pi_string=$(echo "$_pi_hit" | sed 's/^[[:space:]]*//' | head -c 200)
+                fi
+            fi
+
+            # ── Gate: only report if at least one signal fired ─────────────
+            if [[ -z "$_pi_hit" && "$_pi_is_orphan" == false ]]; then
+                continue
+            fi
+
+            if [[ -n "$_pi_hit" ]]; then
+                if [[ "$_pi_is_orphan" == true ]]; then
+                    log_finding "Orphan DPKG postinst with suspicious content [$_pi_pattern]: $_postinst"
+                else
+                    log_finding "DPKG postinst suspicious content [$_pi_pattern]: $_postinst"
+                fi
+            else
+                log_finding "Orphan DPKG postinst (package not installed): $_postinst"
+            fi
+
+            local _pi_hash _pi_meta
+            _pi_hash=$(get_file_hash "$_postinst")
+            _pi_meta=$(get_file_metadata "$_postinst")
+
+            add_finding "PackageManager" "DpkgPostinst" "dpkg_postinst" "$_postinst" \
+                "DPKG postinst: $_pi_pkgname" "$_pi_confidence" \
+                "$_pi_hash" "$_pi_meta" "" "$_pi_pattern" "$_pi_string"
+        done < <(find "$dpkg_info_dir" -maxdepth 1 -type f -name "*.postinst" -print0 2>/dev/null)
+    fi
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # RPM %post scripts
+    # RPM packages embed post-install scriptlets that run as root after install.
+    # One call to `rpm -qa --scripts` dumps all scriptlets — parse the output
+    # to extract and scan each %post block without expensive per-package calls.
+    # ═══════════════════════════════════════════════════════════════════════════
+    if command -v rpm &>/dev/null; then
+        local _rpm_tmp="$TEMP_DATA/rpm_scripts.txt"
+        rpm -qa --scripts 2>/dev/null > "$_rpm_tmp" || true
+
+        if [[ -s "$_rpm_tmp" ]]; then
+            local _rpm_pkg="" _in_post=false _post_buf=""
+
+            _flush_rpm_post() {
+                [[ -z "$_rpm_pkg" || -z "$_post_buf" ]] && return
+                local _rp_confidence="LOW" _rp_pattern="" _rp_string=""
+                if check_suspicious_patterns "$_post_buf"; then
+                    _rp_confidence="HIGH"
+                    _rp_pattern="$MATCHED_PATTERN"
+                    _rp_string="$MATCHED_STRING"
+                    log_finding "RPM %post script with suspicious content: $_rpm_pkg"
+                    add_finding "PackageManager" "RpmPost" "rpm_post_script" \
+                        "/var/lib/rpm/$_rpm_pkg" \
+                        "RPM %post: $_rpm_pkg" "$_rp_confidence" \
+                        "N/A" "N/A" "" "$_rp_pattern" "$_rp_string"
+                fi
+            }
+
+            while IFS= read -r _rline; do
+                if [[ "$_rline" =~ ^package[[:space:]](.+)$ ]]; then
+                    _flush_rpm_post
+                    _rpm_pkg="${BASH_REMATCH[1]}"
+                    _in_post=false
+                    _post_buf=""
+                elif [[ "$_rline" =~ ^postinstall[[:space:]]scriptlet ]]; then
+                    _in_post=true
+                    _post_buf=""
+                elif [[ "$_rline" =~ ^(preinstall|preuninstall|postuninstall|verify|filetrigger)[[:space:]]scriptlet ]]; then
+                    _flush_rpm_post
+                    _in_post=false
+                    _post_buf=""
+                elif [[ "$_in_post" == true ]]; then
+                    _post_buf+="$_rline"$'\n'
+                fi
+            done < "$_rpm_tmp"
+            _flush_rpm_post   # flush last package
+            unset -f _flush_rpm_post
+        fi
+        rm -f "$_rpm_tmp" 2>/dev/null || true
+    fi
+
     # Check at.allow and at.deny
     local at_files=(
         "/etc/at.allow"
@@ -3780,7 +4777,7 @@ check_common_backdoors() {
     # Check for user git configs (can contain credential helpers or hooks)
     if [[ $EUID_CHECK -eq 0 ]]; then
         while IFS=: read -r username _ uid _ _ homedir _; do
-            if [[ $uid -ge 1000 ]] || [[ $uid -eq 0 ]]; then
+            if [[ $uid -ge 0 ]]; then
                 local gitconfig="$homedir/.gitconfig"
                 if [[ -f "$gitconfig" ]]; then
                     local hash=$(get_file_hash "$gitconfig")
@@ -3811,8 +4808,25 @@ check_common_backdoors() {
         if [[ -f "$HOME/.gitconfig" ]]; then
             local hash=$(get_file_hash "$HOME/.gitconfig")
             local metadata=$(get_file_metadata "$HOME/.gitconfig")
+            local content=$(cat "$HOME/.gitconfig" 2>/dev/null || echo "")
 
-            add_finding "GitConfig" "User" "git_config" "$HOME/.gitconfig" "Current user git config" "LOW" "$hash" "$metadata" "user=$(whoami)"
+            local confidence="LOW"
+            local finding_matched_pattern=""
+            local finding_matched_string=""
+            local helper_match=$(echo "$content" | grep -iE "(credential.*helper|core.*pager|core.*editor.*sh)" | head -1) || true
+            if [[ -n "$helper_match" ]]; then
+                confidence="MEDIUM"
+                finding_matched_pattern="git_helper"
+                finding_matched_string="$helper_match"
+            fi
+            if check_suspicious_patterns "$content"; then
+                confidence="HIGH"
+                finding_matched_pattern="$MATCHED_PATTERN"
+                finding_matched_string="$MATCHED_STRING"
+                log_finding "Suspicious git config: $HOME/.gitconfig"
+            fi
+
+            add_finding "GitConfig" "User" "git_config" "$HOME/.gitconfig" "Current user git config" "$confidence" "$hash" "$metadata" "user=$(whoami)" "$finding_matched_pattern" "$finding_matched_string"
         fi
     fi
 
@@ -3827,8 +4841,12 @@ check_common_backdoors() {
 
     for web_dir in "${web_dirs[@]}"; do
         if [[ -d "$web_dir" ]]; then
-            # Look for recently modified PHP/ASP files (last 30 days)
+            # Look for recently modified PHP/ASP files (last 30 days), limit to 100 files
+            local _web_count=0
             while IFS= read -r -d '' web_file; do
+                (( _web_count++ )) || true
+                [[ $_web_count -gt 100 ]] && break
+
                 local hash=$(get_file_hash "$web_file")
                 local metadata=$(get_file_metadata "$web_file")
 
@@ -3860,7 +4878,7 @@ check_common_backdoors() {
                 if [[ $confidence != "LOW" ]]; then
                     add_finding "WebShell" "Suspicious" "web_file" "$web_file" "Recently modified web file in $web_dir (${days_old} days old)" "$confidence" "$hash" "$metadata" "days_old=$days_old" "$finding_matched_pattern" "$finding_matched_string"
                 fi
-            done < <(find "$web_dir" -type f \( -name "*.php" -o -name "*.asp" -o -name "*.aspx" -o -name "*.jsp" \) -print0 2>/dev/null | head -100)
+            done < <(find "$web_dir" -type f \( -name "*.php" -o -name "*.asp" -o -name "*.aspx" -o -name "*.jsp" \) -print0 2>/dev/null)
         fi
     done
 }
@@ -3977,6 +4995,74 @@ main() {
     log_info "Results saved to:"
     log_info "  CSV:   $CSV_FILE"
     log_info "  JSONL: $JSONL_FILE"
+    echo
+
+    # ── Human-readable report (.txt) ────────────────────────────────────────
+    local REPORT_FILE="${OUTPUT_DIR}/persistnux_${HOSTNAME}_${TIMESTAMP}_report.txt"
+    local SCAN_END_EPOCH SCAN_ELAPSED HOST_IP
+    SCAN_END_EPOCH=$(date +%s)
+    SCAN_ELAPSED=$(( SCAN_END_EPOCH - SCAN_EPOCH ))
+    HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}') || HOST_IP="N/A"
+
+    # Count findings by confidence from JSONL (single pass per level)
+    local CNT_CRITICAL CNT_HIGH CNT_MEDIUM CNT_LOW
+    CNT_CRITICAL=$(grep -c '"confidence":"CRITICAL"' "$JSONL_FILE" 2>/dev/null || echo 0)
+    CNT_HIGH=$(grep -c '"confidence":"HIGH"'     "$JSONL_FILE" 2>/dev/null || echo 0)
+    CNT_MEDIUM=$(grep -c '"confidence":"MEDIUM"'  "$JSONL_FILE" 2>/dev/null || echo 0)
+    CNT_LOW=$(grep -c '"confidence":"LOW"'      "$JSONL_FILE" 2>/dev/null || echo 0)
+
+    cat > "$REPORT_FILE" << REPORT
+================================================================================
+  Persistnux — Linux Persistence Detection Report
+================================================================================
+  Version    : 1.9.0
+  Date/Time  : $(date '+%Y-%m-%d %H:%M:%S %Z')
+  Hostname   : ${HOSTNAME}
+  IP Address : ${HOST_IP}
+  Run by     : $(whoami) (UID: $(id -u))
+  Scan time  : ${SCAN_ELAPSED}s
+  Filter mode: ${FILTER_MODE}
+
+--------------------------------------------------------------------------------
+  FINDINGS SUMMARY
+--------------------------------------------------------------------------------
+  CRITICAL : ${CNT_CRITICAL}
+  HIGH     : ${CNT_HIGH}
+  MEDIUM   : ${CNT_MEDIUM}
+  LOW      : ${CNT_LOW}
+  ─────────────────
+  TOTAL    : ${FINDINGS_COUNT}
+
+--------------------------------------------------------------------------------
+  OUTPUT FILES
+--------------------------------------------------------------------------------
+  Report : ${REPORT_FILE}
+  CSV    : ${CSV_FILE}
+  JSONL  : ${JSONL_FILE}
+
+--------------------------------------------------------------------------------
+  DETECTION MODULES RUN
+--------------------------------------------------------------------------------
+  [1/7] Systemd (services, timers, generators)
+  [2/7] Cron & scheduled tasks (cron.d, cron.daily/weekly/monthly/hourly, at)
+  [3/7] Shell profiles (system-wide + per-user, all major shells)
+  [4/7] Init scripts (rc.local, init.d, MOTD)
+  [5/7] Kernel & library preloading (ld.so.preload, ld.so.conf, LKMs, modprobe)
+  [6/7] Additional persistence (XDG, environment, sudoers, PAM, MOTD)
+  [7/7] Common backdoor locations (APT/YUM hooks, DPKG postinst, RPM %post,
+        YUM/DNF plugins, sudoers.d, webshells, git configs)
+
+--------------------------------------------------------------------------------
+  NOTES
+--------------------------------------------------------------------------------
+  - Confidence levels: CRITICAL > HIGH > MEDIUM > LOW
+  - All findings include file hash, owner, permissions, and package status
+  - Package integrity verified via dpkg --verify / rpm -V where applicable
+  - Review JSONL output for machine-readable data: jq . ${JSONL_FILE}
+================================================================================
+REPORT
+
+    log_info "  Report: $REPORT_FILE"
     echo
 
     # Cleanup

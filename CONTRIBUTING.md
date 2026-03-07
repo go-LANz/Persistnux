@@ -40,7 +40,7 @@ We welcome contributions that add detection for new persistence mechanisms!
    - **LOW**: Standard configuration files, low suspicion
    - **MEDIUM**: Potentially suspicious but common
    - **HIGH**: Contains suspicious patterns (curl, wget, /tmp, base64, etc.)
-   - **CRITICAL**: Reserved for advanced detections
+   - **CRITICAL**: Package integrity failure, SUID/SGID on suspicious file, PAM module anomaly, generator in ephemeral location
 
 4. **Add to Main Execution**
    - Call your function from `main()` in logical order
@@ -162,7 +162,6 @@ Before submitting a pull request:
 If you're looking for ideas to contribute:
 
 - Docker/Podman container escape persistence
-- Systemd generators
 - DBus service activation
 - Udev rules persistence
 - APT/YUM package manager hooks

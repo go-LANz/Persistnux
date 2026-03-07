@@ -48,18 +48,27 @@ Persistnux is a bash-based tool designed to identify known Linux persistence mec
 - Detects suspicious download/execution commands
 
 ### 5. Kernel Modules & Library Preloading
-- LD_PRELOAD configurations (`/etc/ld.so.preload`)
-- Dynamic linker configurations
-- Loaded kernel modules (enumeration)
-- Kernel module auto-load configs (`/etc/modules`, `/etc/modules-load.d`)
+- LD_PRELOAD configurations (`/etc/ld.so.preload`) — each listed library verified via package manager
+- Dynamic linker configurations (`/etc/ld.so.conf`, `/etc/ld.so.conf.d/`) — conf file integrity + non-standard path `.so` files scanned and verified
+- `/etc/environment` LD_PRELOAD/LD_LIBRARY_PATH — env file flagged HIGH; referenced library paths verified (unmanaged/modified → CRITICAL)
+- Kernel module parameters (`/etc/modprobe.d/`, `/etc/modprobe.conf`) — file integrity; `install` directives analyzed for suspicious command targets; `blacklist` of security modules (apparmor, selinux, seccomp) flagged HIGH
+- Kernel module auto-load configs (`/etc/modules`, `/etc/modules-load.d/`) — config integrity; referenced module names resolved to `.ko` files via `modinfo` and verified
+- Loaded kernel modules (`lsmod`) — enumeration and integrity verification
 
 ### 6. Additional Mechanisms
-- XDG autostart entries (`.config/autostart`, `/etc/xdg/autostart`)
-- System environment files (`/etc/environment`)
-- Sudoers configurations and drop-ins
-- PAM (Pluggable Authentication Modules) - verifies module package integrity
-- MOTD (Message of the Day) scripts
-- Git hooks and credential helpers
+- XDG autostart entries (`.config/autostart`, `/etc/xdg/autostart`) — all user homes scanned when root
+- System environment files (`/etc/environment`) — LD_PRELOAD/LD_LIBRARY_PATH library paths verified
+- Sudoers configurations and drop-ins (`/etc/sudoers`, `/etc/sudoers.d/`) — NOPASSWD/ALL patterns → HIGH
+- PAM (Pluggable Authentication Modules):
+  - All `.so` modules verified via package manager; `@include` directives followed; `/etc/pam.conf` included
+  - `pam_exec.so` script analysis — missing/suspicious scripts → CRITICAL
+  - `pam_python.so` / `pam_perl.so` relay detection — script extracted and analyzed
+  - `pam_script.so` hook file detection in `/etc/security/`
+  - Config file integrity — modified package-owned PAM configs → CRITICAL
+  - `pam_env.conf` and `~/.pam_environment` LD_PRELOAD library verification
+  - `/etc/security/` general scan
+- MOTD scripts (`/etc/update-motd.d/`) — package verification; modified → CRITICAL
+- Git credential helpers and core.pager settings — content analysis for all users
 - Web shells in common web directories
 
 ## Installation
@@ -88,7 +97,7 @@ sudo ./persistnux.sh
 ./persistnux.sh
 ```
 
-### Filtering Options (v1.2+)
+### Filtering Options (v2.2+)
 
 By default, Persistnux shows only **suspicious findings** (MEDIUM, HIGH, CRITICAL confidence) to reduce noise and focus on actionable threats.
 
@@ -168,7 +177,7 @@ Persistnux uses intelligent confidence scoring to reduce false positives:
 - **LOW**: Standard system configuration, low suspicion (often package-managed files)
 - **MEDIUM**: Potentially suspicious but could be legitimate
 - **HIGH**: Suspicious patterns detected (e.g., curl/wget in cron, /tmp execution, reverse shells)
-- **CRITICAL**: Highly suspicious, likely malicious (reserved for future advanced detection)
+- **CRITICAL**: Definitive evidence of tampering — package integrity verification failure, SUID/SGID on a suspicious file, PAM module anomaly, systemd generator in ephemeral location, or inline interpreter code with high-entropy payload
 
 ### False Positive Reduction (v1.2+)
 
@@ -230,7 +239,7 @@ cat persistnux_*.jsonl | jq 'select(.confidence == "HIGH")'
 cat persistnux_*.jsonl | jq -r '.category' | sort | uniq -c
 
 # Find all systemd services with suspicious commands
-cat persistnux_*.jsonl | jq 'select(.category == "Systemd" and .confidence == "HIGH")'
+cat persistnux_*.jsonl | jq 'select(.category == "Systemd Service" and .confidence == "HIGH")'
 ```
 
 ### Example: Import into Pandas (Python)

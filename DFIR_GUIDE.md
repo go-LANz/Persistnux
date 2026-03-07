@@ -54,19 +54,18 @@ jq 'select(.confidence == "HIGH")' persistnux_*.jsonl
 5. **Shell Profiles** - Per-session execution for all users
 
 **Secondary Review:**
-6. **SSH Keys** - Unauthorized access maintenance
-7. **Kernel Modules** - Deep system integration
-8. **XDG Autostart** - User-level GUI persistence
-9. **PAM Configurations** - Authentication bypass
+6. **Kernel Modules** - Deep system integration
+7. **XDG Autostart** - User-level GUI persistence
+8. **PAM Configurations** - Authentication bypass
 
 ### 3. Analysis Workflow
 
 ```bash
 # Step 1: Count findings by category
-cut -d',' -f2 persistnux_*.csv | tail -n +2 | sort | uniq -c | sort -rn
+cut -d',' -f3 persistnux_*.csv | tail -n +2 | sort | uniq -c | sort -rn
 
 # Step 2: Extract all HIGH confidence findings
-awk -F',' '$7 == "HIGH" {print $2,$4,$5}' persistnux_*.csv
+awk -F',' '$4 == "HIGH" {print $3,$5,$13}' persistnux_*.csv
 
 # Step 3: Review files with suspicious indicators
 grep -i "curl\|wget\|nc\|netcat" persistnux_*.csv
@@ -87,7 +86,7 @@ splunk add index persistnux
 cat persistnux_*.jsonl | splunk add oneshot -index persistnux -sourcetype persistnux:jsonl
 
 # Search for high-risk items
-index=persistnux confidence=HIGH | stats count by category subcategory
+index=persistnux confidence=HIGH | stats count by category
 ```
 
 ### ELK Stack (Elasticsearch)
@@ -121,14 +120,14 @@ df = pd.DataFrame(data)
 
 # High-risk findings
 high_risk = df[df['confidence'] == 'HIGH']
-print(high_risk[['category', 'subcategory', 'location', 'description']])
+print(high_risk[['category', 'file_path', 'description', 'matched_string']])
 
 # Category distribution
 print(df['category'].value_counts())
 
 # Timeline of HIGH confidence findings
 high_risk_timeline = high_risk.sort_values('timestamp')
-print(high_risk_timeline[['timestamp', 'category', 'location']])
+print(high_risk_timeline[['timestamp', 'category', 'file_path']])
 
 # Export for report
 high_risk.to_excel('high_risk_persistence.xlsx', index=False)
@@ -151,10 +150,10 @@ For each HIGH confidence finding, document:
 
 ```bash
 # Extract file paths from HIGH confidence findings
-awk -F',' '$7 == "HIGH" {print $5}' persistnux_*.csv | sort -u
+awk -F',' '$4 == "HIGH" {print $5}' persistnux_*.csv | sort -u
 
 # Extract SHA256 hashes for threat intelligence lookup
-awk -F',' '$7 == "HIGH" {print $8}' persistnux_*.csv | sort -u
+awk -F',' '$4 == "HIGH" {print $6}' persistnux_*.csv | sort -u
 
 # Extract URLs/IPs from descriptions (basic regex)
 grep -oE 'https?://[^ ]+' persistnux_*.csv | sort -u
@@ -182,8 +181,8 @@ awk -F',' 'NR>1 {print $5}' investigation.csv | sort > investigation_files.txt
 comm -13 baseline_files.txt investigation_files.txt > new_persistence.txt
 
 # Compare hashes for same files
-awk -F',' 'NR>1 {print $5":"$8}' baseline.csv | sort > baseline_hashes.txt
-awk -F',' 'NR>1 {print $5":"$8}' investigation.csv | sort > investigation_hashes.txt
+awk -F',' 'NR>1 {print $5":"$6}' baseline.csv | sort > baseline_hashes.txt
+awk -F',' 'NR>1 {print $5":"$6}' investigation.csv | sort > investigation_hashes.txt
 comm -23 investigation_hashes.txt baseline_hashes.txt > modified_files.txt
 ```
 
@@ -230,7 +229,7 @@ while read -r filepath; do
     if [[ -e "$filepath" ]]; then
         cp -p "$filepath" evidence/$(date +%Y%m%d)_$(hostname)/
     fi
-done < <(awk -F',' '$7 == "HIGH" {print $5}' persistnux_*.csv)
+done < <(awk -F',' '$4 == "HIGH" {print $5}' persistnux_*.csv)
 
 # Create file listing with metadata
 ls -laR evidence/ > evidence/file_listing.txt

@@ -6,6 +6,7 @@ persistnux_output/
 # Except example outputs
 !examples/*.csv
 !examples/*.jsonl
+persistnux_test.sh
 
 # Temporary files
 /tmp/persistnux_*
@@ -39,3 +40,7 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+
+#MD files
+MISSING_PERSISTENCE_MECHANISMS.md
+CHANGELOG.md

