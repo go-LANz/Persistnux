@@ -285,6 +285,13 @@ Persistnux automatically flags items with higher confidence when it detects:
 - [ ] Offline analysis mode for forensic disk images
 - [ ] UAC (Unix-like Artifacts Collector) collection integration
 
+## Resources
+https://www.elastic.co/security-labs/continuation-on-persistence-mechanisms
+https://www.elastic.co/security-labs/approaching-the-summit-on-persistence
+https://www.elastic.co/security-labs/primer-on-persistence-mechanisms
+https://www.elastic.co/security-labs/sequel-on-persistence-mechanisms
+https://github.com/Aegrah/PANIX
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit pull requests or open issues for:
