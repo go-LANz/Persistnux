@@ -253,5 +253,5 @@ Found a new suspicious pattern or false positive? Please contribute:
 
 ---
 
-**Last Updated**: 2026-03-05
-**Version**: 1.9.0
+**Last Updated**: 2026-03-06
+**Version**: 2.3.0

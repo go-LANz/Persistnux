@@ -4,10 +4,21 @@
 # A comprehensive DFIR tool to detect known Linux persistence mechanisms
 # Author: DFIR Community Project
 # License: MIT
-# Version: 1.9.0
+# Version: 2.4.0
 ################################################################################
 
+# Require bash 4.0+ for associative arrays (declare -A)
+if [[ "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+    echo "ERROR: persistnux requires bash 4.0 or later. Detected: $BASH_VERSION" >&2
+    echo "       On macOS, install bash via: brew install bash" >&2
+    exit 1
+fi
+
 set -eo pipefail
+
+# Cleanup temp data on any exit (normal, interrupt, signal)
+# Prevents /tmp/persistnux_* files from accumulating on Ctrl+C or error
+trap 'rm -rf "${TEMP_DATA:-}" 2>/dev/null' EXIT INT TERM HUP
 
 # Colors for output
 RED='\033[0;31m'
@@ -25,6 +36,7 @@ CSV_FILE="${OUTPUT_DIR}/persistnux_${HOSTNAME}_${TIMESTAMP}.csv"
 JSONL_FILE="${OUTPUT_DIR}/persistnux_${HOSTNAME}_${TIMESTAMP}.jsonl"
 TEMP_DATA="/tmp/persistnux_${TIMESTAMP}"
 FINDINGS_COUNT=0
+CHECK_NUM=0
 
 # Filter mode: "suspicious_only" (default) or "all"
 FILTER_MODE="${FILTER_MODE:-suspicious_only}"
@@ -35,6 +47,10 @@ EUID_CHECK=$(id -u)
 
 # Performance: Package manager cache to avoid repeated lookups
 # Format: PKG_CACHE["/path/to/file"]="status:package_name" or "unmanaged"
+# NOTE: PKG_CACHE is per-subshell -- each of the 14 parallel modules has its own
+# copy after fork. Cross-module cache sharing requires a file-based implementation
+# with flock, which is a planned v2.5.0 enhancement. Cache still eliminates
+# duplicate calls WITHIN a single module's run.
 declare -A PKG_CACHE
 
 # Performance: File hash + metadata caches to avoid repeated sha256sum/stat calls
@@ -56,8 +72,8 @@ SYSTEMCTL_CACHE_INITIALIZED=false
 declare -a SUSPICIOUS_NETWORK_PATTERNS=(
     "bash -i >& /dev/tcp/"
     "bash -i >& /dev/udp/"
-    "sh -i >\$ /dev/tcp/"
-    "sh -i >\$ /dev/udp/"
+    "sh -i >& /dev/tcp/"
+    "sh -i >& /dev/udp/"
     "zsh -i >& /dev/tcp/"             # zsh reverse shell variant
     "ksh -i >& /dev/tcp/"             # ksh reverse shell variant
     "/bin/bash -c exec 5<>/dev/tcp/"
@@ -69,6 +85,7 @@ declare -a SUSPICIOUS_NETWORK_PATTERNS=(
     "mknod.*backpipe"
     "telnet.*\|.*(bash|sh)"           # Telnet piped to any shell
     "socat exec:"
+    "nsenter.*-t.*1"              # Container escape (enter host PID namespace)
     "xterm -display"
 )
 
@@ -122,7 +139,7 @@ declare -a SUSPICIOUS_LOCATIONS=(
     "^/dev/shm/"                  # Execution from shared memory
     "^/tmp/"                      # Execution from temp directory
     "^/var/tmp/"                  # Execution from persistent temp
-    "/\.[a-z]"                    # Hidden file/directory (starts with dot)
+    "/\.[[:alpha:]]"              # Hidden file/directory (starts with dot)
     "\.\./\.\."                   # Multiple parent traversals (path escape attempt)
     "^/run/user/"                 # User runtime directory (volatile, world-accessible)
 )
@@ -218,7 +235,6 @@ declare -a NEVER_WHITELIST_PATTERNS=(
     "ruby.*TCPSocket"            # Ruby TCP socket
     "ruby.*Socket\.new"          # Ruby socket creation
     "socat.*exec:"               # Socat with exec (reverse shell)
-    "socat.*TCP:"                # Socat TCP connection (potentially malicious)
     "telnet.*\|.*(bash|sh)"      # Telnet piped to any shell (fixed: was two separate patterns)
     "xterm -display"             # Xterm display redirection (reverse shell)
     "mknod.*backpipe"            # Named pipe for reverse shell
@@ -232,8 +248,8 @@ declare -a NEVER_WHITELIST_PATTERNS=(
     "tr.*[A-Za-z].*\|.*(bash|sh)" # tr-based cipher decode to shell (ROT13/ROT47)
     "eval.*\$\(.*curl"           # eval with curl command substitution (download+exec)
     "eval.*\$\(.*wget"           # eval with wget command substitution (download+exec)
-    "LD_PRELOAD=.*/(tmp|dev/shm|var/tmp)/"     # LD_PRELOAD pointing to staging dirs
-    "LD_LIBRARY_PATH=.*/(tmp|dev/shm|var/tmp)/" # LD_LIBRARY_PATH pointing to staging dirs
+    "LD_PRELOAD=.*(/(tmp|dev/shm|var/tmp|home|opt|srv)/|=\.)"     # LD_PRELOAD pointing to staging/user dirs or relative path
+    "LD_LIBRARY_PATH=.*(/(tmp|dev/shm|var/tmp|home|opt|srv)/|=\.)" # LD_LIBRARY_PATH pointing to staging/user dirs or relative path
 )
 
 # Multi-line suspicious patterns (for heredocs, split commands, etc.)
@@ -251,6 +267,21 @@ declare -a MULTILINE_SUSPICIOUS_PATTERNS=(
     "dd.*\|.*(bash|sh)"           # dd piped to shell
     "openssl.*-d.*\|.*(bash|sh)"  # OpenSSL decrypt piped to shell
     "base64.*-d.*\|.*(bash|sh)"   # Base64 decoded cross-line piped to shell
+)
+
+# Network indicators — hardcoded C2 destinations (IPs, suspicious TLDs, DGA, hex-encoded)
+# These complement SUSPICIOUS_NETWORK_PATTERNS (which cover shell redirect techniques).
+# Focus: destination indicators that appear in download/connect contexts in ANY file type.
+declare -a NETWORK_INDICATOR_PATTERNS=(
+    # Non-RFC1918 IP in download/connect context — RFC1918 exclusion is handled in
+    # check_network_indicators() with bash arithmetic; this catches the broad pattern.
+    "(curl|wget|fetch|ncat|nc|python|perl|ruby)[[:space:]]+['\"]?[a-zA-Z]*://[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}"
+    # Suspicious TLD in download URL
+    "(curl|wget|fetch)[^\"'[:space:]]{0,100}\.(ru|cn|onion|tk|xyz|top|pw|cc|biz)([/\"' )]|$)"
+    # DGA-like: 16+ char single label subdomain in download context (CDN names are typically shorter)
+    "(curl|wget|fetch)[^\"'[:space:]]{0,60}[a-z0-9-]{16,}\.(com|net|org|io|co)([/\"' )]|$)"
+    # Hex-encoded IP: 4+ consecutive hex byte escapes (e.g. \x31\x39\x32\x2e)
+    "(\\\\x[0-9a-fA-F]{2}){4}"
 )
 
 # Unified quick suspicious content check pattern (used by all modules).
@@ -276,6 +307,7 @@ COMBINED_FILE_PATTERN=""
 COMBINED_NEVER_WHITELIST_PATTERN=""
 COMBINED_KNOWN_GOOD_PATHS_PATTERN=""
 COMBINED_MULTILINE_PATTERN=""
+COMBINED_NETWORK_INDICATOR_PATTERN=""
 
 # Performance: Package verify cache to avoid re-running dpkg/rpm --verify per package
 # Format: PKG_VERIFY_CACHE["package_name"]="full verify output (may be empty if clean)"
@@ -295,12 +327,13 @@ build_combined_patterns() {
     COMBINED_NEVER_WHITELIST_PATTERN="(${NEVER_WHITELIST_PATTERNS[*]})"
     COMBINED_KNOWN_GOOD_PATHS_PATTERN="(${KNOWN_GOOD_EXECUTABLE_PATHS[*]})"
     COMBINED_MULTILINE_PATTERN="(${MULTILINE_SUSPICIOUS_PATTERNS[*]})"
+    COMBINED_NETWORK_INDICATOR_PATTERN="(${NETWORK_INDICATOR_PATTERNS[*]})"
 
     # ISC-C1 FIX: Auto-derive UNIFIED_SUSPICIOUS_PATTERN from the authoritative arrays.
     # Previously this was a manually maintained string that diverged silently whenever
     # new patterns were added to SUSPICIOUS_COMMANDS or NEVER_WHITELIST_PATTERNS.
     # Now it is built from those combined patterns — zero drift guaranteed.
-    UNIFIED_SUSPICIOUS_PATTERN="${COMBINED_NEVER_WHITELIST_PATTERN}|${COMBINED_COMMAND_PATTERN}|${COMBINED_NETWORK_PATTERN}"
+    UNIFIED_SUSPICIOUS_PATTERN="${COMBINED_NEVER_WHITELIST_PATTERN}|${COMBINED_COMMAND_PATTERN}|${COMBINED_NETWORK_PATTERN}|${COMBINED_NETWORK_INDICATOR_PATTERN}"
 }
 
 # Helper: Check single category and set match info
@@ -327,6 +360,83 @@ _check_category() {
             return 0
         fi
     done
+
+    return 1
+}
+
+# Network indicator check — detects hardcoded C2 destinations in any content type.
+# Covers: non-RFC1918 IPs, suspicious TLDs, DGA-like long subdomains, hex-encoded IPs.
+# Returns: 0 on match (sets MATCHED_PATTERN / MATCHED_STRING), 1 if clean.
+check_network_indicators() {
+    local content="$1"
+    [[ -z "$content" ]] && return 1
+
+    # Fast pre-filter: skip if combined pattern doesn't match at all
+    grep -qE "$COMBINED_NETWORK_INDICATOR_PATTERN" <<< "$content" 2>/dev/null || return 1
+
+    # ── Check 1: non-RFC1918 IP in network tool context ───────────────────────
+    local _ni_line
+    _ni_line=$(grep -oE "(curl|wget|fetch|ncat|nc|python|perl|ruby)[[:space:]]+['\"]?[a-zA-Z]*://[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}" \
+        <<< "$content" 2>/dev/null | head -1) || true
+    if [[ -n "$_ni_line" ]]; then
+        # Extract the dotted-quad IP
+        local _ip
+        _ip=$(grep -oE "[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}" <<< "$_ni_line" | head -1) || true
+        if [[ -n "$_ip" ]]; then
+            local _o1 _o2 _o3
+            IFS=. read -r _o1 _o2 _o3 _ <<< "$_ip"
+            local _is_private=false
+            # 10.0.0.0/8
+            [[ $_o1 -eq 10 ]] && _is_private=true
+            # 127.0.0.0/8
+            [[ $_o1 -eq 127 ]] && _is_private=true
+            # 172.16.0.0/12
+            [[ $_o1 -eq 172 && $_o2 -ge 16 && $_o2 -le 31 ]] && _is_private=true
+            # 192.168.0.0/16
+            [[ $_o1 -eq 192 && $_o2 -eq 168 ]] && _is_private=true
+            # 169.254.0.0/16 (link-local)
+            [[ $_o1 -eq 169 && $_o2 -eq 254 ]] && _is_private=true
+
+            if [[ "$_is_private" == false ]]; then
+                MATCHED_PATTERN="network_indicator_routable_ip"
+                MATCHED_CATEGORY="indicator"
+                MATCHED_STRING="${_ni_line:0:200}"
+                return 0
+            fi
+        fi
+    fi
+
+    # ── Check 2: suspicious TLD in download URL ───────────────────────────────
+    local _tld_line
+    _tld_line=$(grep -oiE "(curl|wget|fetch)[^\"'[:space:]]{0,100}\.(ru|cn|onion|tk|xyz|top|pw|cc|biz)([/\"' )]|$)" \
+        <<< "$content" 2>/dev/null | head -1) || true
+    if [[ -n "$_tld_line" ]]; then
+        MATCHED_PATTERN="network_indicator_suspicious_tld"
+        MATCHED_CATEGORY="indicator"
+        MATCHED_STRING="${_tld_line:0:200}"
+        return 0
+    fi
+
+    # ── Check 3: DGA-like long subdomain in download URL ─────────────────────
+    local _dga_line
+    _dga_line=$(grep -oiE "(curl|wget|fetch)[^\"'[:space:]]{0,60}[a-z0-9-]{16,}\.(com|net|org|io|co)([/\"' )]|$)" \
+        <<< "$content" 2>/dev/null | head -1) || true
+    if [[ -n "$_dga_line" ]]; then
+        MATCHED_PATTERN="network_indicator_dga_domain"
+        MATCHED_CATEGORY="indicator"
+        MATCHED_STRING="${_dga_line:0:200}"
+        return 0
+    fi
+
+    # ── Check 4: hex-encoded IP bytes (4+ consecutive \xNN sequences) ─────────
+    local _hex_line
+    _hex_line=$(grep -oE "(\\\\x[0-9a-fA-F]{2}){4}" <<< "$content" 2>/dev/null | head -1) || true
+    if [[ -n "$_hex_line" ]]; then
+        MATCHED_PATTERN="network_indicator_hex_encoded"
+        MATCHED_CATEGORY="indicator"
+        MATCHED_STRING="${_hex_line:0:200}"
+        return 0
+    fi
 
     return 1
 }
@@ -371,6 +481,13 @@ check_suspicious_patterns() {
         fi
     fi
 
+    # Network indicator patterns (C2 IPs, suspicious TLDs, DGA domains, hex IPs)
+    if [[ "$pattern_type" == "all" ]] || [[ "$pattern_type" == "indicator" ]]; then
+        if check_network_indicators "$content"; then
+            return 0
+        fi
+    fi
+
     return 1  # No suspicious patterns found
 }
 
@@ -403,18 +520,18 @@ show_usage() {
     cat << EOF
 Usage: sudo ./persistnux.sh [OPTIONS]
 
-Persistnux - Linux Persistence Detection Tool v1.9.0
+Persistnux - Linux Persistence Detection Tool v2.4.0
 Comprehensive DFIR tool to detect Linux persistence mechanisms
 
 OPTIONS:
   -h, --help              Show this help message
   -a, --all               Show all findings (default: suspicious only)
-  -m, --min-confidence    Minimum confidence level (LOW|MEDIUM|HIGH)
+  -m, --min-confidence    Minimum confidence level (LOW|MEDIUM|HIGH|CRITICAL)
 
 ENVIRONMENT VARIABLES:
   OUTPUT_DIR              Custom output directory (default: ./persistnux_output)
   FILTER_MODE             Filter mode: "suspicious_only" or "all" (default: suspicious_only)
-  MIN_CONFIDENCE          Minimum confidence filter (LOW|MEDIUM|HIGH)
+  MIN_CONFIDENCE          Minimum confidence filter (LOW|MEDIUM|HIGH|CRITICAL)
 
 EXAMPLES:
   # Show only suspicious findings (MEDIUM, HIGH, CRITICAL)
@@ -446,6 +563,10 @@ OUTPUT:
   - CSV format: persistnux_<hostname>_<timestamp>.csv
   - JSONL format: persistnux_<hostname>_<timestamp>.jsonl
 
+EXIT CODES:
+  0 - No CRITICAL findings
+  1 - CRITICAL findings detected (for CI/CD integration)
+
 For more information, see README.md and DFIR_GUIDE.md
 EOF
 }
@@ -459,7 +580,7 @@ print_banner() {
  / ____/  __/ /  (__  ) (__  ) /_/ /_/ />  <_>  <
 /_/    \___/_/  /____/_/____/\__/\__,_/_/|_/_/|_|
 
-    Linux Persistence Detection Tool v1.9.0
+    Linux Persistence Detection Tool v2.4.0
     For DFIR Investigations
 EOF
     echo -e "${NC}"
@@ -475,6 +596,13 @@ log_warn() {
 
 log_error() {
     echo -e "${RED}[-]${NC} $1"
+}
+
+log_check() {
+    (( CHECK_NUM++ )) || true
+    log_info "[CHECK ${CHECK_NUM}] $1"
+    # Write immediately to terminal so parallel-module progress is visible even before buffered output prints
+    echo "[$(date '+%H:%M:%S')] [${MODULE_NAME:-?}] CHECK ${CHECK_NUM}: $1" >> /dev/tty 2>/dev/null || true
 }
 
 log_finding() {
@@ -631,21 +759,24 @@ is_package_managed() {
        [[ "$file" =~ /.cargo/registry/ ]] || \
        [[ "$file" =~ /.cargo/bin/ ]] || \
        [[ "$file" =~ /go/pkg/mod/ ]] || \
-       [[ "$file" =~ /gems/gems/ ]]; then
+       [[ "$file" =~ /gems/gems/ ]] || \
+       [[ "$file" =~ /.local/lib/python ]] || \
+       [[ "$file" =~ /.local/share/virtualenvs/ ]]; then
         result="runtime-managed"
         PKG_CACHE["$file"]="$result"
         echo "$result"
         return 0
     fi
 
-    # Check dpkg (Debian/Ubuntu) - single call to avoid duplicate lookups
+    # Check dpkg (Debian/Ubuntu) - guarded cascade: each fallback dpkg -S only runs
+    # if the previous attempt returned empty (PERF-1: avoids redundant dpkg calls)
     if command -v dpkg &> /dev/null; then
         local dpkg_output
-        dpkg_output=$(dpkg -S "$file" 2>/dev/null) || true
+        dpkg_output=$(timeout 5 dpkg -S "$file" 2>/dev/null) || true
 
         # If canonical path lookup fails, try original path (kernel modules use /lib/modules not /usr/lib/modules)
         if [[ -z "$dpkg_output" ]] && [[ "$file" != "$original_file" ]]; then
-            dpkg_output=$(dpkg -S "$original_file" 2>/dev/null) || true
+            dpkg_output=$(timeout 5 dpkg -S "$original_file" 2>/dev/null) || true
             # Use original path for subsequent checks if it matched
             [[ -n "$dpkg_output" ]] && file="$original_file"
         fi
@@ -670,7 +801,7 @@ is_package_managed() {
                 alt_path="/usr/sbin/${file#/sbin/}"
             fi
             if [[ -n "$alt_path" ]]; then
-                dpkg_output=$(dpkg -S "$alt_path" 2>/dev/null) || true
+                dpkg_output=$(timeout 5 dpkg -S "$alt_path" 2>/dev/null) || true
                 [[ -n "$dpkg_output" ]] && file="$alt_path"
             fi
         fi
@@ -687,7 +818,7 @@ is_package_managed() {
             if [[ -n "${PKG_VERIFY_CACHE[$package]+isset}" ]]; then
                 full_verify="${PKG_VERIFY_CACHE[$package]}"
             else
-                full_verify=$(dpkg --verify "$package" 2>/dev/null) || true
+                full_verify=$(timeout 15 dpkg --verify "$package" 2>/dev/null) || true
                 PKG_VERIFY_CACHE["$package"]="$full_verify"
             fi
             local verify_output
@@ -785,10 +916,29 @@ is_package_managed() {
         fi
     fi
 
+    # Check apk (Alpine Linux)
+    if command -v apk &>/dev/null; then
+        if apk info --who-owns "$file" 2>/dev/null | grep -q "is owned by"; then
+            result="apk:managed"
+            PKG_CACHE["$file"]="$result"
+            echo "$result"
+            return 0
+        fi
+    fi
+
     # Not managed by package manager - cache and return
     PKG_CACHE["$file"]="unmanaged"
     echo "unmanaged"
     return 1
+}
+
+# Convenience wrapper: calls is_package_managed and stores result in global PKG_STATUS.
+# Used by new v2.4.0 modules (bootloader, polkit, dbus, udev, container, binary_integrity)
+# so callers don't need to capture stdout — they just read $PKG_STATUS after the call.
+# Uses || pattern to prevent set -eo pipefail from aborting on return 1 (unmanaged)
+# or return 2 (modified), both of which are expected non-zero return codes.
+check_file_package() {
+    PKG_STATUS=$(is_package_managed "$1" 2>/dev/null) || PKG_STATUS="${PKG_STATUS:-unmanaged}"
 }
 
 # Extract the first executable path from a command
@@ -800,8 +950,16 @@ get_executable_from_command() {
         command="${command#?}"
     done
 
+    # Strip leading KEY=VALUE environment variable assignments
+    # e.g. "LD_PRELOAD=/tmp/evil.so /usr/bin/sshd -D" -> "/usr/bin/sshd -D"
+    while [[ "$command" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; do
+        command="${command#* }"
+        # If no space found (only one token), stop
+        [[ "$command" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || break
+    done
+
     # Extract first word (the executable)
-    local executable=$(echo "$command" | awk '{print $1}')
+    local executable; read -r executable _ <<< "$command"
 
     # Remove quotes if present
     executable="${executable//\"/}"
@@ -905,6 +1063,58 @@ get_script_from_interpreter_command() {
     # No script file found
     echo ""
     return 1
+}
+
+# Resolve the actual execution target from a command string for the 'command' output field.
+# - interpreter + /path/to/script  → returns /path/to/script
+# - interpreter + -c 'code'        → returns the inline code string
+# - interpreter + -e 'code'        → returns the inline code string (perl)
+# - direct executable / empty      → returns the input unchanged
+resolve_command_target() {
+    local cmd="$1"
+    [[ -z "$cmd" ]] && return 0
+
+    # Strip leading systemd exec modifiers (@, :, +, !, -)
+    while [[ "$cmd" =~ ^[@:+!\-] ]]; do cmd="${cmd#?}"; done
+    cmd=$(echo "$cmd" | tr -s '[:space:]' ' ')
+    cmd="${cmd## }"; cmd="${cmd%% }"
+
+    # Get first token to check if it's a known interpreter
+    local first_token
+    read -r first_token _ <<< "$cmd"
+    if ! is_interpreter "$first_token" 2>/dev/null; then
+        echo "$cmd"
+        return 0
+    fi
+
+    # It's an interpreter — parse arguments
+    local -a args
+    read -ra args <<< "$cmd" 2>/dev/null || IFS=' ' read -ra args <<< "$cmd"
+
+    local i
+    for ((i=1; i<${#args[@]}; i++)); do
+        local arg="${args[i]}"
+        # -c (bash/python/ruby/node) or -e (perl) — next token(s) are inline code
+        if [[ "$arg" == "-c" ]] || [[ "$arg" == "-e" ]]; then
+            # Join everything after this flag as the inline code
+            local inline="${args[*]:$((i+1))}"
+            # Strip surrounding quotes if present
+            inline="${inline#\'}" ; inline="${inline%\'}"
+            inline="${inline#\"}" ; inline="${inline%\"}"
+            echo "$inline"
+            return 0
+        fi
+        # Skip other flags
+        [[ "$arg" =~ ^- ]] && continue
+        # First non-flag argument is the script path — strip quotes and return
+        arg="${arg#\"}" ; arg="${arg%\"}"
+        arg="${arg#\'}" ; arg="${arg%\'}"
+        echo "$arg"
+        return 0
+    done
+
+    # Interpreter with no resolvable target — return full command
+    echo "$cmd"
 }
 
 # Check if a file is a script (not binary/ELF)
@@ -1127,10 +1337,12 @@ analyze_script_content() {
     # Uses script_content_clean (comments stripped) to avoid FP on educational examples
     if [[ -n "$COMBINED_NEVER_WHITELIST_PATTERN" ]]; then
         local full_line
-        full_line=$(echo "$script_content_clean" | grep -iE "$COMBINED_NEVER_WHITELIST_PATTERN" | head -1) || true
+        full_line=$(grep -iE "$COMBINED_NEVER_WHITELIST_PATTERN" <<< "$script_content_clean" | head -1) || true
         if [[ -n "$full_line" ]]; then
             MATCHED_PATTERN="never_whitelist"
-            MATCHED_STRING=$(echo "$full_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
+            full_line="${full_line#"${full_line%%[! ]*}"}"
+            full_line="${full_line%"${full_line##*[! ]}"}"
+            MATCHED_STRING="${full_line:0:200}"
             return 0  # SUSPICIOUS - found dangerous pattern
         fi
     fi
@@ -1140,10 +1352,12 @@ analyze_script_content() {
     # This ensures analyze_script_content() is always in sync with SUSPICIOUS_COMMANDS.
     if [[ -n "$COMBINED_COMMAND_PATTERN" ]]; then
         local full_line
-        full_line=$(echo "$script_content_clean" | grep -iE "$COMBINED_COMMAND_PATTERN" | head -1) || true
+        full_line=$(grep -iE "$COMBINED_COMMAND_PATTERN" <<< "$script_content_clean" | head -1) || true
         if [[ -n "$full_line" ]]; then
             MATCHED_PATTERN="script_suspicious"
-            MATCHED_STRING=$(echo "$full_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
+            full_line="${full_line#"${full_line%%[! ]*}"}"
+            full_line="${full_line%"${full_line##*[! ]}"}"
+            MATCHED_STRING="${full_line:0:200}"
 
             # ISC-C6 FIX: If the matched line contains an interpreter -c/-e flag, extract
             # and deeply analyze the inline code argument. analyze_cron_command() already does
@@ -1166,10 +1380,10 @@ analyze_script_content() {
     content_single_line=$(echo "$script_content_clean" | tr '\n' ' ')
     if [[ -n "$COMBINED_MULTILINE_PATTERN" ]]; then
         local full_line
-        full_line=$(echo "$content_single_line" | grep -iE "$COMBINED_MULTILINE_PATTERN" | head -1) || true
+        full_line=$(grep -iE "$COMBINED_MULTILINE_PATTERN" <<< "$content_single_line" | head -1) || true
         if [[ -n "$full_line" ]]; then
             MATCHED_PATTERN="multiline_suspicious"
-            MATCHED_STRING=$(echo "$full_line" | head -c 200)
+            MATCHED_STRING="${full_line:0:200}"
             return 0  # SUSPICIOUS - found multi-line dangerous pattern
         fi
     fi
@@ -1180,19 +1394,23 @@ analyze_script_content() {
 
     # Hex escape sequences: \x41\x42\x43 (shell/perl/python style)
     local hex_line
-    hex_line=$(echo "$script_content_clean" | grep -E '(\\x[0-9a-fA-F]{2}){4,}' | head -1) || true
+    hex_line=$(grep -E '(\\x[0-9a-fA-F]{2}){4,}' <<< "$script_content_clean" | head -1) || true
     if [[ -n "$hex_line" ]]; then
         MATCHED_PATTERN="hex_encoding"
-        MATCHED_STRING=$(echo "$hex_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
+        hex_line="${hex_line#"${hex_line%%[! ]*}"}"
+        hex_line="${hex_line%"${hex_line##*[! ]}"}"
+        MATCHED_STRING="${hex_line:0:200}"
         return 0  # SUSPICIOUS - hex-encoded payload
     fi
 
     # Octal escape sequences: \101\102\060 (shell/perl style)
     local octal_line
-    octal_line=$(echo "$script_content_clean" | grep -E '(\\[0-7]{3}){4,}' | head -1) || true
+    octal_line=$(grep -E '(\\[0-7]{3}){4,}' <<< "$script_content_clean" | head -1) || true
     if [[ -n "$octal_line" ]]; then
         MATCHED_PATTERN="octal_encoding"
-        MATCHED_STRING=$(echo "$octal_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
+        octal_line="${octal_line#"${octal_line%%[! ]*}"}"
+        octal_line="${octal_line%"${octal_line##*[! ]}"}"
+        MATCHED_STRING="${octal_line:0:200}"
         return 0  # SUSPICIOUS - octal-encoded payload
     fi
 
@@ -1200,29 +1418,35 @@ analyze_script_content() {
     # Threshold lowered from {3,} to {2,}: 2 encoded chars is already intentional
     # Short payloads like $'\x62\x61\x73\x68' ("bash") were previously missed at {3,}
     local ansi_line
-    ansi_line=$(echo "$script_content_clean" | grep -E "\\\$'(\\\\x[0-9a-fA-F]{2}|\\\\[0-7]{3}){2,}'" | head -1) || true
+    ansi_line=$(grep -E "\\\$'(\\\\x[0-9a-fA-F]{2}|\\\\[0-7]{3}){2,}'" <<< "$script_content_clean" | head -1) || true
     if [[ -n "$ansi_line" ]]; then
         MATCHED_PATTERN="ansi_c_encoding"
-        MATCHED_STRING=$(echo "$ansi_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
+        ansi_line="${ansi_line#"${ansi_line%%[! ]*}"}"
+        ansi_line="${ansi_line%"${ansi_line##*[! ]}"}"
+        MATCHED_STRING="${ansi_line:0:200}"
         return 0  # SUSPICIOUS - ANSI-C encoded payload
     fi
 
     # tr-based character substitution piped to execution (ROT13, ROT47, custom ciphers)
     # Pattern: tr '...' '...' | bash/sh  — obfuscation via character rotation
     local tr_exec_line
-    tr_exec_line=$(echo "$script_content_clean" | grep -iE "tr[[:space:]]+['\"].+['\"].*\|[[:space:]]*(bash|sh|dash|zsh|exec)" | head -1) || true
+    tr_exec_line=$(grep -iE "tr[[:space:]]+['\"].+['\"].*\|[[:space:]]*(bash|sh|dash|zsh|exec)" <<< "$script_content_clean" | head -1) || true
     if [[ -n "$tr_exec_line" ]]; then
         MATCHED_PATTERN="tr_cipher_obfuscation"
-        MATCHED_STRING=$(echo "$tr_exec_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
+        tr_exec_line="${tr_exec_line#"${tr_exec_line%%[! ]*}"}"
+        tr_exec_line="${tr_exec_line%"${tr_exec_line##*[! ]}"}"
+        MATCHED_STRING="${tr_exec_line:0:200}"
         return 0  # SUSPICIOUS - tr cipher obfuscation piped to shell
     fi
 
     # rev-based string reversal piped to execution
     local rev_exec_line
-    rev_exec_line=$(echo "$script_content_clean" | grep -iE "rev[[:space:]]*\|[[:space:]]*(bash|sh|dash|zsh)" | head -1) || true
+    rev_exec_line=$(grep -iE "rev[[:space:]]*\|[[:space:]]*(bash|sh|dash|zsh)" <<< "$script_content_clean" | head -1) || true
     if [[ -n "$rev_exec_line" ]]; then
         MATCHED_PATTERN="rev_obfuscation"
-        MATCHED_STRING=$(echo "$rev_exec_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | head -c 200)
+        rev_exec_line="${rev_exec_line#"${rev_exec_line%%[! ]*}"}"
+        rev_exec_line="${rev_exec_line%"${rev_exec_line##*[! ]}"}"
+        MATCHED_STRING="${rev_exec_line:0:200}"
         return 0  # SUSPICIOUS - string reversal piped to shell
     fi
 
@@ -1230,51 +1454,73 @@ analyze_script_content() {
     # These appear in scripts that use language stdlib instead of shell commands,
     # making them invisible to shell-command pattern checks.
     local lang_exec_line
-    lang_exec_line=$(echo "$script_content_clean" | grep -oE \
+    lang_exec_line=$(grep -oE \
         "socket\.connect\(|pty\.spawn\(|subprocess\.Popen[^)]{0,60}shell[[:space:]]*=[[:space:]]*True|os\.(system|popen|exec[vl]p?)\(|TCPSocket\.new\(" \
-        | head -1) || true
+        <<< "$script_content_clean" | head -1) || true
     if [[ -n "$lang_exec_line" ]]; then
         MATCHED_PATTERN="language_network_exec"
         MATCHED_STRING="${lang_exec_line:0:200}"
         return 0  # SUSPICIOUS - language-specific network or shell-execution pattern
     fi
 
-    # Check for high-entropy strings (obfuscation detection)
-    # Look for long strings/variables with suspiciously high entropy
-    # This catches: variable substitution, high-ascii characters, encrypted payloads
-    while IFS= read -r line; do
-        # Skip comments and empty lines
-        [[ "$line" =~ ^[[:space:]]*# ]] && continue
-        [[ -z "$line" ]] && continue
+    # High-entropy string detection -- single awk pass (avoids per-line subprocess cost)
+    local _entropy_hit
+    _entropy_hit=$(awk '
+        /^[[:space:]]*#/ { next }
+        /=/ {
+            # POSIX awk: 2-arg match() + RSTART/RLENGTH (no gawk-only 3-arg match)
+            val = ""
+            if (match($0, /="[^"]{30,}"/)) {
+                val = substr($0, RSTART+2, RLENGTH-3)
+            } else if (match($0, /='"'"'[^'"'"']{30,}'"'"'/)) {
+                val = substr($0, RSTART+2, RLENGTH-3)
+            } else if (match($0, /=[^[:space:]"'"'"']{30,}/)) {
+                val = substr($0, RSTART+1, RLENGTH-1)
+            }
+            if (val == "") next
+            # Compute Shannon entropy
+            n = length(val)
+            if (n < 30) next
+            delete freq
+            for (i=1; i<=n; i++) freq[substr(val,i,1)]++
+            ent = 0
+            for (c in freq) { p = freq[c]/n; ent -= p * log(p)/log(2) }
+            if (ent >= 4.5) {
+                # Only flag if execution context present on same line
+                if ($0 ~ /eval|exec[[:space:]]|base64.*-d|bash[[:space:]]|sh -c|openssl.*-d/) {
+                    print substr(val, 1, 50)
+                    exit
+                }
+            }
+        }
+    ' <<< "$script_content_clean") || true
 
-        # Extract variable assignments with long values (potential obfuscation)
-        # ISC-C10 FIX: Only flag HIGH entropy when paired with an execution context indicator
-        # on the same line (eval, exec, base64 -d, bash, sh -c, openssl -d).
-        # Standalone high-entropy strings (certificates, UUIDs, API keys, hashes) are
-        # too noisy to flag without execution context — they don't continue the loop.
-        local _value=""
-        if [[ "$line" =~ =\"([^\"]{30,})\" ]]; then
-            _value="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ =\'([^\']{30,})\' ]]; then
-            _value="${BASH_REMATCH[1]}"
-        elif [[ "$line" =~ =([^[:space:]]{30,}) ]]; then
-            _value="${BASH_REMATCH[1]}"
-            _value="${_value#[\"\']}"
-            _value="${_value%[\"\']}"
-        fi
-
-        if [[ -n "$_value" ]] && is_high_entropy "$_value" 4.5; then
-            if echo "$line" | grep -qiE 'eval|exec\b|base64.*-d|bash\b|sh -c|openssl.*-d'; then
-                MATCHED_PATTERN="high_entropy_exec"
-                MATCHED_STRING="${_value:0:50}..."
-                return 0  # SUSPICIOUS - high entropy data with execution context
-            fi
-            # Standalone high entropy without execution context: skip (too many FPs)
-        fi
-
-    done <<< "$script_content_clean"
+    if [[ -n "$_entropy_hit" ]]; then
+        MATCHED_PATTERN="high_entropy_exec"
+        MATCHED_STRING="${_entropy_hit}..."
+        return 0
+    fi
 
     return 1  # Clean - no suspicious patterns found
+}
+
+# Analyze a content string (not a file path) for suspicious patterns.
+# Writes content to a temp file, calls analyze_script_content(), cleans up.
+# Use this at all call sites that have content in a variable, not a file path.
+analyze_content_string() {
+    local content="$1"
+    local context_label="${2:-}"   # for logging only
+
+    [[ -z "$content" ]] && return 1
+
+    local _tmp_file
+    _tmp_file=$(mktemp /tmp/persistnux_content_XXXXXX) || return 1
+    printf '%s' "$content" > "$_tmp_file"
+
+    local _result=1
+    analyze_script_content "$_tmp_file" && _result=0
+    rm -f "$_tmp_file"
+    return $_result
 }
 
 # Analyze inline code content for suspicious patterns and obfuscation
@@ -1430,6 +1676,11 @@ should_include_finding() {
     # If MIN_CONFIDENCE is set, filter by confidence level
     if [[ -n "$MIN_CONFIDENCE" ]]; then
         case "$MIN_CONFIDENCE" in
+            "CRITICAL")
+                if [[ "$confidence" != "CRITICAL" ]]; then
+                    return 1  # Exclude
+                fi
+                ;;
             "HIGH")
                 if [[ "$confidence" != "HIGH" ]] && [[ "$confidence" != "CRITICAL" ]]; then
                     return 1  # Exclude
@@ -1461,8 +1712,13 @@ should_include_finding() {
 # Escape CSV fields
 escape_csv() {
     local field="$1"
-    # Replace quotes with double quotes and wrap in quotes if contains comma, quote, or newline
-    if [[ "$field" =~ [,\"$'\n'] ]]; then
+    # Wrap in quotes if field contains comma, quote, newline, carriage return,
+    # or Unicode line/paragraph separators (U+2028, U+2029) that break CSV parsers
+    local ls=$'\xe2\x80\xa8'   # U+2028 LINE SEPARATOR (UTF-8)
+    local ps=$'\xe2\x80\xa9'   # U+2029 PARAGRAPH SEPARATOR (UTF-8)
+    if [[ "$field" == *","* ]] || [[ "$field" == *'"'* ]] || \
+       [[ "$field" == *$'\n'* ]] || [[ "$field" == *$'\r'* ]] || \
+       [[ "$field" == *"$ls"* ]] || [[ "$field" == *"$ps"* ]]; then
         echo "\"${field//\"/\"\"}\""
     else
         echo "$field"
@@ -1478,6 +1734,10 @@ escape_json() {
     str="${str//$'\n'/\\n}"    # newline -> \n
     str="${str//$'\t'/\\t}"    # tab -> \t
     str="${str//$'\r'/\\r}"    # carriage return -> \r
+    # Strip remaining ASCII control characters (0x00-0x1F) not already handled above.
+    # These produce invalid JSON and can break downstream parsers (jq, Splunk, Elastic).
+    # \001-\010 = 0x01-0x08, \013 = 0x0B (VT), \014 = 0x0C (FF), \016-\037 = 0x0E-0x1F
+    str=$(printf '%s' "$str" | tr -d '\000-\010\013\014\016-\037')
     echo "$str"
 }
 
@@ -1516,13 +1776,29 @@ add_finding_new() {
     local matched_pattern="${12:-}"    # The pattern that triggered detection
     local matched_string="${13:-}"     # The actual string that matched
 
+    # Truncate matched_string to avoid oversized CSV/JSONL fields
+    matched_string="${matched_string:0:500}"
+
+    # Resolve command to actual execution target (script path or inline code)
+    if [[ -n "$command" ]]; then
+        command=$(resolve_command_target "$command")
+    fi
+
     # ISC-C8 FIX: Escalate HIGH → CRITICAL for SUID/SGID files with suspicious content.
     # SUID/SGID + suspicious patterns is the most dangerous persistence combination:
     # an attacker-controlled setuid binary that spawns a shell or downloads a payload.
     # Permissions field format: "rwsr-xr-x" or "rws--x--x" etc. (s in user/group position).
-    if [[ "$confidence" == "HIGH" ]] && [[ "$file_permissions" =~ [sS] ]]; then
-        confidence="CRITICAL"
-        matched_pattern="${matched_pattern}+suid_sgid"
+    # Escalate HIGH -> CRITICAL for SUID/SGID files (permission bits 04000/02000)
+    # file_permissions is octal from stat -c "%a" (e.g. "4755", "2755", "6755")
+    # Extract leading digit(s): if value >= 4000 octal, SUID bit is set;
+    # if value >= 2000 (mod 4000), SGID bit is set.
+    if [[ "$confidence" == "HIGH" ]] && [[ "$file_permissions" =~ ^[0-9]+$ ]]; then
+        local _perm_oct
+        _perm_oct=$(( 8#${file_permissions} )) 2>/dev/null || _perm_oct=0
+        if (( (_perm_oct & 04000) || (_perm_oct & 02000) )); then
+            confidence="CRITICAL"
+            matched_pattern="${matched_pattern}+suid_sgid"
+        fi
     fi
 
     # Check if this finding should be included based on filter settings
@@ -1543,11 +1819,11 @@ add_finding_new() {
     local timestamp=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
     # CSV output (new structure with matched_pattern and matched_string)
-    echo "$(escape_csv "$timestamp"),$(escape_csv "$HOSTNAME"),$(escape_csv "$category"),$(escape_csv "$confidence"),$(escape_csv "$file_path"),$(escape_csv "$file_hash"),$(escape_csv "$file_owner"),$(escape_csv "$file_permissions"),$(escape_csv "$file_age_days"),$(escape_csv "$package_status"),$(escape_csv "$command"),$(escape_csv "$enabled_status"),$(escape_csv "$description"),$(escape_csv "$matched_pattern"),$(escape_csv "$matched_string")" >> "$CSV_FILE"
+    echo "$(escape_csv "$timestamp"),$(escape_csv "$HOSTNAME"),$(escape_csv "$category"),$(escape_csv "$confidence"),$(escape_csv "$file_path"),$(escape_csv "$file_hash"),$(escape_csv "$file_owner"),$(escape_csv "$file_permissions"),$(escape_csv "$file_age_days"),$(escape_csv "$package_status"),$(escape_csv "$command"),$(escape_csv "$description"),$(escape_csv "$matched_pattern"),$(escape_csv "$matched_string")" >> "$CSV_FILE"
 
     # JSONL output (new structure with proper escaping)
     cat >> "$JSONL_FILE" << EOF
-{"timestamp":"$timestamp","hostname":"$HOSTNAME","category":"$(escape_json "$category")","confidence":"$confidence","file_path":"$(escape_json "$file_path")","file_hash":"$file_hash","file_owner":"$(escape_json "$file_owner")","file_permissions":"$file_permissions","file_age_days":"$file_age_days","package_status":"$(escape_json "$package_status")","command":"$(escape_json "$command")","enabled_status":"$(escape_json "$enabled_status")","description":"$(escape_json "$description")","matched_pattern":"$(escape_json "$matched_pattern")","matched_string":"$(escape_json "$matched_string")"}
+{"timestamp":"$(escape_json "$timestamp")","hostname":"$(escape_json "$HOSTNAME")","category":"$(escape_json "$category")","confidence":"$confidence","file_path":"$(escape_json "$file_path")","file_hash":"$(escape_json "$file_hash")","file_owner":"$(escape_json "$file_owner")","file_permissions":"$(escape_json "$file_permissions")","file_age_days":"$(escape_json "$file_age_days")","package_status":"$(escape_json "$package_status")","command":"$(escape_json "$command")","description":"$(escape_json "$description")","matched_pattern":"$(escape_json "$matched_pattern")","matched_string":"$(escape_json "$matched_string")"}
 EOF
 }
 
@@ -1582,9 +1858,9 @@ add_finding() {
     local command=""
     if [[ "$description" =~ ExecStart:\ (.+)$ ]]; then
         command="${BASH_REMATCH[1]}"
-    elif [[ "$additional_info" =~ preview=([^|]+) ]]; then
+    elif [[ "$additional_info" =~ preview=(.+)$ ]]; then
         command="${BASH_REMATCH[1]}"
-    elif [[ "$additional_info" =~ content_preview=([^|]+) ]]; then
+    elif [[ "$additional_info" =~ content_preview=(.+)$ ]]; then
         command="${BASH_REMATCH[1]}"
     fi
 
@@ -1601,7 +1877,7 @@ init_output() {
     mkdir -p "$TEMP_DATA"
 
     # CSV header (new structured format with matched_pattern and matched_string)
-    echo "timestamp,hostname,category,confidence,file_path,file_hash,file_owner,file_permissions,file_age_days,package_status,command,enabled_status,description,matched_pattern,matched_string" > "$CSV_FILE"
+    echo "timestamp,hostname,category,confidence,file_path,file_hash,file_owner,file_permissions,file_age_days,package_status,command,description,matched_pattern,matched_string" > "$CSV_FILE"
 
     # Clear JSONL file
     > "$JSONL_FILE"
@@ -1615,9 +1891,209 @@ init_output() {
 # Detection Modules
 ################################################################################
 
+check_bootloader_persistence() {
+    log_info "[NEW] Checking bootloader and initramfs persistence..."
+
+    # ─── GRUB bootloader ────────────────────────────────────────────────────
+    log_check "GRUB bootloader configuration (init= injection)"
+
+    local _grub_files=()
+    [[ -f /etc/default/grub ]] && _grub_files+=("/etc/default/grub")
+    while IFS= read -r -d '' _cfg; do
+        _grub_files+=("$_cfg")
+    done < <(find /etc/default/grub.d -maxdepth 1 -name "*.cfg" -type f -print0 2>/dev/null)
+
+    local _standard_inits=("/sbin/init" "/lib/systemd/systemd" "/usr/lib/systemd/systemd" "/bin/busybox" "/sbin/upstart")
+
+    for _gf in "${_grub_files[@]}"; do
+        local _hash; _hash=$(get_file_hash "$_gf")
+        local _meta; _meta=$(get_file_metadata "$_gf")
+        check_file_package "$_gf"
+        local _pkg_status="$PKG_STATUS"
+
+        local _confidence="LOW"
+        local _matched_pattern=""
+        local _matched_string=""
+
+        # Parse both GRUB_CMDLINE_LINUX_DEFAULT and GRUB_CMDLINE_LINUX
+        local _cmdline=""
+        _cmdline=$(grep -E "^GRUB_CMDLINE_LINUX(_DEFAULT)?=" "$_gf" 2>/dev/null | tr '\n' ' ') || true
+
+        if [[ -n "$_cmdline" ]]; then
+            # Extract init= value using bash parameter expansion
+            if [[ "$_cmdline" =~ (^|[[:space:]])init=([^[:space:]\"\']+) ]]; then
+                local _init_target="${BASH_REMATCH[2]}"
+                # Strip leading and trailing quotes if captured
+                _init_target="${_init_target#[\"\']}"
+                _init_target="${_init_target%[\"\']}"
+
+                local _is_standard=false
+                for _si in "${_standard_inits[@]}"; do
+                    [[ "$_init_target" == "$_si" ]] && _is_standard=true && break
+                done
+
+                if [[ "$_is_standard" == "true" ]]; then
+                    _confidence="LOW"
+                    _matched_pattern="grub_init_standard"
+                    _matched_string="init=$_init_target"
+                else
+                    _confidence="HIGH"
+                    _matched_pattern="grub_init_injection"
+                    _matched_string="init=$_init_target"
+                    log_finding "GRUB init= injection detected in $_gf: init=$_init_target"
+
+                    # Analyze the init= target script if it exists
+                    if [[ -f "$_init_target" ]]; then
+                        local _init_content
+                        _init_content=$(head -n 200 "$_init_target" 2>/dev/null | tr -d '\0') || true
+                        if [[ -n "$_init_content" ]] && analyze_content_string "$_init_content" "$_init_target"; then
+                            _confidence="CRITICAL"
+                            _matched_pattern="grub_init_malicious_content"
+                            _matched_string="$MATCHED_STRING"
+                            log_finding "GRUB init= target has malicious content: $_init_target"
+                        fi
+                    fi
+                fi
+            fi
+        fi
+
+        [[ "$_pkg_status" == "unmanaged" && "$_confidence" == "LOW" ]] && _confidence="MEDIUM"
+
+        add_finding "Bootloader" "GRUB" "grub_config" "$_gf" "GRUB config: $(basename "$_gf")" "$_confidence" "$_hash" "$_meta" "package=$_pkg_status" "$_matched_pattern" "$_matched_string"
+    done
+
+    # Scan root-level dropped init scripts (attacker drops e.g. /grub-panix.sh)
+    log_check "Root-level dropped init scripts"
+    while IFS= read -r -d '' _root_sh; do
+        local _hash; _hash=$(get_file_hash "$_root_sh")
+        local _meta; _meta=$(get_file_metadata "$_root_sh")
+        check_file_package "$_root_sh"
+        local _confidence="HIGH"
+        local _matched_pattern="root_dropped_script"
+        local _matched_string="$(basename "$_root_sh")"
+        local _content
+        _content=$(head -n 200 "$_root_sh" 2>/dev/null | tr -d '\0') || true
+        if [[ -n "$_content" ]] && analyze_content_string "$_content" "$_root_sh"; then
+            _confidence="CRITICAL"
+            _matched_pattern="root_dropped_script_malicious"
+            _matched_string="$MATCHED_STRING"
+        fi
+        log_finding "Root-level dropped script: $_root_sh"
+        add_finding "Bootloader" "DroppedScript" "root_dropped_script" "$_root_sh" "Root-level script: $(basename "$_root_sh")" "$_confidence" "$_hash" "$_meta" "package=$PKG_STATUS" "$_matched_pattern" "$_matched_string"
+    done < <(find / -xdev -maxdepth 2 -type f -name "*.sh" -perm /111 -not -path "/etc/*" -not -path "/usr/*" -not -path "/bin/*" -not -path "/sbin/*" -not -path "/lib/*" -not -path "/lib64/*" -not -path "/opt/*" -not -path "/home/*" -not -path "/root/*" -not -path "/tmp/*" -not -path "/var/*" -not -path "/snap/*" 2>/dev/null)
+
+    # ─── Initramfs / Dracut ─────────────────────────────────────────────────
+    log_check "Dracut initramfs modules (pre-pivot hooks)"
+
+    local _dracut_base="/usr/lib/dracut/modules.d"
+    if [[ -d "$_dracut_base" ]]; then
+        while IFS= read -r -d '' _setup; do
+            local _mod_dir; _mod_dir=$(dirname "$_setup")
+            local _hash; _hash=$(get_file_hash "$_setup")
+            local _meta; _meta=$(get_file_metadata "$_setup")
+            check_file_package "$_setup"
+            local _pkg="$PKG_STATUS"
+
+            local _confidence="LOW"
+            local _matched_pattern=""
+            local _matched_string=""
+
+            local _content
+            _content=$(cat "$_setup" 2>/dev/null | tr -d '\0') || true
+
+            # Look for pre-pivot hook installation
+            if grep -qiE "inst_hook[[:space:]]+pre-pivot" <<< "$_content" 2>/dev/null; then
+                _confidence="HIGH"
+                _matched_pattern="dracut_pre_pivot_hook"
+                _matched_string=$(grep -iE "inst_hook[[:space:]]+pre-pivot" <<< "$_content" | head -1) || true
+                log_finding "Dracut pre-pivot hook found: $_setup"
+
+                # Find and analyze the hook script
+                local _hook_script
+                _hook_script=$(grep -oiE "inst_hook[[:space:]]+pre-pivot[[:space:]]+[0-9]+[[:space:]]+\S+" <<< "$_content" | awk '{print $NF}' | head -1) || true
+                if [[ -n "$_hook_script" ]]; then
+                    local _hook_path="$_mod_dir/$_hook_script"
+                    if [[ -f "$_hook_path" ]]; then
+                        local _hook_content
+                        _hook_content=$(cat "$_hook_path" 2>/dev/null | tr -d '\0') || true
+                        # Check for /sysroot/etc/shadow writes — CRITICAL backdoor user injection
+                        if grep -qiE "(>|>>)[[:space:]]*/sysroot/etc/shadow" <<< "$_hook_content" 2>/dev/null; then
+                            _confidence="CRITICAL"
+                            _matched_pattern="dracut_sysroot_shadow_write"
+                            _matched_string=$(grep -iE "(>|>>)[[:space:]]*/sysroot/etc/shadow" <<< "$_hook_content" | head -1) || true
+                            log_finding "Dracut hook writes to /sysroot/etc/shadow: $_hook_path"
+                        elif analyze_content_string "$_hook_content" "$_hook_path"; then
+                            _confidence="CRITICAL"
+                            _matched_pattern="dracut_hook_malicious_content"
+                            _matched_string="$MATCHED_STRING"
+                        fi
+                    fi
+                fi
+            elif [[ "$_pkg" == "unmanaged" ]]; then
+                _confidence="HIGH"
+                _matched_pattern="dracut_unmanaged_module"
+                _matched_string="$(basename "$_mod_dir")"
+                log_finding "Unmanaged dracut module: $_mod_dir"
+            fi
+
+            add_finding "Bootloader" "Dracut" "dracut_module" "$_setup" "Dracut module: $(basename "$_mod_dir")" "$_confidence" "$_hash" "$_meta" "package=$_pkg" "$_matched_pattern" "$_matched_string"
+        done < <(find "$_dracut_base" -maxdepth 6 -name "module-setup.sh" -type f -print0 2>/dev/null)
+    fi
+
+    # Ubuntu/Debian: initramfs-tools hook scripts
+    log_check "initramfs-tools hook scripts (Ubuntu/Debian)"
+    local _initramfs_scripts_dirs=(
+        "/etc/initramfs-tools/scripts"
+        "/etc/initramfs-tools/hooks"
+    )
+    for _ird in "${_initramfs_scripts_dirs[@]}"; do
+        [[ -d "$_ird" ]] || continue
+        while IFS= read -r -d '' _hook; do
+            local _hash; _hash=$(get_file_hash "$_hook")
+            local _meta; _meta=$(get_file_metadata "$_hook")
+            check_file_package "$_hook"
+            local _pkg="$PKG_STATUS"
+            local _confidence="LOW"
+            local _matched_pattern=""
+            local _matched_string=""
+
+            [[ "$_pkg" == "unmanaged" ]] && _confidence="MEDIUM"
+
+            local _content
+            _content=$(head -n 300 "$_hook" 2>/dev/null | tr -d '\0') || true
+            if [[ -n "$_content" ]] && analyze_content_string "$_content" "$_hook"; then
+                _confidence="CRITICAL"
+                _matched_pattern="$MATCHED_PATTERN"
+                _matched_string="$MATCHED_STRING"
+                log_finding "Suspicious initramfs-tools hook: $_hook"
+            elif grep -qiE "\\\$rootmnt/etc/(shadow|passwd)" <<< "$_content" 2>/dev/null; then
+                _confidence="CRITICAL"
+                _matched_pattern="initramfs_rootmnt_shadow_write"
+                _matched_string=$(grep -iE "\\\$rootmnt/etc/(shadow|passwd)" <<< "$_content" | head -1) || true
+                log_finding "initramfs hook writes to \$rootmnt/etc/shadow or passwd: $_hook"
+            fi
+
+            add_finding "Bootloader" "InitramfsTools" "initramfs_hook" "$_hook" "initramfs-tools hook: $(basename "$_hook")" "$_confidence" "$_hash" "$_meta" "package=$_pkg" "$_matched_pattern" "$_matched_string"
+        done < <(find "$_ird" -maxdepth 6 -type f -perm /111 -print0 2>/dev/null)
+    done
+
+    # FIM for /boot/initrd.img-* — mtime-based (no baseline available on live systems)
+    log_check "/boot/initrd.img-* recent modification"
+    while IFS= read -r -d '' _initrd; do
+        local _meta; _meta=$(get_file_metadata "$_initrd")
+        local _days_old="9999"
+        if [[ "$_meta" =~ days_old:([0-9]+) ]]; then _days_old="${BASH_REMATCH[1]}"; fi
+        if [[ "$_days_old" -le 7 ]]; then
+            local _hash; _hash=$(get_file_hash "$_initrd")
+            add_finding "Bootloader" "InitrdImage" "initrd_recent_modification" "$_initrd" "initrd image recently modified (${_days_old}d ago)" "MEDIUM" "$_hash" "$_meta" "" "initrd_recent_modification" "days_old=$_days_old"
+            log_finding "initrd image recently modified: $_initrd (${_days_old} days ago)"
+        fi
+    done < <(find /boot -maxdepth 1 -name "initrd.img-*" -type f -print0 2>/dev/null)
+}
+
 # Check systemd services
 check_systemd() {
-    log_info "[1/7] Checking systemd services..."
+    log_info "[1/9] Checking systemd services..."
 
     if ! command -v systemctl &> /dev/null; then
         log_warn "systemctl not found, skipping systemd checks"
@@ -1642,7 +2118,7 @@ check_systemd() {
     # compromising non-privileged accounts (www-data, service accounts, etc.)
     if [[ $EUID_CHECK -eq 0 ]]; then
         while IFS=: read -r username _ uid _ _ homedir _; do
-            if [[ $uid -ge 0 ]]; then
+            if [[ $uid -ge 1000 ]] || [[ $uid -eq 0 ]]; then
                 local user_systemd_dir="$homedir/.config/systemd/user"
                 if [[ -d "$user_systemd_dir" ]] && [[ "$user_systemd_dir" != "$HOME/.config/systemd/user" ]]; then
                     systemd_paths+=("$user_systemd_dir")
@@ -1650,6 +2126,8 @@ check_systemd() {
             fi
         done < /etc/passwd
     fi
+
+    log_check "Systemd service files (.service)"
 
     # Track scanned real paths to avoid double-scanning /lib/ and /usr/lib/ on merged-/usr
     local scanned_systemd_paths=()
@@ -1672,10 +2150,23 @@ check_systemd() {
 
                 # Extract exec directives from service file
                 local exec_start="" exec_pre="" exec_post=""
+                local on_failure=""
+                local env_inline="" env_file=""
                 if [[ -f "$service_file" ]]; then
-                    exec_start=$(grep -E "^ExecStart=" "$service_file" 2>/dev/null | head -1 | cut -d'=' -f2- || echo "")
+                    # Join backslash-continued lines, then extract all ExecStart= values
+                    exec_start=$(awk '/^ExecStart=/{
+                        line = substr($0, index($0,"=")+1)
+                        while (sub(/\\$/, "", line)) {
+                            if ((getline nextline) > 0) line = line " " nextline
+                            else break
+                        }
+                        print line
+                    }' "$service_file" 2>/dev/null | tr '\n' ';' | sed 's/;$//' || echo "")
                     exec_pre=$(grep -E "^ExecStartPre=" "$service_file" 2>/dev/null | cut -d'=' -f2- | tr '\n' ';' || echo "")
                     exec_post=$(grep -E "^ExecStartPost=" "$service_file" 2>/dev/null | cut -d'=' -f2- | tr '\n' ';' || echo "")
+                    on_failure=$(grep -E "^OnFailure=" "$service_file" 2>/dev/null | cut -d'=' -f2- | tr '\n' ',' | sed 's/,$//' || echo "")
+                    env_inline=$(grep -E "^Environment=" "$service_file" 2>/dev/null | cut -d'=' -f2- | tr '\n' ';' || echo "")
+                    env_file=$(grep -E "^EnvironmentFile=" "$service_file" 2>/dev/null | cut -d'=' -f2- | tr '\n' ';' || echo "")
                 fi
 
                 # Skip services with no ExecStart - nothing to analyse
@@ -1694,6 +2185,7 @@ check_systemd() {
                 # Skip disabled services - not active, not a persistence risk
                 # Exception: timer-activated services appear "disabled" but run on schedule
                 # If a matching .timer file exists in any systemd path, analyze the service anyway
+                local _timer_schedule=""
                 if [[ "$enabled_status" == "disabled" ]]; then
                     local _timer_basename="${service_name%.service}.timer"
                     local _timer_found=false
@@ -1701,6 +2193,19 @@ check_systemd() {
                     for _tdir in "$(dirname "$service_file")" /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system /run/systemd/system /etc/systemd/user /usr/lib/systemd/user; do
                         if [[ -f "${_tdir}/${_timer_basename}" ]]; then
                             _timer_found=true
+                            # Analyze timer content for schedule values and Unit= cross-reference
+                            local _timer_file="${_tdir}/${_timer_basename}"
+                            local _timer_on_boot; _timer_on_boot=$(grep -iE "^OnBootSec[[:space:]]*=" "$_timer_file" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d ' ') || true
+                            local _timer_on_cal; _timer_on_cal=$(grep -iE "^OnCalendar[[:space:]]*=" "$_timer_file" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d ' ') || true
+                            local _timer_on_unit; _timer_on_unit=$(grep -iE "^OnUnitActiveSec[[:space:]]*=" "$_timer_file" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d ' ') || true
+                            local _timer_unit_ref; _timer_unit_ref=$(grep -iE "^Unit[[:space:]]*=" "$_timer_file" 2>/dev/null | head -1 | cut -d'=' -f2- | tr -d ' ') || true
+                            [[ -n "$_timer_on_boot" ]] && _timer_schedule="OnBootSec=$_timer_on_boot"
+                            [[ -n "$_timer_on_cal" ]] && _timer_schedule="${_timer_schedule:+$_timer_schedule|}OnCalendar=$_timer_on_cal"
+                            [[ -n "$_timer_on_unit" ]] && _timer_schedule="${_timer_schedule:+$_timer_schedule|}OnUnitActiveSec=$_timer_on_unit"
+                            # Flag if timer activates a DIFFERENT service than expected
+                            if [[ -n "$_timer_unit_ref" ]] && [[ "$_timer_unit_ref" != "${service_name}" ]]; then
+                                log_finding "Timer activates non-corresponding service: $_timer_file -> $_timer_unit_ref (expected: $service_name)"
+                            fi
                             break
                         fi
                     done
@@ -1910,13 +2415,7 @@ check_systemd() {
                                     fi
                                 fi
 
-                                # Recent + enabled + unknown = suspicious
-                                if [[ "$confidence" == "MEDIUM" ]] && [[ $days_old -lt 7 ]] && [[ "$enabled_status" == "enabled" ]]; then
-                                    confidence="HIGH"
-                                    finding_matched_pattern="recent_unknown"
-                                    finding_matched_string="${days_old} days old"
-                                    log_finding "Recently created enabled service with unknown command: $service_file"
-                                fi
+                                # (time-based elevation removed — no baseline context)
 
                                 # Default reason if no specific pattern found - show ExecStart content
                                 if [[ -z "$finding_matched_pattern" ]]; then
@@ -1995,13 +2494,116 @@ check_systemd() {
                     done < <(echo "$exec_hook_str" | tr ';' '\n')
                 done
 
+                # ── Environment= / EnvironmentFile= : check for LD_PRELOAD / PATH injection ──
+                if [[ -n "$env_inline" ]]; then
+                    local _env_ld_match
+                    _env_ld_match=$(echo "$env_inline" | grep -oiE "(LD_PRELOAD|LD_LIBRARY_PATH|PATH)[[:space:]]*=[[:space:]]*[^;]+" | head -1) || true
+                    if [[ -n "$_env_ld_match" ]]; then
+                        if [[ "$confidence" != "CRITICAL" ]]; then
+                            confidence="HIGH"
+                            finding_matched_pattern="env_directive_ld_inject"
+                            finding_matched_string="$_env_ld_match"
+                            log_finding "Systemd service has suspicious Environment= directive: $service_file [$_env_ld_match]"
+                        fi
+                    fi
+                fi
+                if [[ -n "$env_file" ]]; then
+                    local _env_file_path
+                    _env_file_path=$(echo "$env_file" | grep -oE '[^;]+' | head -1 | sed 's/^[[:space:]]*//;s/[[:space:]]*;//') || true
+                    _env_file_path="${_env_file_path#-}"  # strip leading - (optional env file marker)
+                    _env_file_path="${_env_file_path## }"
+                    if [[ -n "$_env_file_path" ]] && [[ -f "$_env_file_path" ]]; then
+                        local _ef_pkg_status _ef_pkg_return=0
+                        _ef_pkg_status=$(is_package_managed "$_env_file_path") || _ef_pkg_return=$?
+                        if [[ $_ef_pkg_return -eq 2 ]]; then
+                            confidence="CRITICAL"
+                            finding_matched_pattern="modified_env_file"
+                            finding_matched_string="$_env_file_path"
+                            log_finding "Systemd service EnvironmentFile is MODIFIED: $_env_file_path ($service_file)"
+                        elif [[ $_ef_pkg_return -eq 1 ]]; then
+                            local _ef_ld_match
+                            _ef_ld_match=$(grep -oiE "(LD_PRELOAD|LD_LIBRARY_PATH|PATH)[[:space:]]*=[[:space:]]*[^[:space:]]+" "$_env_file_path" 2>/dev/null | head -1) || true
+                            if [[ -n "$_ef_ld_match" ]]; then
+                                if [[ "$confidence" != "CRITICAL" ]]; then
+                                    confidence="HIGH"
+                                    finding_matched_pattern="env_file_ld_inject"
+                                    finding_matched_string="$_ef_ld_match"
+                                    log_finding "Systemd service EnvironmentFile contains LD injection: $_env_file_path [$_ef_ld_match]"
+                                fi
+                            fi
+                        fi
+                    elif [[ -n "$_env_file_path" ]] && [[ "$_env_file_path" != -* ]]; then
+                        if [[ "$confidence" == "LOW" ]] || [[ "$confidence" == "MEDIUM" ]]; then
+                            confidence="MEDIUM"
+                            if [[ -z "$finding_matched_pattern" ]]; then
+                                finding_matched_pattern="missing_env_file"
+                                finding_matched_string="$_env_file_path"
+                            fi
+                        fi
+                    fi
+                fi
+
+                # ── OnFailure= directive: runs a service when this one fails ─────
+                # Attackers can add OnFailure= to a trusted service pointing to a
+                # malicious service that triggers on first crash/stop.
+                if [[ -n "$on_failure" ]]; then
+                    IFS=',' read -ra _on_failure_units <<< "$on_failure"
+                    for _of_unit in "${_on_failure_units[@]}"; do
+                        _of_unit="${_of_unit## }"
+                        _of_unit="${_of_unit%% }"
+                        [[ -z "$_of_unit" ]] && continue
+                        local _of_found=false _of_pkg_return=0
+                        local _of_path=""
+                        for _of_dir in /etc/systemd/system /usr/lib/systemd/system /lib/systemd/system; do
+                            if [[ -f "$_of_dir/$_of_unit" ]]; then
+                                _of_path="$_of_dir/$_of_unit"
+                                _of_found=true
+                                break
+                            fi
+                        done
+                        local _of_confidence="MEDIUM"
+                        local _of_pattern="on_failure_service"
+                        local _of_string="$_of_unit"
+                        if [[ "$_of_found" == "false" ]]; then
+                            # OnFailure references a non-existent service - suspicious
+                            _of_confidence="HIGH"
+                            _of_pattern="on_failure_missing_service"
+                            _of_string="$_of_unit (not found)"
+                            log_finding "Systemd service OnFailure= references missing service: $_of_unit ($service_file)"
+                        else
+                            local _of_pkg_status
+                            _of_pkg_status=$(is_package_managed "$_of_path") || _of_pkg_return=$?
+                            if [[ $_of_pkg_return -eq 2 ]]; then
+                                _of_confidence="CRITICAL"
+                                _of_pattern="on_failure_modified_service"
+                                _of_string="$_of_path"
+                                log_finding "Systemd OnFailure= target is MODIFIED package service: $_of_path ($service_file)"
+                            elif [[ $_of_pkg_return -eq 1 ]]; then
+                                _of_confidence="HIGH"
+                                _of_pattern="on_failure_unmanaged_service"
+                                _of_string="$_of_path"
+                                log_finding "Systemd OnFailure= target is unmanaged service: $_of_unit ($service_file)"
+                            fi
+                        fi
+                        if should_include_finding "$_of_confidence" "false"; then
+                            add_finding_new "Systemd OnFailure" "$_of_confidence" "$service_file" "DEFER" \
+                                "$(get_owner_from_metadata "$metadata")" "$(get_permissions_from_metadata "$metadata")" \
+                                "$days_old" "${_of_pkg_status:-unmanaged}" "$on_failure" "$enabled_status" \
+                                "$service_name" "$_of_pattern" "$_of_string"
+                        fi
+                    done
+                fi
+
                 # Extract owner and permissions from metadata
                 local owner=$(get_owner_from_metadata "$metadata")
                 local permissions=$(get_permissions_from_metadata "$metadata")
 
                 # Use new structured format directly (DEFER hash until filtering)
                 # Include matched pattern and string for forensic analysis
-                add_finding_new "Systemd Service" "$confidence" "$service_file" "DEFER" "$owner" "$permissions" "$days_old" "$package_status" "$exec_start" "$enabled_status" "$service_name" "$finding_matched_pattern" "$finding_matched_string"
+                # Append timer schedule info to matched_string if timer-activated
+                local _final_matched_string="$finding_matched_string"
+                [[ -n "$_timer_schedule" ]] && _final_matched_string="${_final_matched_string:+${_final_matched_string}|}timer:${_timer_schedule}"
+                add_finding_new "Systemd Service" "$confidence" "$service_file" "DEFER" "$owner" "$permissions" "$days_old" "$package_status" "$exec_start" "$enabled_status" "$service_name" "$finding_matched_pattern" "$_final_matched_string"
 
             # NOTE: Only scan .service files for persistence detection
             # .socket and .timer files don't contain ExecStart commands - they only
@@ -2011,6 +2613,8 @@ check_systemd() {
             done < <(find "$path" -maxdepth 1 -type f -name "*.service" -print0 2>/dev/null)
         fi
     done
+
+    log_check "Systemd generator scripts"
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Systemd Generator Scripts
@@ -2084,6 +2688,69 @@ check_systemd() {
 
             done < <(find "$gen_dir" -maxdepth 1 -type f -print0 2>/dev/null)
         fi
+    done
+
+    log_check "Systemd .path units"
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Systemd Path Units
+    # .path units trigger service activation on filesystem events (file creation,
+    # modification, etc.) — a stealthy persistence vector that bypasses .timer.
+    # ═══════════════════════════════════════════════════════════════════════════
+    local path_unit_dirs=(
+        "/etc/systemd/system"
+        "/usr/lib/systemd/system"
+        "/lib/systemd/system"
+        "/run/systemd/system"
+    )
+
+    local scanned_path_dirs=()
+    for _pu_dir in "${path_unit_dirs[@]}"; do
+        [[ -d "$_pu_dir" ]] || continue
+        local _pu_real
+        _pu_real=$(realpath "$_pu_dir" 2>/dev/null) || _pu_real="$_pu_dir"
+        local _pu_already=false _pu_prev
+        for _pu_prev in "${scanned_path_dirs[@]}"; do
+            [[ "$_pu_prev" == "$_pu_real" ]] && _pu_already=true && break
+        done
+        "$_pu_already" && continue
+        scanned_path_dirs+=("$_pu_real")
+
+        while IFS= read -r -d '' path_unit_file; do
+            local pu_pkg_status pu_pkg_return=0
+            pu_pkg_status=$(is_package_managed "$path_unit_file") || pu_pkg_return=$?
+            [[ $pu_pkg_return -eq 0 ]] && continue  # Verified package .path unit — skip
+
+            local pu_metadata
+            pu_metadata=$(get_file_metadata "$path_unit_file") || true
+            local pu_mod_time=0
+            [[ "$pu_metadata" =~ modified:([0-9]+) ]] && pu_mod_time="${BASH_REMATCH[1]}"
+            local pu_days_old=$(( (SCAN_EPOCH - pu_mod_time) / 86400 ))
+
+            local pu_confidence="HIGH"
+            local pu_pattern="unmanaged_path_unit"
+            local pu_string="$path_unit_file"
+            local pu_activated_unit=""
+            pu_activated_unit=$(grep -E "^Unit=" "$path_unit_file" 2>/dev/null | cut -d'=' -f2- | head -1) || true
+
+            if [[ $pu_pkg_return -eq 2 ]]; then
+                pu_confidence="CRITICAL"
+                pu_pattern="modified_path_unit"
+                log_finding "Systemd .path unit is MODIFIED package file: $path_unit_file"
+            elif [[ "$path_unit_file" =~ ^/(tmp|run/|dev/shm|var/tmp) ]]; then
+                pu_confidence="CRITICAL"
+                pu_pattern="suspicious_location_path_unit"
+                log_finding "Systemd .path unit in suspicious location: $path_unit_file"
+            else
+                log_finding "Unmanaged systemd .path unit: $path_unit_file (activates: ${pu_activated_unit:-unknown})"
+            fi
+
+            add_finding_new "Systemd PathUnit" "$pu_confidence" "$path_unit_file" "DEFER" \
+                "$(get_owner_from_metadata "$pu_metadata")" "$(get_permissions_from_metadata "$pu_metadata")" \
+                "$pu_days_old" "$pu_pkg_status" "${pu_activated_unit}" "" \
+                "$(basename "$path_unit_file")" "$pu_pattern" "$pu_string"
+
+        done < <(find "$_pu_dir" -maxdepth 1 -type f -name "*.path" -print0 2>/dev/null)
     done
 }
 
@@ -2177,7 +2844,7 @@ analyze_cron_command() {
             if [[ "$cron_command" =~ \ -[ce]\  ]] || [[ "$cron_command" =~ \ -[ce]$ ]] || [[ "$cron_command" =~ [[:space:]](-S|--split-string)([[:space:]]|$) ]]; then
                 # FLOW-3 fix: check if the interpreter ITSELF is in a suspicious location
                 # (e.g. /tmp/bash -c 'code' should flag the interpreter, not just the code)
-                if [[ "$executable" =~ ^/(tmp|dev/shm|var/tmp) ]] || [[ "$executable" =~ /\.[a-z] ]]; then
+                if [[ "$executable" =~ ^/(tmp|dev/shm|var/tmp) ]] || [[ "$executable" =~ /\.[[:alpha:]] ]]; then
                     CRON_ANALYSIS_REASON="suspicious_interpreter_location:$executable"
                     return 0
                 fi
@@ -2258,7 +2925,7 @@ analyze_cron_command() {
 
 # Check cron jobs
 check_cron() {
-    log_info "[2/7] Checking cron jobs and scheduled tasks..."
+    log_info "[2/9] Checking cron jobs and scheduled tasks..."
 
     # ═══════════════════════════════════════════════════════════════════════════
     # ALL CRON FILES: Same detection logic
@@ -2287,6 +2954,8 @@ check_cron() {
         "/etc/cron.monthly"
     )
 
+    log_check "/etc/crontab"
+
     # ─────────────────────────────────────────────────────────────────────────
     # Process /etc/crontab
     # ─────────────────────────────────────────────────────────────────────────
@@ -2309,7 +2978,7 @@ check_cron() {
             local metadata
             metadata=$(get_file_metadata "$cron_path") || true
             local content
-            content=$(grep -Ev "^#|^$" "$cron_path" 2>/dev/null | head -20) || true
+            content=$(grep -Ev "^#|^$" "$cron_path" 2>/dev/null | head -200) || true
             local confidence="MEDIUM"
             local finding_matched_pattern=""
             local finding_matched_string=""
@@ -2326,7 +2995,15 @@ check_cron() {
             while IFS= read -r cron_line; do
                 [[ -z "$cron_line" ]] && continue
                 local cron_command
-                cron_command=$(echo "$cron_line" | awk '{for(i=7;i<=NF;i++) printf "%s ", $i; print ""}') || true
+                # @special entries: "@reboot username command..." — command starts at field 3
+                # timed entries:    "* * * * * username command..." — command starts at field 7
+                local _cf; read -ra _cf <<< "$cron_line"
+                if [[ "$cron_line" =~ ^@ ]]; then
+                    cron_command="${_cf[*]:2}"
+                else
+                    cron_command="${_cf[*]:6}"
+                fi
+                cron_command="${cron_command%"${cron_command##*[![:space:]]}"}"
                 if analyze_cron_command "$cron_command" "$cron_path"; then
                     [[ "$confidence" != "CRITICAL" ]] && confidence="HIGH"
                     # Extract pattern and string from CRON_ANALYSIS_REASON (format: pattern:value)
@@ -2339,6 +3016,8 @@ check_cron() {
             add_finding "Cron" "System" "crontab_file" "$cron_path" "System crontab" "$confidence" "$hash" "$metadata" "entries=$(echo "$content" | wc -l)|package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
         fi
     done
+
+    log_check "Crontab directories (cron.d, spool)"
 
     # ─────────────────────────────────────────────────────────────────────────
     # Process crontab directories (/etc/cron.d, /var/spool/cron/*)
@@ -2362,7 +3041,7 @@ check_cron() {
                 local metadata
                 metadata=$(get_file_metadata "$cron_file") || true
                 local content
-                content=$(grep -Ev "^#|^$" "$cron_file" 2>/dev/null | head -20) || true
+                content=$(grep -Ev "^#|^$" "$cron_file" 2>/dev/null | head -200) || true
                 local confidence="MEDIUM"
                 local finding_matched_pattern=""
                 local finding_matched_string=""
@@ -2379,7 +3058,15 @@ check_cron() {
                 while IFS= read -r cron_line; do
                     [[ -z "$cron_line" ]] && continue
                     local cron_command
-                    cron_command=$(echo "$cron_line" | awk '{for(i=7;i<=NF;i++) printf "%s ", $i; print ""}') || true
+                    # @special entries: "@reboot username command..." — command starts at field 3
+                    # timed entries:    "* * * * * username command..." — command starts at field 7
+                    local _cf; read -ra _cf <<< "$cron_line"
+                    if [[ "$cron_line" =~ ^@ ]]; then
+                        cron_command="${_cf[*]:2}"
+                    else
+                        cron_command="${_cf[*]:6}"
+                    fi
+                    cron_command="${cron_command%"${cron_command##*[![:space:]]}"}"
                     if analyze_cron_command "$cron_command" "$cron_file"; then
                         [[ "$confidence" != "CRITICAL" ]] && confidence="HIGH"
                         finding_matched_pattern="${CRON_ANALYSIS_REASON%%:*}"
@@ -2390,9 +3077,11 @@ check_cron() {
 
                 add_finding "Cron" "System" "crontab_file" "$cron_file" "Crontab: $(basename "$cron_file")" "$confidence" "$hash" "$metadata" "package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
 
-            done < <(find "$cron_dir" -type f -print0 2>/dev/null)
+            done < <(find "$cron_dir" \( -type f -o -type l \) -print0 2>/dev/null)
         fi
     done
+
+    log_check "Periodic cron directories (daily/hourly/weekly/monthly)"
 
     # ─────────────────────────────────────────────────────────────────────────
     # Process cron script directories (/etc/cron.daily, hourly, weekly, monthly)
@@ -2434,12 +3123,7 @@ check_cron() {
                     local current_time=$SCAN_EPOCH
                     local days_old=$(( (current_time - mod_time) / 86400 ))
 
-                    if [[ $days_old -lt 7 ]]; then
-                        confidence="HIGH"
-                        finding_matched_pattern="recently_created"
-                        finding_matched_string="${days_old} days old"
-                        log_finding "Recently created cron script: $cron_script (${days_old} days old)"
-                    fi
+                    # (time-based elevation removed — no baseline context)
 
                     if [[ "$cron_script" =~ \.(tmp|bak|old)$ ]] || [[ "$(basename "$cron_script")" =~ ^\. ]]; then
                         confidence="HIGH"
@@ -2462,11 +3146,13 @@ check_cron() {
         fi
     done
 
+    log_check "User crontabs"
+
     # User crontabs
     # Analyze each entry with the full execution chain (same flow as /etc/crontab and /etc/cron.d)
     if [[ $EUID_CHECK -eq 0 ]]; then
         while IFS=: read -r username _ uid _; do
-            if [[ $uid -ge 0 ]]; then
+            if [[ $uid -ge 1000 ]] || [[ $uid -eq 0 ]]; then
                 local user_cron
                 user_cron=$(crontab -u "$username" -l 2>/dev/null || echo "")
                 if [[ -n "$user_cron" ]]; then
@@ -2482,10 +3168,11 @@ check_cron() {
 
                         # Extract command column: @special uses field 2+, timed entries field 6+
                         local cron_command
+                        local _cf; read -ra _cf <<< "$cron_line"
                         if [[ "$cron_line" =~ ^@ ]]; then
-                            cron_command=$(echo "$cron_line" | awk '{for(i=2;i<=NF;i++) printf "%s ", $i; print ""}') || true
+                            cron_command="${_cf[*]:1}"
                         else
-                            cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}') || true
+                            cron_command="${_cf[*]:5}"
                         fi
                         cron_command="${cron_command%"${cron_command##*[![:space:]]}"}"  # rtrim
 
@@ -2516,10 +3203,11 @@ check_cron() {
                 [[ "$cron_line" =~ ^[A-Z_]+= ]] && continue
 
                 local cron_command
+                local _cf; read -ra _cf <<< "$cron_line"
                 if [[ "$cron_line" =~ ^@ ]]; then
-                    cron_command=$(echo "$cron_line" | awk '{for(i=2;i<=NF;i++) printf "%s ", $i; print ""}') || true
+                    cron_command="${_cf[*]:1}"
                 else
-                    cron_command=$(echo "$cron_line" | awk '{for(i=6;i<=NF;i++) printf "%s ", $i; print ""}') || true
+                    cron_command="${_cf[*]:5}"
                 fi
                 cron_command="${cron_command%"${cron_command##*[![:space:]]}"}"
 
@@ -2534,6 +3222,8 @@ check_cron() {
             add_finding "Cron" "User" "user_crontab" "~/.crontab" "Current user crontab" "$confidence" "N/A" "user=$(whoami)" "preview=${user_cron:0:100}" "$finding_matched_pattern" "$finding_matched_string"
         fi
     fi
+
+    log_check "At jobs (atq + spool)"
 
     # Check at jobs - two methods:
     # 1. atq + at -c: standard, but atq can be tampered on compromised systems
@@ -2609,9 +3299,10 @@ check_cron() {
                 local in_atq=false
                 if [[ ${#atq_job_ids[@]} -gt 0 ]]; then
                     for known_id in "${atq_job_ids[@]}"; do
-                        # At spool files are named with the job ID embedded (format varies by system)
-                        # Check if numeric job ID matches anywhere in spool filename
-                        if [[ "$spool_name" == *"$known_id"* ]]; then
+                        # At spool files embed the job ID (format varies: "a0000001", "=a01", etc.)
+                        # Use boundary-aware regex: match zero-padded job ID bounded by non-digits
+                        # to prevent "1" matching "10", "12", "21", etc. (substring false positive)
+                        if echo "$spool_name" | grep -qE "(^|[^0-9])0*${known_id}([^0-9]|$)"; then
                             in_atq=true
                             break
                         fi
@@ -2652,6 +3343,8 @@ check_cron() {
         fi
     done
 
+    log_check "Anacron (/etc/anacrontab)"
+
     # Check anacron (/etc/anacrontab) - persistent jobs for machines that may be powered off
     # Anacron guarantees job execution even after missed runs - a stealth persistence vector
     if [[ -f "/etc/anacrontab" ]]; then
@@ -2686,11 +3379,45 @@ check_cron() {
             add_finding "Cron" "Anacron" "anacrontab" "/etc/anacrontab" "Anacron scheduled jobs" "$confidence" "DEFER" "$metadata" "package=$pkg_status" "$finding_matched_pattern" "$finding_matched_string"
         fi
     fi
+
+    log_check "cron.allow / cron.deny ACL files"
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # cron.allow / cron.deny — ACL files controlling who may use cron.
+    # Tampered to allow unauthorized accounts = privilege escalation path.
+    # ─────────────────────────────────────────────────────────────────────────
+    local cron_acl_files=( "/etc/cron.allow" "/etc/cron.deny" )
+    for _ca_file in "${cron_acl_files[@]}"; do
+        [[ -f "$_ca_file" ]] || continue
+        local _ca_hash _ca_meta _ca_pkg_status _ca_pkg_return=0
+        _ca_hash=$(get_file_hash "$_ca_file") || true
+        _ca_meta=$(get_file_metadata "$_ca_file") || true
+        _ca_pkg_status=$(is_package_managed "$_ca_file") || _ca_pkg_return=$?
+
+        local _ca_confidence="MEDIUM"
+        local _ca_pattern="cron_acl_file"
+        local _ca_string="$_ca_file"
+
+        if [[ $_ca_pkg_return -eq 2 ]]; then
+            _ca_confidence="CRITICAL"
+            _ca_pattern="modified_cron_acl"
+            _ca_string="$_ca_file"
+            log_finding "Cron ACL file is MODIFIED package file: $_ca_file"
+        elif [[ $_ca_pkg_return -eq 0 ]]; then
+            _ca_confidence="LOW"
+            _ca_pattern="verified_cron_acl"
+        else
+            log_finding "Unmanaged cron ACL file: $_ca_file"
+        fi
+
+        add_finding "Cron" "ACL" "cron_acl" "$_ca_file" "Cron access control: $(basename "$_ca_file")" \
+            "$_ca_confidence" "$_ca_hash" "$_ca_meta" "package=$_ca_pkg_status" "$_ca_pattern" "$_ca_string"
+    done
 }
 
 # Check shell profiles and RC files
 check_shell_profiles() {
-    log_info "[3/7] Checking shell profiles and RC files..."
+    log_info "[3/9] Checking shell profiles and RC files..."
 
     local profile_files=(
         "/etc/profile"
@@ -2704,6 +3431,8 @@ check_shell_profiles() {
         "/etc/zsh/zlogin"      # Zsh login shell post-zshrc
         "/etc/fish/config.fish"
     )
+
+    log_check "System-wide shell profiles"
 
     # System-wide profiles
     for profile in "${profile_files[@]}"; do
@@ -2733,16 +3462,10 @@ check_shell_profiles() {
                 package_status=$(is_package_managed "$profile") || true
                 confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
-                # ISC-C5 FIX: Time-based elevation for recently modified profiles
+                # (time-based elevation removed — no baseline context)
                 local mod_time=0
                 [[ "$metadata" =~ modified:([0-9]+) ]] && mod_time="${BASH_REMATCH[1]}"
                 local days_old=$(( (SCAN_EPOCH - mod_time) / 86400 ))
-                if [[ $days_old -lt 7 ]] && [[ "$confidence" == "MEDIUM" ]]; then
-                    confidence="HIGH"
-                    finding_matched_pattern="${finding_matched_pattern:-recent_modification}"
-                    finding_matched_string="${finding_matched_string:-${days_old} days old}"
-                    log_finding "Recently modified system profile: $profile (${days_old} days old)"
-                fi
 
                 add_finding "ShellProfile" "System" "profile_file" "$profile" "System shell profile" "$confidence" "$hash" "$metadata" "days_old=${days_old};package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
 
@@ -2772,16 +3495,10 @@ check_shell_profiles() {
                     package_status=$(is_package_managed "$profile_file") || true
                     confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
-                    # ISC-C5 FIX: Time-based elevation for recently modified profile.d scripts
+                    # (time-based elevation removed — no baseline context)
                     local mod_time=0
                     [[ "$metadata" =~ modified:([0-9]+) ]] && mod_time="${BASH_REMATCH[1]}"
                     local days_old=$(( (SCAN_EPOCH - mod_time) / 86400 ))
-                    if [[ $days_old -lt 7 ]] && [[ "$confidence" == "MEDIUM" ]]; then
-                        confidence="HIGH"
-                        finding_matched_pattern="${finding_matched_pattern:-recent_modification}"
-                        finding_matched_string="${finding_matched_string:-${days_old} days old}"
-                        log_finding "Recently modified profile.d script: $profile_file (${days_old} days old)"
-                    fi
 
                     add_finding "ShellProfile" "System" "profile_script" "$profile_file" "Profile.d script: $(basename "$profile_file")" "$confidence" "$hash" "$metadata" "days_old=${days_old};package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
 
@@ -2789,6 +3506,8 @@ check_shell_profiles() {
             fi
         fi
     done
+
+    log_check "User shell profiles"
 
     # User profiles
     local user_profiles=(
@@ -2807,7 +3526,7 @@ check_shell_profiles() {
     # Check for all users if root
     if [[ $EUID_CHECK -eq 0 ]]; then
         while IFS=: read -r username _ uid _ _ homedir _; do
-            if [[ $uid -ge 0 ]]; then
+            if [[ $uid -ge 1000 ]] || [[ $uid -eq 0 ]]; then
                 for user_profile in "${user_profiles[@]}"; do
                     local profile_path="$homedir/$user_profile"
                     if [[ -f "$profile_path" ]]; then
@@ -2835,16 +3554,10 @@ check_shell_profiles() {
                         package_status=$(is_package_managed "$profile_path") || true
                         confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
-                        # ISC-C5 FIX: Time-based elevation for recently modified user profiles
+                        # (time-based elevation removed — no baseline context)
                         local mod_time=0
                         [[ "$metadata" =~ modified:([0-9]+) ]] && mod_time="${BASH_REMATCH[1]}"
                         local days_old=$(( (SCAN_EPOCH - mod_time) / 86400 ))
-                        if [[ $days_old -lt 7 ]] && [[ "$confidence" == "MEDIUM" ]]; then
-                            confidence="HIGH"
-                            finding_matched_pattern="${finding_matched_pattern:-recent_modification}"
-                            finding_matched_string="${finding_matched_string:-${days_old} days old}"
-                            log_finding "Recently modified user profile: $profile_path (${days_old} days old, user: $username)"
-                        fi
 
                         add_finding "ShellProfile" "User" "user_profile" "$profile_path" "User profile for $username" "$confidence" "$hash" "$metadata" "days_old=${days_old};user=$username;package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
                     fi
@@ -2878,16 +3591,10 @@ check_shell_profiles() {
                 package_status=$(is_package_managed "$profile_path") || true
                 confidence=$(adjust_confidence_for_package "$confidence" "$package_status")
 
-                # ISC-C5 FIX: Time-based elevation for recently modified non-root user profiles
+                # (time-based elevation removed — no baseline context)
                 local mod_time=0
                 [[ "$metadata" =~ modified:([0-9]+) ]] && mod_time="${BASH_REMATCH[1]}"
                 local days_old=$(( (SCAN_EPOCH - mod_time) / 86400 ))
-                if [[ $days_old -lt 7 ]] && [[ "$confidence" == "MEDIUM" ]]; then
-                    confidence="HIGH"
-                    finding_matched_pattern="${finding_matched_pattern:-recent_modification}"
-                    finding_matched_string="${finding_matched_string:-${days_old} days old}"
-                    log_finding "Recently modified user profile: $profile_path (${days_old} days old)"
-                fi
 
                 add_finding "ShellProfile" "User" "user_profile" "$profile_path" "Current user profile" "$confidence" "$hash" "$metadata" "days_old=${days_old};user=$(whoami);package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
             fi
@@ -2897,7 +3604,9 @@ check_shell_profiles() {
 
 # Check init scripts and rc.local
 check_init_scripts() {
-    log_info "[4/7] Checking init scripts and rc.local..."
+    log_info "[4/9] Checking init scripts and rc.local..."
+
+    log_check "rc.local startup scripts"
 
     # ═══════════════════════════════════════════════════════════════════════════
     # TYPE 1: rc.local files (typically NOT package-managed, always analyze)
@@ -2943,6 +3652,8 @@ check_init_scripts() {
             add_finding "Init" "RcLocal" "rc_local" "$rc_local" "rc.local startup script" "$confidence" "$hash" "$metadata" "package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
         fi
     done
+
+    log_check "SysV init.d scripts"
 
     # ═══════════════════════════════════════════════════════════════════════════
     # TYPE 2: /etc/init.d scripts (often package-managed)
@@ -3000,8 +3711,10 @@ check_init_scripts() {
 
             add_finding "Init" "Script" "init_script" "$init_file" "Init script: $(basename "$init_file")" "$confidence" "$hash" "$metadata" "package=$package_status" "$finding_matched_pattern" "$finding_matched_string"
 
-        done < <(find "/etc/init.d" -maxdepth 1 -type f -print0 2>/dev/null)
+        done < <(find "/etc/init.d" -maxdepth 1 \( -type f -o -type l \) -print0 2>/dev/null)
     fi
+
+    log_check "Runlevel scripts (rc*.d symlinks)"
 
     # ═══════════════════════════════════════════════════════════════════════════
     # TYPE 3: /etc/rc*.d directories (runlevel symlinks)
@@ -3083,13 +3796,15 @@ check_init_scripts() {
 
 # Check kernel modules and library preloading
 check_kernel_and_preload() {
-    log_info "[5/7] Checking kernel modules and library preloading..."
+    log_info "[5/9] Checking kernel modules and library preloading..."
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Suspicious locations for libraries/modules - these should NEVER contain
     # legitimate system libraries or kernel modules
     # ═══════════════════════════════════════════════════════════════════════════
     local suspicious_locations_pattern="^/(tmp|dev/shm|var/tmp|home|root)/|/\."
+
+    log_check "ld.so.preload library injection"
 
     # ═══════════════════════════════════════════════════════════════════════════
     # TYPE 1: /etc/ld.so.preload - Libraries loaded into ALL processes
@@ -3151,6 +3866,8 @@ check_kernel_and_preload() {
             done <<< "$preload_content"
         fi
     fi
+
+    log_check "ld.so.conf dynamic linker configuration"
 
     # ═══════════════════════════════════════════════════════════════════════════
     # TYPE 2: /etc/ld.so.conf and /etc/ld.so.conf.d/* - Library search paths
@@ -3261,6 +3978,8 @@ check_kernel_and_preload() {
         done < <(find "$_lddir" -maxdepth 1 -name "*.so*" \( -type f -o -type l \) -print0 2>/dev/null)
     done
 
+    log_check "Loaded kernel modules (lsmod)"
+
     # ═══════════════════════════════════════════════════════════════════════════
     # TYPE 3: Loaded kernel modules - verify each module file
     # ═══════════════════════════════════════════════════════════════════════════
@@ -3341,6 +4060,8 @@ check_kernel_and_preload() {
 
         done < <(lsmod 2>/dev/null | tail -n +2)
     fi
+
+    log_check "/etc/modules and modules-load.d auto-load configs"
 
     # ═══════════════════════════════════════════════════════════════════════════
     # TYPE 4: Kernel module auto-loading configs
@@ -3455,6 +4176,8 @@ check_kernel_and_preload() {
             fi
         done < <(grep -vE "^#|^$" "$mod_config" 2>/dev/null)
     done
+
+    log_check "modprobe.d kernel module parameters"
 
     # ═══════════════════════════════════════════════════════════════════════════
     # TYPE 5: /etc/modprobe.d/ and /etc/modprobe.conf — kernel module parameters
@@ -3586,7 +4309,9 @@ check_kernel_and_preload() {
 
 # Check additional persistence locations
 check_additional_persistence() {
-    log_info "[6/7] Checking additional persistence mechanisms..."
+    log_info "[6/9] Checking additional persistence mechanisms..."
+
+    log_check "XDG autostart entries"
 
     # XDG autostart
     local autostart_dirs=(
@@ -3596,10 +4321,12 @@ check_additional_persistence() {
 
     # When running as root, scan all users' XDG autostart directories
     if [[ $EUID_CHECK -eq 0 ]]; then
-        while IFS=: read -r _ _ _ _ _ homedir _; do
-            local _user_autostart="$homedir/.config/autostart"
-            if [[ "$_user_autostart" != "$HOME/.config/autostart" ]] && [[ -d "$_user_autostart" ]]; then
-                autostart_dirs+=("$_user_autostart")
+        while IFS=: read -r _ _ xdg_uid _ _ homedir _; do
+            if [[ $xdg_uid -ge 1000 ]] || [[ $xdg_uid -eq 0 ]]; then
+                local _user_autostart="$homedir/.config/autostart"
+                if [[ "$_user_autostart" != "$HOME/.config/autostart" ]] && [[ -d "$_user_autostart" ]]; then
+                    autostart_dirs+=("$_user_autostart")
+                fi
             fi
         done < /etc/passwd
     fi
@@ -3755,6 +4482,8 @@ check_additional_persistence() {
         fi
     done
 
+    log_check "/etc/environment LD_PRELOAD / LD_LIBRARY_PATH"
+
     # Check /etc/environment
     if [[ -f "/etc/environment" ]]; then
         local hash=$(get_file_hash "/etc/environment")
@@ -3812,6 +4541,8 @@ check_additional_persistence() {
         done
     fi
 
+    log_check "Sudoers configuration"
+
     # Check sudoers for persistence
     if [[ $EUID_CHECK -eq 0 ]]; then
         if [[ -f "/etc/sudoers" ]]; then
@@ -3854,6 +4585,8 @@ check_additional_persistence() {
             done < <(find /etc/sudoers.d -type f -print0 2>/dev/null)
         fi
     fi
+
+    log_check "PAM modules and configuration"
 
     # Check for PAM backdoors
     # Verify actual PAM module .so files, not just config references
@@ -4372,6 +5105,8 @@ check_additional_persistence() {
         fi
     fi
 
+    log_check "MOTD update scripts"
+
     # Check MOTD scripts
     local motd_dirs=(
         "/etc/update-motd.d"
@@ -4422,13 +5157,67 @@ check_additional_persistence() {
             done < <(find "$motd_dir" -type f -print0 2>/dev/null)
         fi
     done
+
+    # ─── Passwd: UID 0 duplicate accounts ────────────────────────────────────
+    log_check "Duplicate UID 0 accounts in /etc/passwd"
+
+    if [[ -r /etc/passwd ]]; then
+        while IFS=: read -r _pw_user _ _pw_uid _ _ _pw_home _pw_shell; do
+            if [[ "$_pw_uid" -eq 0 ]] && [[ "$_pw_user" != "root" ]]; then
+                local _hash; _hash=$(get_file_hash /etc/passwd)
+                local _meta; _meta=$(get_file_metadata /etc/passwd)
+                add_finding "UserAccount" "Passwd" "non_root_uid_zero" "/etc/passwd" "Non-root UID 0 account: $_pw_user" "CRITICAL" "$_hash" "$_meta" "uid=$_pw_uid|home=$_pw_home" "non_root_uid_zero" "user=$_pw_user;uid=0"
+                log_finding "Non-root account with UID 0: $_pw_user (home: $_pw_home)"
+            fi
+        done < /etc/passwd
+    fi
+
+    # ─── Passwd: Shell masking (trailing space) ────────────────────────────
+    log_check "Shell masking via trailing space in /etc/passwd"
+
+    if [[ -r /etc/passwd ]]; then
+        local _shells_list=()
+        if [[ -r /etc/shells ]]; then
+            while IFS= read -r _sl; do
+                [[ "$_sl" =~ ^# ]] && continue
+                [[ -z "$_sl" ]] && continue
+                _shells_list+=("$_sl")
+            done < /etc/shells
+        fi
+
+        while IFS=: read -r _sm_user _ _sm_uid _ _ _sm_home _sm_shell; do
+            # Check for trailing whitespace in shell field
+            if [[ "$_sm_shell" =~ [[:space:]]$ ]]; then
+                local _hash; _hash=$(get_file_hash /etc/passwd)
+                local _meta; _meta=$(get_file_metadata /etc/passwd)
+                add_finding "UserAccount" "Passwd" "shell_masking_trailing_space" "/etc/passwd" "Shell masking (trailing space): $_sm_user" "HIGH" "$_hash" "$_meta" "uid=$_sm_uid|shell='${_sm_shell}'" "shell_trailing_space" "user=$_sm_user;shell_raw='${_sm_shell}'"
+                log_finding "Shell masking via trailing space: user=$_sm_user shell='${_sm_shell}'"
+            fi
+
+            # Check for non-standard shell (not in /etc/shells, not nologin/false)
+            if [[ ${#_shells_list[@]} -gt 0 ]]; then
+                local _shell_trimmed="${_sm_shell%"${_sm_shell##*[! ]}"}"
+                local _is_valid=false
+                for _valid_shell in "${_shells_list[@]}"; do
+                    [[ "$_shell_trimmed" == "$_valid_shell" ]] && _is_valid=true && break
+                done
+                if [[ "$_is_valid" == "false" ]] && [[ "$_shell_trimmed" != "/bin/false" ]] && [[ "$_shell_trimmed" != "/usr/sbin/nologin" ]] && [[ "$_shell_trimmed" != "/sbin/nologin" ]] && [[ -n "$_shell_trimmed" ]]; then
+                    local _hash; _hash=$(get_file_hash /etc/passwd)
+                    local _meta; _meta=$(get_file_metadata /etc/passwd)
+                    add_finding "UserAccount" "Passwd" "nonstandard_shell" "/etc/passwd" "Non-standard shell: $_sm_user" "MEDIUM" "$_hash" "$_meta" "uid=$_sm_uid|shell=$_shell_trimmed" "nonstandard_shell" "user=$_sm_user;shell=$_shell_trimmed"
+                fi
+            fi
+        done < /etc/passwd
+    fi
+
 }
 
 # Check common backdoor locations (inspired by Crackdown and DFIR research)
 check_common_backdoors() {
-    log_info "[7/7] Checking common backdoor locations..."
+    log_info "[7/9] Checking common backdoor locations..."
 
     # APT/YUM configuration files that can be abused
+    log_check "APT/YUM package manager configuration files"
     local pkg_mgr_configs=(
         "/etc/apt/apt.conf.d"
         "/usr/share/unattended-upgrades"
@@ -4476,6 +5265,49 @@ check_common_backdoors() {
             fi
         fi
     done
+
+    # ─── APT Post-Invoke / Pre-Invoke hook directives ─────────────────────────
+    log_check "APT DPkg::Post-Invoke and APT::Update hook directives"
+
+    if [[ -d "/etc/apt/apt.conf.d" ]]; then
+        while IFS= read -r -d '' _apt_conf; do
+            local _content
+            _content=$(cat "$_apt_conf" 2>/dev/null | tr -d '\0') || true
+
+            # Parse DPkg::Post-Invoke and APT::Update::Pre-Invoke / Post-Invoke
+            local _hook_hit
+            _hook_hit=$(grep -iE '(DPkg::(Post|Pre)-Invoke|APT::Update::(Pre|Post)-Invoke)' <<< "$_content" | grep -v "^[[:space:]]*#" | head -3) || true
+
+            [[ -z "$_hook_hit" ]] && continue
+
+            local _hash; _hash=$(get_file_hash "$_apt_conf")
+            local _meta; _meta=$(get_file_metadata "$_apt_conf")
+            check_file_package "$_apt_conf"
+            local _pkg="$PKG_STATUS"
+
+            local _confidence="MEDIUM"
+            local _matched_pattern="apt_hook_directive"
+            local _matched_string="${_hook_hit:0:200}"
+
+            [[ "$_pkg" == "unmanaged" ]] && _confidence="HIGH"
+
+            # Extract and analyze the hook command string
+            local _hook_cmd
+            _hook_cmd=$(grep -oiE '"[^"]+"[[:space:]]*;' <<< "$_hook_hit" | tr -d '"' | tr -d ';' | head -1) || true
+            if [[ -n "$_hook_cmd" ]] && analyze_content_string "$_hook_cmd" "$_apt_conf"; then
+                _confidence="CRITICAL"
+                _matched_pattern="apt_hook_malicious_command"
+                _matched_string="$MATCHED_STRING"
+                log_finding "APT hook directive with malicious command: $_apt_conf"
+            else
+                log_finding "APT hook directive found: $_apt_conf"
+            fi
+
+            add_finding "PackageManager" "AptHook" "apt_hook_directive" "$_apt_conf" "APT hook: $(basename "$_apt_conf")" "$_confidence" "$_hash" "$_meta" "package=$_pkg" "$_matched_pattern" "$_matched_string"
+        done < <(find /etc/apt/apt.conf.d -maxdepth 1 -type f -print0 2>/dev/null)
+    fi
+
+    log_check "YUM/DNF plugin configurations and scripts"
 
     # ═══════════════════════════════════════════════════════════════════════════
     # YUM / DNF Plugin persistence
@@ -4562,6 +5394,8 @@ check_common_backdoors() {
         done < <(find "$_ypcd" -type f -name "*.conf" -print0 2>/dev/null)
     done
 
+    log_check "DPKG postinst scripts (/var/lib/dpkg/info/*.postinst)"
+
     # ═══════════════════════════════════════════════════════════════════════════
     # DPKG postinst scripts  (/var/lib/dpkg/info/*.postinst)
     # Every installed Debian package can ship a post-install shell script that
@@ -4588,6 +5422,19 @@ check_common_backdoors() {
     # ═══════════════════════════════════════════════════════════════════════════
     local dpkg_info_dir="/var/lib/dpkg/info"
     if [[ -d "$dpkg_info_dir" ]]; then
+        # Pre-build installed package set with ONE bulk dpkg-query call (timeout 10).
+        # Avoids 400-800 sequential dpkg-query forks that block if apt holds the dpkg lock.
+        local -A _dpkg_installed_pkgs=()
+        if command -v dpkg-query &>/dev/null; then
+            while IFS=$'\t' read -r _dp _ds; do
+                [[ "$_ds" == *"install ok installed"* ]] && _dpkg_installed_pkgs["$_dp"]=1
+            done < <(timeout 10 dpkg-query -W -f='${Package}\t${Status}\n' 2>/dev/null)
+        fi
+
+        if [[ ${#_dpkg_installed_pkgs[@]} -eq 0 ]] && command -v dpkg-query &>/dev/null; then
+            log_warn "dpkg-query returned no packages (apt lock held or timeout) — skipping postinst orphan check"
+        fi
+
         while IFS= read -r -d '' _postinst; do
             local _pi_confidence="LOW"
             local _pi_pattern="" _pi_string=""
@@ -4598,15 +5445,11 @@ check_common_backdoors() {
             _pi_pkgname=$(basename "$_postinst" .postinst)
             _pi_pkgname="${_pi_pkgname%%:*}"   # strip :arch suffix (e.g. bash:amd64 → bash)
 
-            if command -v dpkg-query &>/dev/null; then
-                local _pi_status
-                _pi_status=$(dpkg-query -W -f='${Status}' "$_pi_pkgname" 2>/dev/null || echo "")
-                if [[ "$_pi_status" != *"install ok installed"* ]]; then
-                    _pi_is_orphan=true
-                    _pi_confidence="MEDIUM"
-                    _pi_pattern="orphan_postinst"
-                    _pi_string="package $_pi_pkgname not installed"
-                fi
+            if [[ ${#_dpkg_installed_pkgs[@]} -gt 0 ]] && [[ -z "${_dpkg_installed_pkgs[$_pi_pkgname]+isset}" ]]; then
+                _pi_is_orphan=true
+                _pi_confidence="MEDIUM"
+                _pi_pattern="orphan_postinst"
+                _pi_string="package $_pi_pkgname not installed"
             fi
 
             # ── Signal 2: Focused content analysis ────────────────────────
@@ -4696,7 +5539,7 @@ check_common_backdoors() {
     # ═══════════════════════════════════════════════════════════════════════════
     if command -v rpm &>/dev/null; then
         local _rpm_tmp="$TEMP_DATA/rpm_scripts.txt"
-        rpm -qa --scripts 2>/dev/null > "$_rpm_tmp" || true
+        timeout 30 rpm -qa --scripts 2>/dev/null > "$_rpm_tmp" || true
 
         if [[ -s "$_rpm_tmp" ]]; then
             local _rpm_pkg="" _in_post=false _post_buf=""
@@ -4739,6 +5582,8 @@ check_common_backdoors() {
         rm -f "$_rpm_tmp" 2>/dev/null || true
     fi
 
+    log_check "at.allow / at.deny access control files"
+
     # Check at.allow and at.deny
     local at_files=(
         "/etc/at.allow"
@@ -4753,6 +5598,8 @@ check_common_backdoors() {
             add_finding "Scheduled" "AtAccess" "at_access" "$at_file" "At access control: $(basename "$at_file")" "MEDIUM" "$hash" "$metadata" ""
         fi
     done
+
+    log_check "doas.conf (OpenBSD-style sudo alternative)"
 
     # Check doas configuration (OpenBSD-style sudo alternative)
     if [[ -f "/etc/doas.conf" ]]; then
@@ -4774,15 +5621,17 @@ check_common_backdoors() {
         add_finding "Privilege" "Doas" "doas_config" "/etc/doas.conf" "Doas privilege escalation config" "$confidence" "$hash" "$metadata" "" "$finding_matched_pattern" "$finding_matched_string"
     fi
 
+    log_check "User git configs (credential helpers and hooks)"
+
     # Check for user git configs (can contain credential helpers or hooks)
     if [[ $EUID_CHECK -eq 0 ]]; then
         while IFS=: read -r username _ uid _ _ homedir _; do
-            if [[ $uid -ge 0 ]]; then
+            if [[ $uid -ge 1000 ]] || [[ $uid -eq 0 ]]; then
                 local gitconfig="$homedir/.gitconfig"
                 if [[ -f "$gitconfig" ]]; then
                     local hash=$(get_file_hash "$gitconfig")
                     local metadata=$(get_file_metadata "$gitconfig")
-                    local content=$(cat "$gitconfig" 2>/dev/null || echo "")
+                    local content=$(<"$gitconfig" 2>/dev/null || echo "")
 
                     local confidence="LOW"
                     local finding_matched_pattern=""
@@ -4808,7 +5657,7 @@ check_common_backdoors() {
         if [[ -f "$HOME/.gitconfig" ]]; then
             local hash=$(get_file_hash "$HOME/.gitconfig")
             local metadata=$(get_file_metadata "$HOME/.gitconfig")
-            local content=$(cat "$HOME/.gitconfig" 2>/dev/null || echo "")
+            local content=$(<"$HOME/.gitconfig" 2>/dev/null || echo "")
 
             local confidence="LOW"
             local finding_matched_pattern=""
@@ -4830,6 +5679,8 @@ check_common_backdoors() {
         fi
     fi
 
+    log_check "Web server directories for webshells"
+
     # Check web server directories for potential webshells
     local web_dirs=(
         "/var/www"
@@ -4845,7 +5696,10 @@ check_common_backdoors() {
             local _web_count=0
             while IFS= read -r -d '' web_file; do
                 (( _web_count++ )) || true
-                [[ $_web_count -gt 100 ]] && break
+                if [[ $_web_count -gt 100 ]]; then
+                    log_warn "Web shell scan cap (100 files) reached in $web_dir — remaining files not scanned"
+                    break
+                fi
 
                 local hash=$(get_file_hash "$web_file")
                 local metadata=$(get_file_metadata "$web_file")
@@ -4856,30 +5710,998 @@ check_common_backdoors() {
                 local current_time=$SCAN_EPOCH
                 local days_old=$(( (current_time - mod_time) / 86400 ))
 
+                # Content-gated only — report if webshell pattern found regardless of age
                 local confidence="LOW"
                 local finding_matched_pattern=""
                 local finding_matched_string=""
-                if [[ $days_old -lt 30 ]]; then
-                    confidence="MEDIUM"
-                    finding_matched_pattern="recently_modified"
-                    finding_matched_string="${days_old} days old"
-
-                    # Check for webshell patterns
-                    local content=$(head -100 "$web_file" 2>/dev/null || echo "")
-                    local webshell_match=$(echo "$content" | grep -oiE "(eval|base64_decode|system\(|exec\(|shell_exec|passthru|proc_open|popen)" | head -1) || true
-                    if [[ -n "$webshell_match" ]]; then
-                        confidence="HIGH"
-                        finding_matched_pattern="webshell_pattern"
-                        finding_matched_string="$webshell_match"
-                        log_finding "Potential webshell detected: $web_file (modified ${days_old} days ago)"
-                    fi
+                local content
+                content=$(head -100 "$web_file" 2>/dev/null || echo "")
+                local webshell_match
+                webshell_match=$(echo "$content" | grep -oiE "(eval|base64_decode|system\(|exec\(|shell_exec|passthru|proc_open|popen)" | head -1) || true
+                if [[ -n "$webshell_match" ]]; then
+                    confidence="HIGH"
+                    finding_matched_pattern="webshell_pattern"
+                    finding_matched_string="$webshell_match"
+                    log_finding "Potential webshell detected: $web_file"
                 fi
 
                 if [[ $confidence != "LOW" ]]; then
-                    add_finding "WebShell" "Suspicious" "web_file" "$web_file" "Recently modified web file in $web_dir (${days_old} days old)" "$confidence" "$hash" "$metadata" "days_old=$days_old" "$finding_matched_pattern" "$finding_matched_string"
+                    add_finding "WebShell" "Suspicious" "web_file" "$web_file" "Web file with suspicious content in $web_dir" "$confidence" "$hash" "$metadata" "days_old=$days_old" "$finding_matched_pattern" "$finding_matched_string"
                 fi
-            done < <(find "$web_dir" -type f \( -name "*.php" -o -name "*.asp" -o -name "*.aspx" -o -name "*.jsp" \) -print0 2>/dev/null)
+            done < <(find "$web_dir" -xdev -type f \( -name "*.php" -o -name "*.asp" -o -name "*.aspx" -o -name "*.jsp" \) -print0 2>/dev/null)
         fi
+    done
+}
+
+################################################################################
+# SSH Persistence Check
+################################################################################
+
+check_ssh_persistence() {
+    log_info "[8/9] Checking SSH persistence mechanisms..."
+
+    # Collect user home directories to check
+    local _ssh_homes=()
+    if [[ $EUID_CHECK -eq 0 ]]; then
+        while IFS=: read -r _su_name _ _su_uid _ _ _su_home _; do
+            if ([[ $_su_uid -ge 1000 ]] || [[ $_su_uid -eq 0 ]]) && [[ -n "$_su_home" ]] && [[ "$_su_home" != "/" ]]; then
+                _ssh_homes+=("${_su_home}:${_su_name}")
+            fi
+        done < /etc/passwd
+    else
+        _ssh_homes+=("${HOME}:$(whoami)")
+    fi
+
+    log_check "SSH authorized_keys files (all users)"
+
+    # Read AuthorizedKeysFile directive from sshd_config (may specify non-default path)
+    local _ak_directive
+    _ak_directive=$(grep -iE "^[[:space:]]*AuthorizedKeysFile[[:space:]]" \
+        /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null \
+        | awk '{print $2}' | head -1) || true
+    local _ak_patterns=(".ssh/authorized_keys")  # default
+    if [[ -n "$_ak_directive" ]] && [[ "$_ak_directive" != ".ssh/authorized_keys" ]]; then
+        _ak_patterns+=("$_ak_directive")
+    fi
+
+    for _ssh_entry in "${_ssh_homes[@]}"; do
+        local _ssh_home="${_ssh_entry%%:*}"
+        local _ssh_user="${_ssh_entry##*:}"
+        local _ssh_dir="$_ssh_home/.ssh"
+
+        # ── authorized_keys ───────────────────────────────────────────────────
+        # Attackers add their public key to gain persistent access without a password.
+        # Flag: file present, with analysis of key options (command=, restrict, from=)
+        for _ak_pattern in "${_ak_patterns[@]}"; do
+            local _ak_file
+            if [[ "$_ak_pattern" == /* ]]; then
+                # Absolute path -- expand %u for username
+                _ak_file="${_ak_pattern//%u/$_ssh_user}"
+            else
+                _ak_file="${_ssh_home}/${_ak_pattern}"
+            fi
+            [[ -f "$_ak_file" ]] || continue
+        if true; then
+            local _ak_hash _ak_meta
+            _ak_hash=$(get_file_hash "$_ak_file") || true
+            _ak_meta=$(get_file_metadata "$_ak_file") || true
+
+            local _ak_confidence="MEDIUM"
+            local _ak_pattern="authorized_keys_present"
+            local _ak_string="$_ak_file"
+
+            # Extract mod time
+            local _ak_mod_time=0
+            [[ "$_ak_meta" =~ modified:([0-9]+) ]] && _ak_mod_time="${BASH_REMATCH[1]}"
+            local _ak_days_old=$(( (SCAN_EPOCH - _ak_mod_time) / 86400 ))
+
+            # Check for suspicious key options: command= (forced command / RCE)
+            # from= with suspicious hosts, or inline execution patterns
+            local _ak_cmd_match
+            _ak_cmd_match=$(grep -v "^#" "$_ak_file" 2>/dev/null | grep -oiE 'command="([^"\\]|\\.){0,200}"' | head -1) || true
+            if [[ -n "$_ak_cmd_match" ]]; then
+                _ak_confidence="HIGH"
+                _ak_pattern="authorized_keys_command_option"
+                _ak_string="$_ak_cmd_match"
+                log_finding "SSH authorized_keys has command= option ($_ssh_user): $_ak_cmd_match"
+
+                # Deeper check: is the forced command content suspicious?
+                if echo "$_ak_cmd_match" | grep -qiE "$UNIFIED_SUSPICIOUS_PATTERN"; then
+                    _ak_confidence="CRITICAL"
+                    _ak_pattern="authorized_keys_suspicious_command"
+                    log_finding "SSH authorized_keys command= contains suspicious content ($_ssh_user)"
+                fi
+            fi
+
+            # (time-based elevation removed — no baseline context)
+
+            add_finding_new "SSH" "$_ak_confidence" "$_ak_file" "$_ak_hash" \
+                "$(get_owner_from_metadata "$_ak_meta")" "$(get_permissions_from_metadata "$_ak_meta")" \
+                "$_ak_days_old" "unmanaged" "" "" "$_ssh_user" "$_ak_pattern" "$_ak_string"
+        fi
+        done  # _ak_patterns loop
+
+        log_check "~/.ssh/rc login hook ($_ssh_user)"
+
+        # ── ~/.ssh/rc ─────────────────────────────────────────────────────────
+        # Executed by sshd on every SSH login for the user (before shell launch).
+        # Attackers use this for login hooks, beacons, or persistent execution.
+        local _rc_file="$_ssh_dir/rc"
+        if [[ -f "$_rc_file" ]]; then
+            local _rc_hash _rc_meta
+            _rc_hash=$(get_file_hash "$_rc_file") || true
+            _rc_meta=$(get_file_metadata "$_rc_file") || true
+
+            local _rc_confidence="HIGH"   # Any ~/.ssh/rc is unusual and warrants review
+            local _rc_pattern="ssh_rc_present"
+            local _rc_string="$_rc_file"
+
+            local _rc_mod_time=0
+            [[ "$_rc_meta" =~ modified:([0-9]+) ]] && _rc_mod_time="${BASH_REMATCH[1]}"
+            local _rc_days_old=$(( (SCAN_EPOCH - _rc_mod_time) / 86400 ))
+
+            log_finding "SSH rc file present ($_ssh_user): $_rc_file"
+
+            # Content analysis
+            if analyze_script_content "$_rc_file"; then
+                _rc_confidence="CRITICAL"
+                _rc_pattern="ssh_rc_suspicious_content"
+                _rc_string="$MATCHED_STRING"
+                log_finding "SSH rc file contains suspicious content ($_ssh_user): $MATCHED_STRING"
+            elif quick_suspicious_check "$(head -n 50 "$_rc_file" 2>/dev/null | tr -d '\0')"; then
+                _rc_confidence="CRITICAL"
+                _rc_pattern="ssh_rc_suspicious_content"
+                _rc_string="$MATCHED_STRING"
+                log_finding "SSH rc file contains suspicious pattern ($_ssh_user): $MATCHED_STRING"
+            fi
+
+            add_finding_new "SSH" "$_rc_confidence" "$_rc_file" "$_rc_hash" \
+                "$(get_owner_from_metadata "$_rc_meta")" "$(get_permissions_from_metadata "$_rc_meta")" \
+                "$_rc_days_old" "unmanaged" "" "" "$_ssh_user" "$_rc_pattern" "$_rc_string"
+        fi
+    done
+
+    # ─── System account SSH keys (UID 1-999) ─────────────────────────────────
+    # These are excluded from the regular per-user scan above — scan them separately
+    # System accounts with SSH keys are always suspicious (e.g., news, nobody, mail)
+    log_check "System account SSH authorized_keys (UID 1-999)"
+
+    if [[ $EUID_CHECK -eq 0 ]]; then
+        while IFS=: read -r _sys_user _ _sys_uid _ _ _sys_home _; do
+            [[ "$_sys_uid" -lt 1 ]] && continue    # skip uid 0 (root — handled above)
+            [[ "$_sys_uid" -ge 1000 ]] && continue  # skip regular users — handled above
+            [[ -z "$_sys_home" ]] || [[ "$_sys_home" == "/" ]] && continue
+            [[ -d "$_sys_home/.ssh" ]] || continue
+
+            local _ak_file="$_sys_home/.ssh/authorized_keys"
+            [[ -f "$_ak_file" ]] || continue
+
+            local _hash; _hash=$(get_file_hash "$_ak_file")
+            local _meta; _meta=$(get_file_metadata "$_ak_file")
+
+            local _confidence="HIGH"
+            local _matched_pattern="system_account_ssh_key"
+            local _matched_string="user=$_sys_user;uid=$_sys_uid"
+
+            log_finding "System account has SSH authorized_keys: $_sys_user (uid=$_sys_uid) -> $_ak_file"
+
+            # Analyze any command= forced commands in the key file
+            local _cmd_match
+            _cmd_match=$(grep -v "^#" "$_ak_file" 2>/dev/null | grep -oiE 'command="([^"\\]|\\.){0,200}"' | head -1) || true
+            if [[ -n "$_cmd_match" ]]; then
+                local _cmd_content="${_cmd_match#command=\"}"
+                _cmd_content="${_cmd_content%\"}"
+                if analyze_content_string "$_cmd_content" "$_ak_file"; then
+                    _confidence="CRITICAL"
+                    _matched_pattern="system_account_ssh_forced_command_malicious"
+                    _matched_string="$MATCHED_STRING"
+                fi
+            fi
+
+            add_finding "SSH" "SystemAccount" "system_account_ssh_key" "$_ak_file" "System account SSH key: $_sys_user (uid=$_sys_uid)" "$_confidence" "$_hash" "$_meta" "user=$_sys_user|uid=$_sys_uid" "$_matched_pattern" "$_matched_string"
+        done < /etc/passwd
+    fi
+}
+
+check_polkit_persistence() {
+    log_info "[NEW] Checking Polkit (PolicyKit) persistence..."
+
+    # ─── .pkla files (Polkit < 0.106) ───────────────────────────────────────
+    log_check "Polkit PKLA rules (/etc/polkit-1/localauthority/)"
+
+    local _pkla_dir="/etc/polkit-1/localauthority/50-local.d"
+    if [[ -d "$_pkla_dir" ]]; then
+        while IFS= read -r -d '' _pkla; do
+            local _hash; _hash=$(get_file_hash "$_pkla")
+            local _meta; _meta=$(get_file_metadata "$_pkla")
+            check_file_package "$_pkla"
+            local _pkg="$PKG_STATUS"
+
+            local _confidence="LOW"
+            local _matched_pattern=""
+            local _matched_string=""
+
+            [[ "$_pkg" == "unmanaged" ]] && _confidence="HIGH"
+
+            local _content
+            _content=$(cat "$_pkla" 2>/dev/null | tr -d '\0') || true
+
+            # Check for triple Result=yes (unconditional bypass)
+            local _any="" _inactive="" _active=""
+            grep -qiE "^ResultAny[[:space:]]*=[[:space:]]*yes" <<< "$_content" && _any="yes"
+            grep -qiE "^ResultInactive[[:space:]]*=[[:space:]]*yes" <<< "$_content" && _inactive="yes"
+            grep -qiE "^ResultActive[[:space:]]*=[[:space:]]*yes" <<< "$_content" && _active="yes"
+
+            local _identity
+            _identity=$(grep -iE "^Identity[[:space:]]*=" <<< "$_content" | head -1) || true
+
+            if [[ "$_any" == "yes" && "$_inactive" == "yes" && "$_active" == "yes" ]]; then
+                _confidence="CRITICAL"
+                _matched_pattern="polkit_pkla_all_result_yes"
+                _matched_string="ResultAny=yes;ResultInactive=yes;ResultActive=yes"
+                log_finding "Polkit PKLA: unconditional auth bypass (all Result=yes): $_pkla"
+                # Wildcard identity makes it even worse but confidence is already CRITICAL
+                if [[ "$_identity" =~ "unix-user:\*" ]] || [[ "$_identity" =~ "unix-group:\*" ]]; then
+                    _matched_string="$_matched_string;Identity=wildcard"
+                    log_finding "Polkit PKLA: wildcard identity with all Result=yes: $_pkla"
+                fi
+            elif [[ -n "$_any" || -n "$_inactive" || -n "$_active" ]]; then
+                [[ "$_confidence" != "CRITICAL" ]] && _confidence="HIGH"
+                _matched_pattern="polkit_pkla_partial_yes"
+                _matched_string="ResultAny=${_any:-no};ResultInactive=${_inactive:-no};ResultActive=${_active:-no}"
+                log_finding "Polkit PKLA: partial Result=yes: $_pkla"
+            fi
+
+            add_finding "Privilege" "Polkit" "polkit_pkla" "$_pkla" "Polkit PKLA: $(basename "$_pkla")" "$_confidence" "$_hash" "$_meta" "package=$_pkg" "$_matched_pattern" "$_matched_string"
+        done < <(find "$_pkla_dir" -maxdepth 2 -name "*.pkla" -type f -print0 2>/dev/null)
+    fi
+
+    # ─── .rules files (Polkit >= 0.106, JS-based) ───────────────────────────
+    log_check "Polkit rules.d (JS-based, /etc/polkit-1/rules.d/)"
+
+    local _rules_dir="/etc/polkit-1/rules.d"
+    if [[ -d "$_rules_dir" ]]; then
+        while IFS= read -r -d '' _rules; do
+            local _hash; _hash=$(get_file_hash "$_rules")
+            local _meta; _meta=$(get_file_metadata "$_rules")
+            check_file_package "$_rules"
+            local _pkg="$PKG_STATUS"
+
+            local _confidence="LOW"
+            local _matched_pattern=""
+            local _matched_string=""
+
+            [[ "$_pkg" == "unmanaged" ]] && _confidence="HIGH"
+
+            local _content
+            _content=$(cat "$_rules" 2>/dev/null | tr -d '\0') || true
+
+            # Strip single-line JS comments before analysis to reduce FPs
+            local _content_clean
+            _content_clean=$(grep -v "^[[:space:]]*//" <<< "$_content") || _content_clean="$_content"
+
+            # Check for unconditional polkit.Result.YES (no if/condition before return)
+            if grep -qiE "return[[:space:]]+polkit\.Result\.YES" <<< "$_content_clean" 2>/dev/null; then
+                # Check if the return is inside a conditional block
+                # Check if the YES return is immediately preceded by an if() within 5 lines
+                local _yes_has_local_condition
+                _yes_has_local_condition=$(grep -B5 -iE "return[[:space:]]+polkit\.Result\.YES" \
+                    <<< "$_content_clean" 2>/dev/null | grep -ciE "if[[:space:]]*\(") || true
+                if [[ "${_yes_has_local_condition:-0}" -gt 0 ]]; then
+                    [[ "$_confidence" == "LOW" ]] && _confidence="MEDIUM"
+                    _matched_pattern="polkit_rules_conditioned_yes"
+                    _matched_string=$(grep -iE "return[[:space:]]+polkit\.Result\.YES" <<< "$_content_clean" | head -1) || true
+                    log_finding "Polkit rules: conditioned polkit.Result.YES: $_rules"
+                else
+                    # Unconditional — CRITICAL
+                    _confidence="CRITICAL"
+                    _matched_pattern="polkit_rules_unconditional_yes"
+                    _matched_string=$(grep -iE "return[[:space:]]+polkit\.Result\.YES" <<< "$_content_clean" | head -1) || true
+                    log_finding "Polkit rules: unconditional polkit.Result.YES: $_rules"
+                fi
+            fi
+
+            # Secondary: run analyze_script_content for NEVER_WHITELIST hits in rules
+            if analyze_content_string "$_content" "$_rules"; then
+                _confidence="CRITICAL"
+                _matched_pattern="${_matched_pattern:+${_matched_pattern}+}polkit_rules_malicious_content"
+                _matched_string="$MATCHED_STRING"
+            fi
+
+            add_finding "Privilege" "Polkit" "polkit_rules" "$_rules" "Polkit rules: $(basename "$_rules")" "$_confidence" "$_hash" "$_meta" "package=$_pkg" "$_matched_pattern" "$_matched_string"
+        done < <(find "$_rules_dir" -maxdepth 1 -name "*.rules" -type f -print0 2>/dev/null)
+    fi
+}
+
+check_dbus_persistence() {
+    log_info "[NEW] Checking D-Bus and NetworkManager dispatcher persistence..."
+
+    # ─── D-Bus system service activation files ───────────────────────────────
+    log_check "D-Bus system service files (/usr/share/dbus-1/system-services/)"
+
+    local _dbus_svc_dir="/usr/share/dbus-1/system-services"
+    if [[ -d "$_dbus_svc_dir" ]]; then
+        while IFS= read -r -d '' _dsvc; do
+            local _hash; _hash=$(get_file_hash "$_dsvc")
+            local _meta; _meta=$(get_file_metadata "$_dsvc")
+            check_file_package "$_dsvc"
+            local _pkg="$PKG_STATUS"
+
+            local _confidence="LOW"
+            local _matched_pattern=""
+            local _matched_string=""
+
+            [[ "$_pkg" == "unmanaged" ]] && _confidence="HIGH"
+
+            # Extract Exec= line
+            local _exec_line
+            _exec_line=$(grep -E "^Exec=" "$_dsvc" 2>/dev/null | head -1 | cut -d'=' -f2-) || true
+
+            if [[ -n "$_exec_line" ]]; then
+                # Extract the executable path (first word)
+                local _exec_target
+                read -r _exec_target _ <<< "$_exec_line"
+
+                if [[ ! -f "$_exec_target" ]] && [[ -n "$_exec_target" ]]; then
+                    # Dangling Exec= — file not found
+                    _confidence="HIGH"
+                    _matched_pattern="dbus_dangling_exec"
+                    _matched_string="Exec=$_exec_line (target not found)"
+                    log_finding "D-Bus service has dangling Exec= target: $_dsvc ($_exec_target)"
+                elif [[ -f "$_exec_target" ]]; then
+                    check_file_package "$_exec_target"
+                    local _exec_pkg="$PKG_STATUS"
+
+                    if [[ "$_exec_pkg" == "unmanaged" ]]; then
+                        _confidence="HIGH"
+                        _matched_pattern="dbus_unmanaged_exec_target"
+                        _matched_string="Exec=$_exec_target"
+                        log_finding "D-Bus service Exec= target is unmanaged: $_exec_target"
+                    fi
+
+                    # Analyze target content
+                    local _exec_content
+                    _exec_content=$(head -n 300 "$_exec_target" 2>/dev/null | tr -d '\0') || true
+                    if [[ -n "$_exec_content" ]] && analyze_content_string "$_exec_content" "$_exec_target"; then
+                        _confidence="CRITICAL"
+                        _matched_pattern="dbus_malicious_exec_content"
+                        _matched_string="$MATCHED_STRING"
+                        log_finding "D-Bus service Exec= target has malicious content: $_exec_target"
+                    fi
+
+                    # Flag execution from suspicious locations
+                    if [[ "$_exec_target" =~ ^(/tmp|/dev/shm|/var/tmp)/ ]]; then
+                        _confidence="CRITICAL"
+                        _matched_pattern="dbus_exec_suspicious_location"
+                        _matched_string="Exec=$_exec_target"
+                        log_finding "D-Bus service Exec= from suspicious location: $_exec_target"
+                    fi
+                fi
+            fi
+
+            # Check for SystemdService= field (DBus activation of a systemd unit)
+            local _svc_unit
+            _svc_unit=$(grep -E "^SystemdService=" "$_dsvc" 2>/dev/null | cut -d'=' -f2- | head -1) || true
+            if [[ -n "$_svc_unit" ]]; then
+                # Verify the referenced systemd unit is a known/enabled unit
+                if ! systemctl is-enabled "$_svc_unit" &>/dev/null 2>&1; then
+                    [[ "$_confidence" == "LOW" ]] && _confidence="MEDIUM"
+                    _matched_pattern="${_matched_pattern:-dbus_systemd_service}"
+                    _matched_string="SystemdService=$_svc_unit"
+                    log_finding "D-Bus service references SystemdService= unit: $_svc_unit ($_dsvc)"
+                fi
+            fi
+
+            add_finding "EventTriggered" "DBus" "dbus_service" "$_dsvc" "D-Bus service: $(basename "$_dsvc")" "$_confidence" "$_hash" "$_meta" "package=$_pkg|exec=$_exec_line" "$_matched_pattern" "$_matched_string"
+        done < <(find "$_dbus_svc_dir" -maxdepth 1 -name "*.service" -type f -print0 2>/dev/null)
+    fi
+
+    # D-Bus policy files — wildcard allow directives
+    log_check "D-Bus policy files (/etc/dbus-1/system.d/)"
+    local _dbus_conf_dir="/etc/dbus-1/system.d"
+    if [[ -d "$_dbus_conf_dir" ]]; then
+        while IFS= read -r -d '' _dconf; do
+            local _hash; _hash=$(get_file_hash "$_dconf")
+            local _meta; _meta=$(get_file_metadata "$_dconf")
+            check_file_package "$_dconf"
+            local _pkg="$PKG_STATUS"
+
+            local _confidence="LOW"
+            local _matched_pattern=""
+            local _matched_string=""
+            [[ "$_pkg" == "unmanaged" ]] && _confidence="MEDIUM"
+
+            local _content
+            _content=$(cat "$_dconf" 2>/dev/null | tr -d '\0') || true
+
+            # Flag wildcard allow policies
+            local _wildcard_hit
+            _wildcard_hit=$(grep -iE '<allow (own|send_destination)="(\*|[^"]*\.\*)"' <<< "$_content" | head -1) || true
+            if [[ -n "$_wildcard_hit" ]]; then
+                _confidence="HIGH"
+                _matched_pattern="dbus_wildcard_policy"
+                _matched_string="${_wildcard_hit:0:200}"
+                log_finding "D-Bus policy has wildcard allow directive: $_dconf"
+            fi
+
+            add_finding "EventTriggered" "DBus" "dbus_policy" "$_dconf" "D-Bus policy: $(basename "$_dconf")" "$_confidence" "$_hash" "$_meta" "package=$_pkg" "$_matched_pattern" "$_matched_string"
+        done < <(find "$_dbus_conf_dir" -maxdepth 1 -name "*.conf" -type f -print0 2>/dev/null)
+    fi
+
+    # ─── NetworkManager Dispatcher ──────────────────────────────────────────
+    log_check "NetworkManager dispatcher scripts (/etc/NetworkManager/dispatcher.d/)"
+
+    local _nm_dir="/etc/NetworkManager/dispatcher.d"
+    if [[ -d "$_nm_dir" ]]; then
+        while IFS= read -r -d '' _nms; do
+            # Skip non-executable files — NM dispatcher only runs executable scripts
+            [[ -x "$_nms" ]] || continue
+
+            local _hash; _hash=$(get_file_hash "$_nms")
+            local _meta; _meta=$(get_file_metadata "$_nms")
+            check_file_package "$_nms"
+            local _pkg="$PKG_STATUS"
+
+            local _confidence="LOW"
+            local _matched_pattern=""
+            local _matched_string=""
+
+            [[ "$_pkg" == "unmanaged" ]] && _confidence="HIGH"
+
+            local _content
+            _content=$(head -n 300 "$_nms" 2>/dev/null | tr -d '\0') || true
+            if [[ -n "$_content" ]] && analyze_content_string "$_content" "$_nms"; then
+                _confidence="CRITICAL"
+                _matched_pattern="$MATCHED_PATTERN"
+                _matched_string="$MATCHED_STRING"
+                log_finding "Suspicious NM dispatcher script: $_nms"
+            fi
+
+            add_finding "EventTriggered" "NMDispatcher" "nm_dispatcher_script" "$_nms" "NM dispatcher: $(basename "$_nms")" "$_confidence" "$_hash" "$_meta" "package=$_pkg" "$_matched_pattern" "$_matched_string"
+        done < <(find "$_nm_dir" -maxdepth 2 -type f -print0 2>/dev/null)
+    fi
+}
+
+check_udev_persistence() {
+    log_info "[NEW] Checking udev rules persistence..."
+
+    log_check "Udev rules (RUN+= persistence)"
+
+    local _udev_dirs=(
+        "/etc/udev/rules.d"
+        "/lib/udev/rules.d"
+        "/run/udev/rules.d"
+    )
+
+    for _udev_dir in "${_udev_dirs[@]}"; do
+        [[ -d "$_udev_dir" ]] || continue
+        local _is_run_dir=false
+        [[ "$_udev_dir" == "/run/udev/rules.d" ]] && _is_run_dir=true
+
+        while IFS= read -r -d '' _rule; do
+            local _hash; _hash=$(get_file_hash "$_rule")
+            local _meta; _meta=$(get_file_metadata "$_rule")
+            check_file_package "$_rule"
+            local _pkg="$PKG_STATUS"
+
+            local _confidence="LOW"
+            local _matched_pattern=""
+            local _matched_string=""
+
+            # /run/udev/rules.d files are always suspicious — runtime injection
+            if [[ "$_is_run_dir" == "true" ]]; then
+                _confidence="HIGH"
+                _matched_pattern="udev_runtime_rule"
+                _matched_string="$(basename "$_rule") in /run/udev/rules.d"
+                log_finding "Runtime udev rule in /run/udev/rules.d: $_rule"
+            elif [[ "$_pkg" == "unmanaged" ]]; then
+                _confidence="MEDIUM"
+            fi
+
+            local _content
+            _content=$(cat "$_rule" 2>/dev/null | tr -d '\0') || true
+
+            # Extract all RUN+= values
+            local _run_val
+            while IFS= read -r _run_line; do
+                _run_val=""
+                # Try double-quoted
+                _run_val=$(grep -oiE 'RUN\+?=[[:space:]]*"[^"]+"' <<< "$_run_line" | grep -oE '"[^"]+"' | tr -d '"' | head -1) || true
+                # Try single-quoted
+                if [[ -z "$_run_val" ]]; then
+                    _run_val=$(grep -oiE "RUN\+?=[[:space:]]*'[^']+'" <<< "$_run_line" | grep -oE "'[^']+'" | tr -d "'" | head -1) || true
+                fi
+                # Try unquoted (value ends at whitespace or end of line)
+                if [[ -z "$_run_val" ]]; then
+                    _run_val=$(grep -oiE 'RUN\+?=[[:space:]]*[^"'"'"'[:space:]]+' <<< "$_run_line" | sed 's/RUN+\?=[[:space:]]*//' | head -1) || true
+                fi
+                [[ -z "$_run_val" ]] && continue
+
+                # Analyze the RUN+= command string
+                if analyze_content_string "$_run_val" "$_rule"; then
+                    _confidence="CRITICAL"
+                    _matched_pattern="udev_run_malicious_command"
+                    _matched_string="${_run_val:0:200}"
+                    log_finding "Udev rule RUN+= has malicious command: $_rule"
+                    break
+                fi
+
+                # Flag at/cron delegation (common udev foreground bypass)
+                if [[ "$_run_val" =~ "at now" ]] || [[ "$_run_val" =~ "at +" ]] || [[ "$_run_val" =~ "crontab" ]]; then
+                    [[ "$_confidence" != "CRITICAL" ]] && _confidence="HIGH"
+                    _matched_pattern="udev_run_at_delegation"
+                    _matched_string="${_run_val:0:200}"
+                    log_finding "Udev rule RUN+= delegates to at/cron: $_rule"
+                fi
+
+                # Flag execution from suspicious locations
+                if [[ "$_run_val" =~ ^(/tmp|/dev/shm|/var/tmp)/ ]]; then
+                    _confidence="CRITICAL"
+                    _matched_pattern="udev_run_suspicious_location"
+                    _matched_string="${_run_val:0:200}"
+                    log_finding "Udev rule RUN+= executes from suspicious location: $_run_val"
+                fi
+
+                # If RUN+= points to a script, analyze its content
+                local _run_bin
+                read -r _run_bin _ <<< "$_run_val"
+                if [[ -f "$_run_bin" ]]; then
+                    local _run_content
+                    _run_content=$(head -n 200 "$_run_bin" 2>/dev/null | tr -d '\0') || true
+                    if [[ -n "$_run_content" ]] && analyze_content_string "$_run_content" "$_run_bin"; then
+                        _confidence="CRITICAL"
+                        _matched_pattern="udev_run_target_malicious"
+                        _matched_string="$MATCHED_STRING"
+                        log_finding "Udev rule RUN+= target has malicious content: $_run_bin"
+                    fi
+                fi
+
+                [[ -z "$_matched_string" ]] && _matched_string="${_run_val:0:200}"
+            done < <(grep -iE "RUN\+?=" "$_rule" 2>/dev/null || true)
+
+            add_finding "EventTriggered" "Udev" "udev_rule" "$_rule" "Udev rule: $(basename "$_rule")" "$_confidence" "$_hash" "$_meta" "package=$_pkg|dir=$(basename "$_udev_dir")" "$_matched_pattern" "$_matched_string"
+        done < <(find "$_udev_dir" -maxdepth 1 -name "*.rules" -type f -print0 2>/dev/null)
+    done
+}
+
+check_container_persistence() {
+    log_info "[NEW] Checking container/Docker escape persistence..."
+
+    # Check for Dockerfiles in suspicious locations
+    log_check "Dockerfiles in user-writable locations"
+    while IFS= read -r -d '' _df; do
+        local _hash; _hash=$(get_file_hash "$_df")
+        local _meta; _meta=$(get_file_metadata "$_df")
+        local _confidence="HIGH"
+        local _matched_pattern="dockerfile_suspicious_location"
+        local _matched_string="$(dirname "$_df")"
+        local _content
+        _content=$(cat "$_df" 2>/dev/null | tr -d '\0') || true
+
+        if grep -qiE "(nsenter|socat exec:|--privileged)" <<< "$_content" 2>/dev/null; then
+            _confidence="CRITICAL"
+            local _hit
+            _hit=$(grep -iE "(nsenter|socat exec:|--privileged)" <<< "$_content" | head -1) || true
+            _matched_pattern="dockerfile_escape_technique"
+            _matched_string="${_hit:0:200}"
+            log_finding "Dockerfile contains container escape technique: $_df"
+        else
+            log_finding "Dockerfile in suspicious location: $_df"
+        fi
+
+        add_finding "Container" "Docker" "dockerfile_suspicious" "$_df" "Dockerfile: $(dirname "$_df")" "$_confidence" "$_hash" "$_meta" "" "$_matched_pattern" "$_matched_string"
+    done < <(find /tmp /root /home /var/tmp -maxdepth 3 -name "Dockerfile" -type f -print0 2>/dev/null)
+
+    # Docker daemon config
+    log_check "Docker daemon configuration"
+    if [[ -f /etc/docker/daemon.json ]]; then
+        local _hash; _hash=$(get_file_hash /etc/docker/daemon.json)
+        local _meta; _meta=$(get_file_metadata /etc/docker/daemon.json)
+        local _content
+        _content=$(cat /etc/docker/daemon.json 2>/dev/null | tr -d '\0') || true
+        local _confidence="LOW"
+        local _matched_pattern=""
+        local _matched_string=""
+
+        if grep -qiE '"userns-remap"[[:space:]]*:[[:space:]]*"(|none)"' <<< "$_content" 2>/dev/null || \
+           grep -qiE '"no-new-privileges"[[:space:]]*:[[:space:]]*false' <<< "$_content" 2>/dev/null; then
+            _confidence="MEDIUM"
+            _matched_pattern="docker_daemon_weakened_security"
+            _matched_string=$(grep -iE '"(userns-remap|no-new-privileges)"' <<< "$_content" | head -1) || true
+        fi
+
+        add_finding "Container" "Docker" "docker_daemon_config" "/etc/docker/daemon.json" "Docker daemon config" "$_confidence" "$_hash" "$_meta" "" "$_matched_pattern" "$_matched_string"
+    fi
+
+    # Running/stopped containers
+    if ! command -v docker &>/dev/null; then
+        log_info "Docker not found — skipping container inspection"
+        return
+    fi
+
+    log_check "Docker container security posture"
+
+    local _all_container_ids
+    _all_container_ids=$(timeout 10 docker ps -aq 2>/dev/null) || true
+    local _total_containers
+    _total_containers=$(echo "$_all_container_ids" | grep -c . 2>/dev/null || echo 0)
+    local _container_ids
+    _container_ids=$(echo "$_all_container_ids" | head -20)
+    if [[ "$_total_containers" -gt 20 ]]; then
+        log_warn "Container scan: $(( _total_containers - 20 )) containers beyond the 20-container limit were not inspected"
+    fi
+
+    [[ -z "$_container_ids" ]] && { log_info "No Docker containers found"; return; }
+
+    while IFS= read -r _cid; do
+        [[ -z "$_cid" ]] && continue
+
+        local _inspect
+        _inspect=$(timeout 10 docker inspect "$_cid" 2>/dev/null) || continue
+
+        local _name
+        _name=$(grep -oiE '"Name"[[:space:]]*:[[:space:]]*"[^"]+"' <<< "$_inspect" | head -1 | grep -oiE '"[^"]+"$' | tr -d '"') || _name="$_cid"
+
+        local _privileged
+        _privileged=$(grep -oiE '"Privileged"[[:space:]]*:[[:space:]]*[a-z]+' <<< "$_inspect" | grep -oiE '[a-z]+$') || _privileged="false"
+
+        local _pid_mode
+        _pid_mode=$(grep -oiE '"PidMode"[[:space:]]*:[[:space:]]*"[^"]+"' <<< "$_inspect" | head -1 | grep -oiE '"[^"]+"$' | tr -d '"') || _pid_mode=""
+
+        local _confidence="LOW"
+        local _matched_pattern=""
+        local _matched_string=""
+
+        if [[ "$_privileged" == "true" ]]; then
+            _confidence="HIGH"
+            _matched_pattern="container_privileged"
+            _matched_string="Privileged=true"
+            log_finding "Privileged Docker container: $_name ($_cid)"
+
+            if [[ "$_pid_mode" == "host" ]]; then
+                _confidence="CRITICAL"
+                _matched_pattern="container_privileged_pid_host"
+                _matched_string="Privileged=true;PidMode=host"
+                log_finding "Privileged + host PID namespace container: $_name ($_cid)"
+            fi
+        fi
+
+        # Docker socket bind-mount check
+        if grep -qiE '"/var/run/docker\.sock"' <<< "$_inspect" 2>/dev/null; then
+            _confidence="CRITICAL"
+            _matched_pattern="container_docker_sock_mount"
+            _matched_string="$_matched_string;docker.sock bind-mounted"
+            log_finding "Docker socket bind-mounted into container: $_name ($_cid)"
+        fi
+
+        # Check entrypoint/cmd for nsenter
+        local _entrypoint
+        _entrypoint=$(grep -oiE '"Entrypoint"[[:space:]]*:[[:space:]]*\[[^\]]+\]' <<< "$_inspect" | head -1) || true
+        if [[ -n "$_entrypoint" ]] && grep -qiE "nsenter" <<< "$_entrypoint" 2>/dev/null; then
+            _confidence="CRITICAL"
+            _matched_pattern="container_nsenter_entrypoint"
+            _matched_string="nsenter in entrypoint"
+            log_finding "Container entrypoint contains nsenter: $_name ($_cid)"
+        fi
+
+        local _meta; _meta=$(get_file_metadata "/dev/null") || _meta=""  # placeholder metadata
+        add_finding "Container" "Docker" "docker_container" "/var/run/docker.sock" "Container: $_name ($_cid)" "$_confidence" "N/A" "$_meta" "privileged=$_privileged|pid_mode=$_pid_mode" "$_matched_pattern" "$_matched_string"
+    done <<< "$_container_ids"
+}
+
+################################################################################
+# Binary Integrity Check
+################################################################################
+
+check_binary_integrity() {
+    log_info "[9/9] Checking system binary integrity..."
+    log_check "System binary integrity (dpkg -V / rpm -Va)"
+
+    local _bin_dirs=("/usr/bin" "/usr/sbin" "/bin" "/sbin")
+
+    _report_modified_binary() {
+        local _file="$1"
+        local _hash _meta _days=0
+        _hash=$(get_file_hash "$_file") || _hash="N/A"
+        _meta=$(get_file_metadata "$_file") || _meta="N/A"
+        [[ "$_meta" =~ modified:([0-9]+) ]] && _days=$(( (SCAN_EPOCH - ${BASH_REMATCH[1]}) / 86400 ))
+        log_finding "Modified system binary detected: $_file"
+        add_finding_new "BinaryIntegrity" "CRITICAL" "$_file" "$_hash" \
+            "$(get_owner_from_metadata "$_meta")" "$(get_permissions_from_metadata "$_meta")" \
+            "$_days" "modified" "" "" "" "modified_system_binary" "$_file"
+    }
+
+    _is_critical_path() {
+        local _f="$1"
+        for _bd in "${_bin_dirs[@]}"; do
+            [[ "$_f" == "$_bd/"* ]] && return 0
+        done
+        [[ "$_f" == */lib/security/* || "$_f" == */lib*/security/* ]] && return 0
+        return 1
+    }
+
+    if command -v dpkg &>/dev/null; then
+        # Scope-first: identify only packages that own files in critical directories.
+        # dpkg -S is a fast DB lookup (~ms per file), far cheaper than dpkg -V on all pkgs.
+        local _dv_pkgs
+        _dv_pkgs=$(
+            find /usr/bin /usr/sbin /bin /sbin -maxdepth 1 -type f -print0 2>/dev/null \
+            | xargs -0 -n 200 dpkg -S 2>/dev/null \
+            | awk -F: '{print $1}'
+            # Also include packages owning PAM security modules
+            find /lib/security /lib/x86_64-linux-gnu/security \
+                 /lib/aarch64-linux-gnu/security /usr/lib/x86_64-linux-gnu/security \
+                 /usr/lib/aarch64-linux-gnu/security \
+                 -maxdepth 1 -name "*.so" -print0 2>/dev/null \
+            | xargs -0 -n 200 dpkg -S 2>/dev/null \
+            | awk -F: '{print $1}'
+        )
+        _dv_pkgs=$(echo "$_dv_pkgs" | sort -u)
+
+        if [[ -z "$_dv_pkgs" ]]; then
+            log_warn "Binary integrity: no packages found owning critical binaries — skipping"
+            unset -f _report_modified_binary _is_critical_path
+            return
+        fi
+
+        # Verify only the scoped package set, in parallel (4 workers)
+        local _dv_output
+        _dv_output=$(echo "$_dv_pkgs" | xargs -P4 -I{} dpkg --verify {} 2>/dev/null || true)
+
+        while IFS= read -r _dv_line; do
+            [[ -z "$_dv_line" ]] && continue
+            # Skip conffiles (dpkg marks them with " c " as second field)
+            [[ "$_dv_line" =~ ^[^[:space:]]+[[:space:]]+c[[:space:]] ]] && continue
+            local _dv_file
+            _dv_file=$(echo "$_dv_line" | awk '{print $NF}')
+            [[ -z "$_dv_file" ]] && continue
+            _is_critical_path "$_dv_file" || continue
+            _report_modified_binary "$_dv_file"
+        done <<< "$_dv_output"
+
+    elif command -v rpm &>/dev/null; then
+        # Scope-first: identify packages owning files in critical directories via rpm -qf
+        local _rv_pkgs
+        _rv_pkgs=$(
+            find /usr/bin /usr/sbin /bin /sbin -maxdepth 1 -type f -print0 2>/dev/null \
+            | xargs -0 -n 200 rpm -qf 2>/dev/null \
+            | grep -v "not owned"
+            find /lib/security /usr/lib/security /lib64/security /usr/lib64/security \
+                 -maxdepth 1 -name "*.so" -print0 2>/dev/null \
+            | xargs -0 -n 200 rpm -qf 2>/dev/null \
+            | grep -v "not owned"
+        )
+        _rv_pkgs=$(echo "$_rv_pkgs" | sort -u)
+
+        if [[ -z "$_rv_pkgs" ]]; then
+            log_warn "Binary integrity: no packages found owning critical binaries — skipping"
+            unset -f _report_modified_binary _is_critical_path
+            return
+        fi
+
+        # Verify only the scoped package set, in parallel (4 workers)
+        local _rv_output
+        _rv_output=$(echo "$_rv_pkgs" | xargs -P4 -I{} rpm -V {} 2>/dev/null || true)
+
+        while IFS= read -r _rv_line; do
+            [[ -z "$_rv_line" ]] && continue
+            local _rv_file
+            _rv_file=$(echo "$_rv_line" | awk '{print $NF}')
+            [[ -z "$_rv_file" ]] && continue
+            _is_critical_path "$_rv_file" || continue
+            _report_modified_binary "$_rv_file"
+        done <<< "$_rv_output"
+
+    else
+        log_warn "No package manager (dpkg/rpm) found — binary integrity check skipped"
+        return
+    fi
+
+    unset -f _report_modified_binary _is_critical_path
+
+    # ─── SUID/SGID active filesystem scan ────────────────────────────────────
+    log_check "SUID/SGID files (active filesystem scan)"
+
+    local _suid_paths=(
+        "/usr/bin" "/usr/sbin" "/bin" "/sbin"
+        "/usr/local/bin" "/usr/local/sbin"
+        "/opt" "/tmp" "/dev/shm" "/var/tmp"
+    )
+
+    local _suid_count=0
+    for _sp in "${_suid_paths[@]}"; do
+        [[ -d "$_sp" ]] || continue
+        while IFS= read -r -d '' _suid_file; do
+            _suid_count=$(( _suid_count + 1 ))
+            [[ $_suid_count -gt 200 ]] && { log_info "SUID scan: result limit reached (200), truncating"; break 2; }
+
+            local _hash; _hash=$(get_file_hash "$_suid_file")
+            local _meta; _meta=$(get_file_metadata "$_suid_file")
+            check_file_package "$_suid_file"
+            local _pkg="$PKG_STATUS"
+
+            local _confidence="LOW"
+            local _matched_pattern="suid_binary"
+            local _matched_string="$(basename "$_suid_file")"
+
+            # Suspicious location — always CRITICAL
+            if [[ "$_suid_file" =~ ^(/tmp|/dev/shm|/var/tmp)/ ]]; then
+                _confidence="CRITICAL"
+                _matched_pattern="suid_suspicious_location"
+                _matched_string="SUID in $(dirname "$_suid_file")"
+                log_finding "SUID binary in suspicious location: $_suid_file"
+            elif [[ "$_pkg" == "unmanaged" ]]; then
+                _confidence="CRITICAL"
+                _matched_pattern="suid_unmanaged_binary"
+                _matched_string="unmanaged SUID: $(basename "$_suid_file")"
+                log_finding "Unmanaged SUID binary: $_suid_file"
+            fi
+
+            # If SUID file is a shell script, analyze content
+            local _ftype
+            _ftype=$(file "$_suid_file" 2>/dev/null || echo "")
+            if [[ "$_ftype" =~ (script|text|ASCII) ]]; then
+                local _content
+                _content=$(head -n 200 "$_suid_file" 2>/dev/null | tr -d '\0') || true
+                if [[ -n "$_content" ]] && analyze_content_string "$_content" "$_suid_file"; then
+                    _confidence="CRITICAL"
+                    _matched_pattern="suid_script_malicious_content"
+                    _matched_string="$MATCHED_STRING"
+                    log_finding "SUID shell script with malicious content: $_suid_file"
+                fi
+            fi
+
+            add_finding "Privilege" "SUID" "suid_binary" "$_suid_file" "SUID binary: $(basename "$_suid_file")" "$_confidence" "$_hash" "$_meta" "package=$_pkg" "$_matched_pattern" "$_matched_string"
+        done < <(find "$_sp" -xdev -maxdepth 3 -perm -4000 -type f -print0 2>/dev/null)
+    done
+    if [[ $_suid_count -gt 200 ]]; then
+        log_warn "SUID scan: $_suid_count SUID files found -- only first 200 inspected"
+    fi
+
+    log_check "SGID files (active filesystem scan)"
+    local _sgid_count=0
+    for _sp in "${_suid_paths[@]}"; do
+        [[ -d "$_sp" ]] || continue
+        while IFS= read -r -d '' _sgid_file; do
+            _sgid_count=$(( _sgid_count + 1 ))
+            [[ $_sgid_count -gt 100 ]] && break 2
+
+            local _hash; _hash=$(get_file_hash "$_sgid_file")
+            local _meta; _meta=$(get_file_metadata "$_sgid_file")
+            check_file_package "$_sgid_file"
+            local _pkg="$PKG_STATUS"
+
+            local _confidence="LOW"
+            local _matched_pattern="sgid_binary"
+            [[ "$_pkg" == "unmanaged" ]] && { _confidence="HIGH"; _matched_pattern="sgid_unmanaged_binary"; log_finding "Unmanaged SGID binary: $_sgid_file"; }
+            [[ "$_sgid_file" =~ ^(/tmp|/dev/shm|/var/tmp)/ ]] && { _confidence="CRITICAL"; _matched_pattern="sgid_suspicious_location"; log_finding "SGID binary in suspicious location: $_sgid_file"; }
+
+            add_finding "Privilege" "SGID" "sgid_binary" "$_sgid_file" "SGID binary: $(basename "$_sgid_file")" "$_confidence" "$_hash" "$_meta" "package=$_pkg" "$_matched_pattern" "$(basename "$_sgid_file")"
+        done < <(find "$_sp" -xdev -maxdepth 3 -perm -2000 -type f -print0 2>/dev/null)
+    done
+    if [[ $_sgid_count -gt 100 ]]; then
+        log_warn "SGID scan: $_sgid_count SGID files found -- only first 100 inspected"
+    fi
+
+    # ─── File Capabilities (getcap) ───────────────────────────────────────────
+    log_check "File capabilities (getcap)"
+
+    if command -v getcap &>/dev/null; then
+        # GTFOBins that are dangerous with cap_setuid
+        local _gtfobins=("bash" "sh" "python" "python2" "python3" "perl" "ruby" "find" "vim" "vi" "nmap" "awk" "gawk" "mawk" "less" "more" "tee" "cp" "rsync" "tar")
+
+        local _cap_paths=("/usr/bin" "/usr/sbin" "/bin" "/sbin" "/usr/local/bin" "/usr/local/sbin" "/opt" "/srv" "/home")
+        local _cap_output=""
+        for _cap_path in "${_cap_paths[@]}"; do
+            [[ -d "$_cap_path" ]] || continue
+            _cap_output+=$(timeout 30 getcap -r "$_cap_path" 2>/dev/null || true)
+            _cap_output+=$'\n'
+        done
+
+        while IFS= read -r _cap_line; do
+            [[ -z "$_cap_line" ]] && continue
+            # Format: /path/to/binary = cap_net_raw+ep
+            local _cap_file _cap_caps
+            read -r _cap_file _ _cap_caps <<< "$_cap_line"
+            [[ -z "$_cap_file" ]] && continue
+
+            local _hash; _hash=$(get_file_hash "$_cap_file")
+            local _meta; _meta=$(get_file_metadata "$_cap_file")
+            check_file_package "$_cap_file"
+            local _pkg="$PKG_STATUS"
+
+            local _confidence="LOW"
+            local _matched_pattern="file_capability"
+            local _matched_string="$_cap_caps"
+
+            # cap_sys_admin on anything → CRITICAL
+            if [[ "$_cap_caps" =~ "cap_sys_admin" ]]; then
+                _confidence="CRITICAL"
+                _matched_pattern="cap_sys_admin"
+                log_finding "cap_sys_admin capability: $_cap_file ($_cap_caps)"
+            # cap_setuid on GTFOBin → CRITICAL
+            elif [[ "$_cap_caps" =~ "cap_setuid" ]]; then
+                local _basename
+                _basename=$(basename "$_cap_file")
+                local _is_gtfobin=false
+                for _gtf in "${_gtfobins[@]}"; do
+                    if [[ "$_basename" == "$_gtf" ]] || [[ "$_basename" =~ ^${_gtf}[0-9.]+$ ]]; then
+                        _is_gtfobin=true
+                        break
+                    fi
+                done
+                if [[ "$_is_gtfobin" == "true" ]]; then
+                    _confidence="CRITICAL"
+                    _matched_pattern="cap_setuid_gtfobin"
+                    log_finding "cap_setuid on GTFOBin: $_cap_file ($_cap_caps)"
+                elif [[ "$_pkg" == "unmanaged" ]]; then
+                    _confidence="HIGH"
+                    _matched_pattern="cap_setuid_unmanaged"
+                    log_finding "cap_setuid on unmanaged binary: $_cap_file"
+                fi
+            # cap_net_raw on pkg-owned utility → LOW (expected for ping, tcpdump)
+            elif [[ "$_cap_caps" =~ "cap_net_raw" ]] && [[ "$_pkg" == "managed" ]]; then
+                _confidence="LOW"
+            elif [[ "$_pkg" == "unmanaged" ]]; then
+                _confidence="MEDIUM"
+            fi
+
+            add_finding "Privilege" "Capability" "file_capability" "$_cap_file" "File capability: $(basename "$_cap_file") ($_cap_caps)" "$_confidence" "$_hash" "$_meta" "package=$_pkg|caps=$_cap_caps" "$_matched_pattern" "$_matched_string"
+        done <<< "$_cap_output"
+    else
+        log_info "getcap not available — skipping file capability scan"
+    fi
+
+    # ─── Binary Hijacking — Renamed originals (.original/.old/.bak/.real) ───
+    log_check "Binary hijacking (renamed originals)"
+
+    local _hijack_dirs=("/bin" "/usr/bin" "/sbin" "/usr/sbin" "/usr/local/bin" "/usr/local/sbin")
+    for _hd in "${_hijack_dirs[@]}"; do
+        [[ -d "$_hd" ]] || continue
+        while IFS= read -r -d '' _renamed; do
+            local _base_with_suffix; _base_with_suffix=$(basename "$_renamed")
+            # Strip suffix to get active name
+            local _active_name="${_base_with_suffix%.original}"
+            _active_name="${_active_name%.old}"
+            _active_name="${_active_name%.bak}"
+            _active_name="${_active_name%.real}"
+            local _active_path="$_hd/$_active_name"
+
+            local _hash; _hash=$(get_file_hash "$_renamed")
+            local _meta; _meta=$(get_file_metadata "$_renamed")
+
+            local _confidence="MEDIUM"
+            local _matched_pattern="renamed_binary"
+            local _matched_string="$(basename "$_renamed")"
+
+            if [[ -f "$_active_path" ]]; then
+                # Active file exists — check if it's a wrapper script
+                local _ftype
+                _ftype=$(file "$_active_path" 2>/dev/null || echo "")
+                if [[ "$_ftype" =~ (script|text|ASCII) ]] || head -c 3 "$_active_path" 2>/dev/null | grep -qE "^#!"; then
+                    # Active binary is a shell script — likely a wrapper
+                    _confidence="CRITICAL"
+                    _matched_pattern="binary_hijack_wrapper"
+                    _matched_string="Renamed: $(basename "$_renamed") → Wrapper: $_active_name"
+                    log_finding "Binary hijacking detected: $_active_path is wrapper, original at $_renamed"
+
+                    local _wrapper_content
+                    _wrapper_content=$(head -n 200 "$_active_path" 2>/dev/null | tr -d '\0') || true
+                    if [[ -n "$_wrapper_content" ]] && analyze_content_string "$_wrapper_content" "$_active_path"; then
+                        _matched_string="$MATCHED_STRING"
+                    fi
+                else
+                    _confidence="HIGH"
+                    _matched_pattern="renamed_binary_active_present"
+                    _matched_string="Renamed: $(basename "$_renamed") | Active: $_active_name exists"
+                    log_finding "Renamed binary with active counterpart: $_renamed"
+                fi
+            else
+                log_finding "Renamed binary (no active counterpart): $_renamed"
+            fi
+
+            add_finding "Privilege" "BinaryHijack" "renamed_binary" "$_renamed" "Renamed binary: $(basename "$_renamed")" "$_confidence" "$_hash" "$_meta" "active=$_active_path" "$_matched_pattern" "$_matched_string"
+        done < <(find "$_hd" -maxdepth 1 -type f \( -name "*.original" -o -name "*.old" -o -name "*.bak" -o -name "*.real" \) -print0 2>/dev/null)
     done
 }
 
@@ -4904,7 +6726,7 @@ main() {
                     MIN_CONFIDENCE="$2"
                     shift 2
                 else
-                    echo "Error: --min-confidence requires a value (LOW|MEDIUM|HIGH)"
+                    echo "Error: --min-confidence requires a value (LOW|MEDIUM|HIGH|CRITICAL)"
                     exit 1
                 fi
                 ;;
@@ -4919,12 +6741,12 @@ main() {
     # Validate MIN_CONFIDENCE if set
     if [[ -n "$MIN_CONFIDENCE" ]]; then
         case "$MIN_CONFIDENCE" in
-            "LOW"|"MEDIUM"|"HIGH")
+            "LOW"|"MEDIUM"|"HIGH"|"CRITICAL")
                 # Valid
                 ;;
             *)
                 log_warn "Invalid MIN_CONFIDENCE value: '$MIN_CONFIDENCE'"
-                log_warn "Valid values are: LOW, MEDIUM, HIGH"
+                log_warn "Valid values are: LOW, MEDIUM, HIGH, CRITICAL"
                 log_warn "Using default: MEDIUM"
                 MIN_CONFIDENCE="MEDIUM"
                 ;;
@@ -4965,32 +6787,51 @@ main() {
     SCAN_EPOCH=$(date +%s)
     echo
 
-    # Run detection modules
-    check_systemd
+    # Run all detection modules in parallel for speed
+    # Each module writes to its own temp CSV/JSONL; logs buffered and printed in order
+    log_info "Launching detection modules in parallel..."
     echo
 
-    check_cron
-    echo
+    local _mods=(systemd cron shell_profiles init_scripts kernel_preload additional backdoors ssh binary_integrity bootloader polkit dbus udev container)
+    local _mod_fns=(check_systemd check_cron check_shell_profiles check_init_scripts check_kernel_and_preload check_additional_persistence check_common_backdoors check_ssh_persistence check_binary_integrity check_bootloader_persistence check_polkit_persistence check_dbus_persistence check_udev_persistence check_container_persistence)
+    local _mod_pids=()
 
-    check_shell_profiles
-    echo
+    local _mi=0
+    for _mfn in "${_mod_fns[@]}"; do
+        local _mname="${_mods[$_mi]}"
+        local _mcsv="${TEMP_DATA}/${_mname}.csv"
+        local _mjsonl="${TEMP_DATA}/${_mname}.jsonl"
+        local _mlog="${TEMP_DATA}/${_mname}.log"
+        > "$_mcsv"
+        > "$_mjsonl"
+        (
+            CSV_FILE="$_mcsv"
+            JSONL_FILE="$_mjsonl"
+            MODULE_NAME="$_mname"
+            "$_mfn"
+        ) > "$_mlog" 2>&1 &
+        _mod_pids+=($!)
+        _mi=$(( _mi + 1 ))
+    done
 
-    check_init_scripts
-    echo
-
-    check_kernel_and_preload
-    echo
-
-    check_additional_persistence
-    echo
-
-    check_common_backdoors
-    echo
+    # Wait for each module in display order, print buffered log, merge findings
+    _mi=0
+    for _mname in "${_mods[@]}"; do
+        if ! wait "${_mod_pids[$_mi]}"; then
+            echo "[WARN] Module '${_mname}' exited with error — findings may be incomplete" >&2
+        fi
+        cat "${TEMP_DATA}/${_mname}.log"
+        echo
+        cat "${TEMP_DATA}/${_mname}.csv"  >> "$CSV_FILE"
+        cat "${TEMP_DATA}/${_mname}.jsonl" >> "$JSONL_FILE"
+        _mi=$(( _mi + 1 ))
+    done
 
     # Summary
     log_info "=========================================="
     log_info "Detection Complete!"
     log_info "=========================================="
+    FINDINGS_COUNT=$(grep -c '^{' "$JSONL_FILE" 2>/dev/null || echo 0)
     log_info "Total findings logged: $FINDINGS_COUNT"
     log_info "Results saved to:"
     log_info "  CSV:   $CSV_FILE"
@@ -5006,16 +6847,49 @@ main() {
 
     # Count findings by confidence from JSONL (single pass per level)
     local CNT_CRITICAL CNT_HIGH CNT_MEDIUM CNT_LOW
-    CNT_CRITICAL=$(grep -c '"confidence":"CRITICAL"' "$JSONL_FILE" 2>/dev/null || echo 0)
-    CNT_HIGH=$(grep -c '"confidence":"HIGH"'     "$JSONL_FILE" 2>/dev/null || echo 0)
-    CNT_MEDIUM=$(grep -c '"confidence":"MEDIUM"'  "$JSONL_FILE" 2>/dev/null || echo 0)
-    CNT_LOW=$(grep -c '"confidence":"LOW"'      "$JSONL_FILE" 2>/dev/null || echo 0)
+    # Count findings by confidence using JSON field parse (avoids false counts from field content)
+    CNT_CRITICAL=$(python3 -c "
+import sys, json
+count = 0
+for line in open('$JSONL_FILE'):
+    try:
+        if json.loads(line).get('confidence') == 'CRITICAL': count += 1
+    except: pass
+print(count)
+" 2>/dev/null || grep -c '"confidence":"CRITICAL"' "$JSONL_FILE" 2>/dev/null || echo 0)
+    CNT_HIGH=$(python3 -c "
+import sys, json
+count = 0
+for line in open('$JSONL_FILE'):
+    try:
+        if json.loads(line).get('confidence') == 'HIGH': count += 1
+    except: pass
+print(count)
+" 2>/dev/null || grep -c '"confidence":"HIGH"' "$JSONL_FILE" 2>/dev/null || echo 0)
+    CNT_MEDIUM=$(python3 -c "
+import sys, json
+count = 0
+for line in open('$JSONL_FILE'):
+    try:
+        if json.loads(line).get('confidence') == 'MEDIUM': count += 1
+    except: pass
+print(count)
+" 2>/dev/null || grep -c '"confidence":"MEDIUM"' "$JSONL_FILE" 2>/dev/null || echo 0)
+    CNT_LOW=$(python3 -c "
+import sys, json
+count = 0
+for line in open('$JSONL_FILE'):
+    try:
+        if json.loads(line).get('confidence') == 'LOW': count += 1
+    except: pass
+print(count)
+" 2>/dev/null || grep -c '"confidence":"LOW"' "$JSONL_FILE" 2>/dev/null || echo 0)
 
     cat > "$REPORT_FILE" << REPORT
 ================================================================================
   Persistnux — Linux Persistence Detection Report
 ================================================================================
-  Version    : 1.9.0
+  Version    : 2.4.0
   Date/Time  : $(date '+%Y-%m-%d %H:%M:%S %Z')
   Hostname   : ${HOSTNAME}
   IP Address : ${HOST_IP}
@@ -5043,14 +6917,20 @@ main() {
 --------------------------------------------------------------------------------
   DETECTION MODULES RUN
 --------------------------------------------------------------------------------
-  [1/7] Systemd (services, timers, generators)
-  [2/7] Cron & scheduled tasks (cron.d, cron.daily/weekly/monthly/hourly, at)
-  [3/7] Shell profiles (system-wide + per-user, all major shells)
-  [4/7] Init scripts (rc.local, init.d, MOTD)
-  [5/7] Kernel & library preloading (ld.so.preload, ld.so.conf, LKMs, modprobe)
-  [6/7] Additional persistence (XDG, environment, sudoers, PAM, MOTD)
-  [7/7] Common backdoor locations (APT/YUM hooks, DPKG postinst, RPM %post,
-        YUM/DNF plugins, sudoers.d, webshells, git configs)
+  [1/14]  Systemd (services, timers, generators, .path units, OnFailure= hooks)
+  [2/14]  Cron & scheduled tasks (cron.d, cron.daily/weekly/monthly/hourly, at)
+  [3/14]  Shell profiles (system-wide + per-user, all major shells)
+  [4/14]  Init scripts (rc.local, init.d, MOTD)
+  [5/14]  Kernel & library preloading (ld.so.preload, ld.so.conf, LKMs, modprobe)
+  [6/14]  Additional persistence (XDG, environment, sudoers, PAM)
+  [7/14]  Common backdoor locations (APT/YUM hooks, DPKG postinst, webshells, git)
+  [8/14]  SSH persistence (authorized_keys, ~/.ssh/rc)
+  [9/14]  Binary integrity (dpkg -V / rpm -Va — modified system binaries)
+  [10/14] Bootloader (GRUB cmdline, initrd dropped scripts, dracut hooks)
+  [11/14] Polkit (rules granting unconditional privilege escalation)
+  [12/14] D-Bus (service activation files, wildcard policies)
+  [13/14] Udev (RUN+= commands in udev rules)
+  [14/14] Container (Docker security posture — privileged, host mounts, backdoors)
 
 --------------------------------------------------------------------------------
   NOTES
@@ -5059,6 +6939,7 @@ main() {
   - All findings include file hash, owner, permissions, and package status
   - Package integrity verified via dpkg --verify / rpm -V where applicable
   - Review JSONL output for machine-readable data: jq . ${JSONL_FILE}
+  - Exit code 1 is returned when CRITICAL findings exist (for CI/CD integration)
 ================================================================================
 REPORT
 
@@ -5069,6 +6950,12 @@ REPORT
     rm -rf "$TEMP_DATA" 2>/dev/null
 
     log_info "Analysis completed at $(date)"
+
+    # Exit non-zero if CRITICAL findings exist — enables CI/CD integration
+    # and automated alerting pipelines that check exit code.
+    if [[ ${CNT_CRITICAL:-0} -gt 0 ]]; then
+        exit 1
+    fi
 }
 
 # Run main function

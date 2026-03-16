@@ -19,7 +19,7 @@ sudo OUTPUT_DIR=/tmp/ir_collection ./persistnux.sh
 ```bash
 # Compress output for transport
 cd persistnux_output
-tar -czf persistnux_evidence_$(hostname)_$(date +%Y%m%d_%H%M%S).tar.gz *.csv *.jsonl
+tar -czf persistnux_evidence_$(hostname)_$(date +%Y%m%d_%H%M%S).tar.gz *.csv *.jsonl *.txt
 
 # Calculate hash for chain of custody
 sha256sum persistnux_evidence_*.tar.gz > evidence.sha256
@@ -54,9 +54,10 @@ jq 'select(.confidence == "HIGH")' persistnux_*.jsonl
 5. **Shell Profiles** - Per-session execution for all users
 
 **Secondary Review:**
-6. **Kernel Modules** - Deep system integration
-7. **XDG Autostart** - User-level GUI persistence
-8. **PAM Configurations** - Authentication bypass
+6. **SSH Persistence** - authorized_keys command= restrictions, ~/.ssh/rc backdoors
+7. **Kernel Modules** - Deep system integration
+8. **XDG Autostart** - User-level GUI persistence
+9. **PAM Configurations** - Authentication bypass
 
 ### 3. Analysis Workflow
 
@@ -251,6 +252,20 @@ find evidence/ -type f -exec sha256sum {} \; > evidence/evidence_hashes.txt
 - MITRE ATT&CK: Persistence Tactics (TA0003)
 - SANS DFIR Cheat Sheets
 - Linux Forensics Resources
+
+## Exit Codes
+
+Persistnux returns structured exit codes for CI/CD integration:
+
+| Exit Code | Meaning |
+|-----------|---------|
+| 0 | Scan completed successfully — no CRITICAL findings |
+| 1 | CRITICAL findings detected — immediate response required |
+
+```bash
+# Example: fail a CI pipeline if CRITICAL persistence is found
+sudo ./persistnux.sh || { echo "CRITICAL persistence detected!"; exit 1; }
+```
 
 ## Questions or Issues?
 
