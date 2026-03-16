@@ -277,56 +277,13 @@ Persistnux automatically flags items with higher confidence when it detects:
 | RedHat / RHEL | ⚠️ Not yet tested | rpm support is implemented but unverified on live systems |
 | Fedora | ⚠️ Not yet tested | rpm support is implemented but unverified on live systems |
 | CentOS / AlmaLinux / Rocky | ⚠️ Not yet tested | rpm support is implemented but unverified on live systems |
-| Arch Linux | 🔬 Experimental | pacman support implemented |
 
 > **Note:** The tool is primarily tested on **Ubuntu/Debian** systems. RedHat, Fedora, and RPM-based distributions have package manager support implemented in code but have not been validated in live test environments. Contributions and test reports for RPM-based distros are welcome.
-
-## DFIR Workflow Integration
-
-### Example: Import into Splunk
-
-```bash
-# Index JSONL output
-cat persistnux_*.jsonl | splunk add oneshot -sourcetype persistnux:jsonl
-```
-
-### Example: Analyze with jq
-
-```bash
-# Find all HIGH confidence findings
-cat persistnux_*.jsonl | jq 'select(.confidence == "HIGH")'
-
-# Group by category
-cat persistnux_*.jsonl | jq -r '.category' | sort | uniq -c
-
-# Find all systemd services with suspicious commands
-cat persistnux_*.jsonl | jq 'select(.category == "Systemd Service" and .confidence == "HIGH")'
-```
-
-### Example: Import into Pandas (Python)
-
-```python
-import pandas as pd
-
-# Load CSV
-df = pd.read_csv('persistnux_hostname_timestamp.csv')
-
-# Filter high-confidence findings
-high_risk = df[df['confidence'] == 'HIGH']
-
-# Group by category
-df.groupby('category').size()
-```
 
 ## Roadmap
 
 - [ ] Offline analysis mode for forensic disk images
-- [ ] UAC (Unix-like Artifacts Collector) integration
-- [ ] YARA rule integration for binary analysis
-- [ ] Timeline generation
-- [ ] HTML report generation
-- [ ] Baseline comparison mode
-- [ ] Detection of rootkits (chkrootkit/rkhunter integration)
+- [ ] UAC (Unix-like Artifacts Collector) collection integration
 
 ## Contributing
 
