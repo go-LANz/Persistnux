@@ -42,5 +42,4 @@ wheels/
 *.egg
 
 #MD files
-MISSING_PERSISTENCE_MECHANISMS.md
 CHANGELOG.md
