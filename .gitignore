@@ -43,3 +43,6 @@ wheels/
 
 #MD files
 CHANGELOG.md
+
+# Benchmark output (contains host-identifying data: hostname, usernames, paths)
+benchmark_results/

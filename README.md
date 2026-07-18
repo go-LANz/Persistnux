@@ -263,8 +263,9 @@ Persistnux automatically flags items with higher confidence when it detects:
 ## Requirements
 
 - Bash 4.0+
-- Standard Unix utilities: `find`, `grep`, `stat`, `sha256sum`
-- Optional: `systemctl`, `lsmod`, `modinfo` (for specific checks)
+- Standard Unix utilities: `find`, `grep`, `stat`, `sha256sum`, `awk`, `file`
+- Optional: `systemctl`, `lsmod`, `modinfo`, `getcap`, `dpkg`/`rpm` (for specific checks)
+- No interpreter dependency (pure bash + coreutils; no `python`/`jq` required)
 - Root/sudo access recommended for comprehensive analysis
 
 ## Tested On / Compatibility
@@ -274,16 +275,30 @@ Persistnux automatically flags items with higher confidence when it detects:
 | Ubuntu 22.04 LTS | ✅ Tested | Primary development and test platform |
 | Ubuntu 20.04 LTS | ✅ Tested | Fully supported |
 | Debian 11/12 | ✅ Tested | dpkg-based, same path conventions |
+| Kali Linux (rolling) | ✅ Tested | Used for the PANIX detection benchmark (see below) |
 | RedHat / RHEL | ⚠️ Not yet tested | rpm support is implemented but unverified on live systems |
 | Fedora | ⚠️ Not yet tested | rpm support is implemented but unverified on live systems |
 | CentOS / AlmaLinux / Rocky | ⚠️ Not yet tested | rpm support is implemented but unverified on live systems |
 
 > **Note:** The tool is primarily tested on **Ubuntu/Debian** systems. RedHat, Fedora, and RPM-based distributions have package manager support implemented in code but have not been validated in live test environments. Contributions and test reports for RPM-based distros are welcome.
 
+## Testing / Benchmark
+
+Persistnux is benchmarked against [**PANIX**](https://github.com/Aegrah/PANIX),
+which installs the same persistence mechanisms Persistnux hunts. The repeatable
+harness at [`tests/panix_benchmark.sh`](tests/panix_benchmark.sh) applies each
+PANIX technique, runs Persistnux, and confirms detection via a baseline diff.
+Every file-based PANIX technique that applies on the test box is detected at
+`MEDIUM`+ confidence. See [PANIX_BENCHMARK.md](PANIX_BENCHMARK.md) for the full
+coverage table and methodology.
+
+> ⚠️ The benchmark installs real backdoors — run it only in a disposable VM.
+
 ## Roadmap
 
 - [ ] Offline analysis mode for forensic disk images
 - [ ] UAC (Unix-like Artifacts Collector) collection integration
+- [ ] Extend the PANIX benchmark to bootloader/initramfs/LKM vectors on a full VM
 
 ## Resources
 https://www.elastic.co/security-labs/continuation-on-persistence-mechanisms

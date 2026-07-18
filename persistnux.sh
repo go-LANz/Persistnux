@@ -4,7 +4,7 @@
 # A comprehensive DFIR tool to detect known Linux persistence mechanisms
 # Author: DFIR Community Project
 # License: MIT
-# Version: 2.4.0
+# Version: 2.6.0
 ################################################################################
 
 # Require bash 4.0+ for associative arrays (declare -A)
@@ -28,13 +28,16 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Global variables
+VERSION="2.6.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUTPUT_DIR="${OUTPUT_DIR:-./persistnux_output}"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 HOSTNAME=$(hostname)
 CSV_FILE="${OUTPUT_DIR}/persistnux_${HOSTNAME}_${TIMESTAMP}.csv"
 JSONL_FILE="${OUTPUT_DIR}/persistnux_${HOSTNAME}_${TIMESTAMP}.jsonl"
-TEMP_DATA="/tmp/persistnux_${TIMESTAMP}"
+# Created via mktemp in init_output() — a predictable /tmp path is a symlink/race
+# risk for a tool that runs as root on potentially compromised systems
+TEMP_DATA=""
 FINDINGS_COUNT=0
 CHECK_NUM=0
 
@@ -47,11 +50,12 @@ EUID_CHECK=$(id -u)
 
 # Performance: Package manager cache to avoid repeated lookups
 # Format: PKG_CACHE["/path/to/file"]="status:package_name" or "unmanaged"
-# NOTE: PKG_CACHE is per-subshell -- each of the 14 parallel modules has its own
-# copy after fork. Cross-module cache sharing requires a file-based implementation
-# with flock, which is a planned v2.5.0 enhancement. Cache still eliminates
-# duplicate calls WITHIN a single module's run.
+# PKG_CACHE is per-subshell (each of the 14 parallel modules gets a fork copy),
+# so results are ALSO mirrored to PKG_CACHE_FILE (tab-separated path<TAB>status,
+# set in init_output) which all module subshells share. Appends of short lines
+# via O_APPEND are atomic, so no locking is required.
 declare -A PKG_CACHE
+PKG_CACHE_FILE=""
 
 # Performance: File hash + metadata caches to avoid repeated sha256sum/stat calls
 # The same binary/script path can appear in systemd, cron, and autostart checks
@@ -79,7 +83,7 @@ declare -a SUSPICIOUS_NETWORK_PATTERNS=(
     "/bin/bash -c exec 5<>/dev/tcp/"
     "/bin/bash -c exec 5<>/dev/udp/"
     "nc.*-e.*(sh|bash|dash|zsh)"      # Netcat with any shell execute flag
-    "/bin/sh | nc"
+    "/bin/sh[[:space:]]*\|[[:space:]]*nc"   # /bin/sh piped to netcat (fixed: was unescaped alternation)
     "nc -k.*-l"                       # Netcat bind shell listener (persistent)
     "ncat -k.*-l"                     # Ncat bind shell listener (persistent)
     "mknod.*backpipe"
@@ -227,7 +231,7 @@ declare -a NEVER_WHITELIST_PATTERNS=(
     "\| *sh\b"                   # Piping to sh (fixed: word boundary, was trailing-space)
     "\| */bin/sh"                # Piping to /bin/sh
     "\| */bin/bash"              # Piping to /bin/bash
-    ">&[ ]*/dev/"                # Redirecting to /dev/ (reverse shell pattern)
+    ">&[ ]*/dev/(tcp|udp)/"      # Redirecting to /dev/tcp|udp (reverse shell; fixed: was matching >&/dev/null)
     "exec [0-9]*<>/dev/"         # Bash exec fd+bidirectional dev redirect (fixed: was dead pattern)
     "python.*socket\.socket"     # Python socket creation
     "python.*socket.*connect"    # Python socket connect (removed spurious space requirement)
@@ -520,7 +524,7 @@ show_usage() {
     cat << EOF
 Usage: sudo ./persistnux.sh [OPTIONS]
 
-Persistnux - Linux Persistence Detection Tool v2.4.0
+Persistnux - Linux Persistence Detection Tool v${VERSION}
 Comprehensive DFIR tool to detect Linux persistence mechanisms
 
 OPTIONS:
@@ -579,10 +583,9 @@ print_banner() {
   / /_/ / _ \/ ___/ ___/ / ___/ __/ / / / |/_/ |/_/
  / ____/  __/ /  (__  ) (__  ) /_/ /_/ />  <_>  <
 /_/    \___/_/  /____/_/____/\__/\__,_/_/|_/_/|_|
-
-    Linux Persistence Detection Tool v2.4.0
-    For DFIR Investigations
 EOF
+    echo "    Linux Persistence Detection Tool v${VERSION}"
+    echo "    For DFIR Investigations"
     echo -e "${NC}"
 }
 
@@ -698,6 +701,16 @@ get_systemctl_enabled_status() {
     fi
 }
 
+# Store a package-status result in both the in-memory cache and the shared
+# file cache so parallel module subshells benefit from each other's lookups
+_pkg_cache_store() {
+    local key="$1" val="$2"
+    PKG_CACHE["$key"]="$val"
+    if [[ -n "${PKG_CACHE_FILE:-}" ]]; then
+        printf '%s\t%s\n' "$key" "$val" >> "$PKG_CACHE_FILE" 2>/dev/null || true
+    fi
+}
+
 # Check if file is managed by package manager (reduces false positives)
 # Uses PKG_CACHE for performance optimization
 is_package_managed() {
@@ -713,7 +726,7 @@ is_package_managed() {
         canonical=$(realpath "$file" 2>/dev/null) && file="$canonical" || true
     fi
 
-    # Check cache first (performance optimization)
+    # Check in-memory cache first (performance optimization)
     if [[ -n "${PKG_CACHE[$file]+isset}" ]]; then
         local cached="${PKG_CACHE[$file]}"
         echo "$cached"
@@ -722,6 +735,23 @@ is_package_managed() {
         elif [[ "$cached" == "unmanaged" ]]; then
             return 1
         else
+            return 0
+        fi
+    fi
+
+    # Check the shared file cache — another parallel module may have already
+    # resolved this path (an awk lookup is far cheaper than a dpkg/rpm query)
+    if [[ -n "${PKG_CACHE_FILE:-}" ]] && [[ -s "$PKG_CACHE_FILE" ]]; then
+        local file_cached
+        file_cached=$(awk -F'\t' -v k="$file" '$1==k{print $2; exit}' "$PKG_CACHE_FILE" 2>/dev/null) || true
+        if [[ -n "$file_cached" ]]; then
+            PKG_CACHE["$file"]="$file_cached"
+            echo "$file_cached"
+            if [[ "$file_cached" == *":MODIFIED" ]]; then
+                return 2
+            elif [[ "$file_cached" == "unmanaged" ]]; then
+                return 1
+            fi
             return 0
         fi
     fi
@@ -736,7 +766,7 @@ is_package_managed() {
     # very specific directory name that doesn't appear in false contexts).
     if [[ "$file" =~ /snap/ ]] || [[ "$file" =~ ^/var/lib/snapd/ ]]; then
         result="snap:managed"
-        PKG_CACHE["$file"]="$result"
+        _pkg_cache_store "$file" "$result"
         echo "$result"
         return 0
     fi
@@ -744,7 +774,7 @@ is_package_managed() {
     # Check flatpak packages - files under flatpak dirs are flatpak-managed
     if [[ "$file" =~ ^/var/lib/flatpak/ ]] || [[ "$file" =~ ^/run/host/usr/ ]]; then
         result="flatpak:managed"
-        PKG_CACHE["$file"]="$result"
+        _pkg_cache_store "$file" "$result"
         echo "$result"
         return 0
     fi
@@ -763,7 +793,7 @@ is_package_managed() {
        [[ "$file" =~ /.local/lib/python ]] || \
        [[ "$file" =~ /.local/share/virtualenvs/ ]]; then
         result="runtime-managed"
-        PKG_CACHE["$file"]="$result"
+        _pkg_cache_store "$file" "$result"
         echo "$result"
         return 0
     fi
@@ -833,7 +863,7 @@ is_package_managed() {
             fi
 
             # Cache the result
-            PKG_CACHE["$file"]="$result"
+            _pkg_cache_store "$file" "$result"
             echo "$result"
             return $ret_code
         fi
@@ -876,7 +906,7 @@ is_package_managed() {
             fi
 
             # Cache the result
-            PKG_CACHE["$file"]="$result"
+            _pkg_cache_store "$file" "$result"
             echo "$result"
             return $ret_code
         fi
@@ -910,7 +940,7 @@ is_package_managed() {
                 ret_code=0
             fi
 
-            PKG_CACHE["$file"]="$result"
+            _pkg_cache_store "$file" "$result"
             echo "$result"
             return $ret_code
         fi
@@ -920,14 +950,14 @@ is_package_managed() {
     if command -v apk &>/dev/null; then
         if apk info --who-owns "$file" 2>/dev/null | grep -q "is owned by"; then
             result="apk:managed"
-            PKG_CACHE["$file"]="$result"
+            _pkg_cache_store "$file" "$result"
             echo "$result"
             return 0
         fi
     fi
 
     # Not managed by package manager - cache and return
-    PKG_CACHE["$file"]="unmanaged"
+    _pkg_cache_store "$file" "unmanaged"
     echo "unmanaged"
     return 1
 }
@@ -1301,6 +1331,14 @@ analyze_script_content() {
         return 1  # Cannot analyze, treat as clean
     fi
 
+    # Binary guard: pattern-matching ELF/binary content produces meaningless
+    # "matches", corrupt matched_string values, and `grep: binary file matches`
+    # noise (observed on package-verified udev RUN+= targets like /usr/sbin/dmsetup
+    # and D-Bus Exec= binaries). Only analyze shebang scripts and text files.
+    if ! is_script "$script_file"; then
+        return 1
+    fi
+
     # Read first 1000 lines of script (to avoid huge files)
     # Strip null bytes to prevent bash warnings with binary content
     local script_content
@@ -1514,7 +1552,7 @@ analyze_content_string() {
     [[ -z "$content" ]] && return 1
 
     local _tmp_file
-    _tmp_file=$(mktemp /tmp/persistnux_content_XXXXXX) || return 1
+    _tmp_file=$(mktemp "${TEMP_DATA:-/tmp}/persistnux_content_XXXXXX") || return 1
     printf '%s' "$content" > "$_tmp_file"
 
     local _result=1
@@ -1874,7 +1912,16 @@ add_finding() {
 # Initialize output files
 init_output() {
     mkdir -p "$OUTPUT_DIR"
-    mkdir -p "$TEMP_DATA"
+    # Unpredictable temp dir (0700) — prevents symlink/pre-creation attacks in /tmp
+    # on compromised hosts. Falls back to a PID-suffixed path if mktemp is missing.
+    TEMP_DATA=$(mktemp -d "/tmp/persistnux_${TIMESTAMP}_XXXXXX" 2>/dev/null) || {
+        TEMP_DATA="/tmp/persistnux_${TIMESTAMP}_$$"
+        mkdir -m 700 "$TEMP_DATA"
+    }
+    # Cross-module package status cache (modules run as parallel subshells and
+    # cannot share the in-memory PKG_CACHE array — see is_package_managed)
+    PKG_CACHE_FILE="${TEMP_DATA}/pkg_cache.tsv"
+    : > "$PKG_CACHE_FILE"
 
     # CSV header (new structured format with matched_pattern and matched_string)
     echo "timestamp,hostname,category,confidence,file_path,file_hash,file_owner,file_permissions,file_age_days,package_status,command,description,matched_pattern,matched_string" > "$CSV_FILE"
@@ -2081,8 +2128,11 @@ check_bootloader_persistence() {
     log_check "/boot/initrd.img-* recent modification"
     while IFS= read -r -d '' _initrd; do
         local _meta; _meta=$(get_file_metadata "$_initrd")
+        # Metadata format carries 'modified:<epoch>' — compute age from scan epoch
         local _days_old="9999"
-        if [[ "$_meta" =~ days_old:([0-9]+) ]]; then _days_old="${BASH_REMATCH[1]}"; fi
+        if [[ "$_meta" =~ modified:([0-9]+) ]]; then
+            _days_old=$(( (SCAN_EPOCH - BASH_REMATCH[1]) / 86400 ))
+        fi
         if [[ "$_days_old" -le 7 ]]; then
             local _hash; _hash=$(get_file_hash "$_initrd")
             add_finding "Bootloader" "InitrdImage" "initrd_recent_modification" "$_initrd" "initrd image recently modified (${_days_old}d ago)" "MEDIUM" "$_hash" "$_meta" "" "initrd_recent_modification" "days_old=$_days_old"
@@ -2107,9 +2157,11 @@ check_systemd() {
         "/etc/systemd/system"
         "/usr/lib/systemd/system"
         "/lib/systemd/system"
+        "/usr/local/lib/systemd/system"   # valid unit search path (systemd-analyze unit-paths); PANIX --systemd --default drops units here
         "/run/systemd/system"
         "/etc/systemd/user"
         "/usr/lib/systemd/user"
+        "/usr/local/lib/systemd/user"
         "$HOME/.config/systemd/user"
     )
 
@@ -2626,9 +2678,11 @@ check_systemd() {
         "/etc/systemd/system-generators"
         "/usr/lib/systemd/system-generators"
         "/lib/systemd/system-generators"
+        "/usr/local/lib/systemd/system-generators"
         "/run/systemd/system-generators"
         "/etc/systemd/user-generators"
         "/usr/lib/systemd/user-generators"
+        "/usr/local/lib/systemd/user-generators"
     )
 
     # Track scanned real paths to avoid double-scanning /lib/ and /usr/lib/ on merged-/usr
@@ -2701,6 +2755,7 @@ check_systemd() {
         "/etc/systemd/system"
         "/usr/lib/systemd/system"
         "/lib/systemd/system"
+        "/usr/local/lib/systemd/system"
         "/run/systemd/system"
     )
 
@@ -5753,6 +5808,7 @@ check_ssh_persistence() {
     fi
 
     log_check "SSH authorized_keys files (all users)"
+    log_check "~/.ssh/rc login hooks (all users)"
 
     # Read AuthorizedKeysFile directive from sshd_config (may specify non-default path)
     local _ak_directive
@@ -5775,8 +5831,9 @@ check_ssh_persistence() {
         for _ak_pattern in "${_ak_patterns[@]}"; do
             local _ak_file
             if [[ "$_ak_pattern" == /* ]]; then
-                # Absolute path -- expand %u for username
+                # Absolute path -- expand sshd tokens: %u = username, %h = home dir
                 _ak_file="${_ak_pattern//%u/$_ssh_user}"
+                _ak_file="${_ak_file//%h/$_ssh_home}"
             else
                 _ak_file="${_ssh_home}/${_ak_pattern}"
             fi
@@ -5820,8 +5877,6 @@ check_ssh_persistence() {
                 "$_ak_days_old" "unmanaged" "" "" "$_ssh_user" "$_ak_pattern" "$_ak_string"
         fi
         done  # _ak_patterns loop
-
-        log_check "~/.ssh/rc login hook ($_ssh_user)"
 
         # ── ~/.ssh/rc ─────────────────────────────────────────────────────────
         # Executed by sshd on every SSH login for the user (before shell launch).
@@ -6059,9 +6114,12 @@ check_dbus_persistence() {
                         log_finding "D-Bus service Exec= target is unmanaged: $_exec_target"
                     fi
 
-                    # Analyze target content
-                    local _exec_content
-                    _exec_content=$(head -n 300 "$_exec_target" 2>/dev/null | tr -d '\0') || true
+                    # Analyze target content (scripts only — D-Bus Exec= targets
+                    # are usually ELF binaries; is_script gate avoids binary FPs)
+                    local _exec_content=""
+                    if is_script "$_exec_target"; then
+                        _exec_content=$(head -n 300 "$_exec_target" 2>/dev/null | tr -d '\0') || true
+                    fi
                     if [[ -n "$_exec_content" ]] && analyze_content_string "$_exec_content" "$_exec_target"; then
                         _confidence="CRITICAL"
                         _matched_pattern="dbus_malicious_exec_content"
@@ -6084,7 +6142,7 @@ check_dbus_persistence() {
             _svc_unit=$(grep -E "^SystemdService=" "$_dsvc" 2>/dev/null | cut -d'=' -f2- | head -1) || true
             if [[ -n "$_svc_unit" ]]; then
                 # Verify the referenced systemd unit is a known/enabled unit
-                if ! systemctl is-enabled "$_svc_unit" &>/dev/null 2>&1; then
+                if ! systemctl is-enabled "$_svc_unit" &>/dev/null; then
                     [[ "$_confidence" == "LOW" ]] && _confidence="MEDIUM"
                     _matched_pattern="${_matched_pattern:-dbus_systemd_service}"
                     _matched_string="SystemdService=$_svc_unit"
@@ -6242,10 +6300,13 @@ check_udev_persistence() {
                     log_finding "Udev rule RUN+= executes from suspicious location: $_run_val"
                 fi
 
-                # If RUN+= points to a script, analyze its content
+                # If RUN+= points to a script, analyze its content.
+                # is_script gate avoids reading ELF binaries (e.g. verified
+                # /usr/sbin/dmsetup in 95-dm-notify.rules) as text — that produced
+                # a CRITICAL false positive with garbage matched_string.
                 local _run_bin
                 read -r _run_bin _ <<< "$_run_val"
-                if [[ -f "$_run_bin" ]]; then
+                if [[ -f "$_run_bin" ]] && is_script "$_run_bin"; then
                     local _run_content
                     _run_content=$(head -n 200 "$_run_bin" 2>/dev/null | tr -d '\0') || true
                     if [[ -n "$_run_content" ]] && analyze_content_string "$_run_content" "$_run_bin"; then
@@ -6324,7 +6385,8 @@ check_container_persistence() {
     local _all_container_ids
     _all_container_ids=$(timeout 10 docker ps -aq 2>/dev/null) || true
     local _total_containers
-    _total_containers=$(echo "$_all_container_ids" | grep -c . 2>/dev/null || echo 0)
+    _total_containers=$(grep -c . <<< "$_all_container_ids" 2>/dev/null || true)
+    _total_containers=${_total_containers:-0}
     local _container_ids
     _container_ids=$(echo "$_all_container_ids" | head -20)
     if [[ "$_total_containers" -gt 20 ]]; then
@@ -6420,84 +6482,88 @@ check_binary_integrity() {
         return 1
     }
 
-    if command -v dpkg &>/dev/null; then
-        # Scope-first: identify only packages that own files in critical directories.
-        # dpkg -S is a fast DB lookup (~ms per file), far cheaper than dpkg -V on all pkgs.
-        local _dv_pkgs
-        _dv_pkgs=$(
-            find /usr/bin /usr/sbin /bin /sbin -maxdepth 1 -type f -print0 2>/dev/null \
-            | xargs -0 -n 200 dpkg -S 2>/dev/null \
-            | awk -F: '{print $1}'
-            # Also include packages owning PAM security modules
-            find /lib/security /lib/x86_64-linux-gnu/security \
-                 /lib/aarch64-linux-gnu/security /usr/lib/x86_64-linux-gnu/security \
-                 /usr/lib/aarch64-linux-gnu/security \
-                 -maxdepth 1 -name "*.so" -print0 2>/dev/null \
-            | xargs -0 -n 200 dpkg -S 2>/dev/null \
-            | awk -F: '{print $1}'
-        )
-        _dv_pkgs=$(echo "$_dv_pkgs" | sort -u)
+    # Package-integrity verification is isolated in a helper and invoked with
+    # `|| true`. CRITICAL: this section must NEVER abort the module. Under
+    # `set -eo pipefail`, a bare `pkgs=$(find|xargs dpkg -S|awk)` whose pipeline
+    # exits non-zero (dpkg -S returns 2 when handed no/unowned files, and `xargs`
+    # without -r invokes the command once with empty input) propagates that
+    # failure and kills the whole function — silently skipping the SUID,
+    # capability, and binary-hijack scans that follow. `xargs -r`, `|| true`
+    # on every scoping/verify assignment, and the helper wrapper prevent that.
+    _verify_system_binaries() {
+        if command -v dpkg &>/dev/null; then
+            # Scope-first: identify only packages that own files in critical dirs.
+            local _dv_pkgs
+            _dv_pkgs=$(
+                find /usr/bin /usr/sbin /bin /sbin -maxdepth 1 -type f -print0 2>/dev/null \
+                | xargs -0 -r -n 200 dpkg -S 2>/dev/null \
+                | awk -F: '{print $1}'
+                find /lib/security /lib/x86_64-linux-gnu/security \
+                     /lib/aarch64-linux-gnu/security /usr/lib/x86_64-linux-gnu/security \
+                     /usr/lib/aarch64-linux-gnu/security \
+                     -maxdepth 1 -name "*.so" -print0 2>/dev/null \
+                | xargs -0 -r -n 200 dpkg -S 2>/dev/null \
+                | awk -F: '{print $1}'
+            ) || true
+            _dv_pkgs=$(sort -u <<< "$_dv_pkgs") || true
 
-        if [[ -z "$_dv_pkgs" ]]; then
-            log_warn "Binary integrity: no packages found owning critical binaries — skipping"
-            unset -f _report_modified_binary _is_critical_path
-            return
+            if [[ -z "$_dv_pkgs" ]]; then
+                log_warn "Binary integrity: no packages found owning critical binaries — skipping verify"
+                return 0
+            fi
+
+            local _dv_output
+            _dv_output=$(xargs -r -P4 -I{} dpkg --verify {} 2>/dev/null <<< "$_dv_pkgs") || true
+
+            while IFS= read -r _dv_line; do
+                [[ -z "$_dv_line" ]] && continue
+                [[ "$_dv_line" =~ ^[^[:space:]]+[[:space:]]+c[[:space:]] ]] && continue
+                local _dv_file
+                _dv_file=$(awk '{print $NF}' <<< "$_dv_line") || true
+                [[ -z "$_dv_file" ]] && continue
+                _is_critical_path "$_dv_file" || continue
+                _report_modified_binary "$_dv_file"
+            done <<< "$_dv_output"
+
+        elif command -v rpm &>/dev/null; then
+            local _rv_pkgs
+            _rv_pkgs=$(
+                find /usr/bin /usr/sbin /bin /sbin -maxdepth 1 -type f -print0 2>/dev/null \
+                | xargs -0 -r -n 200 rpm -qf 2>/dev/null \
+                | grep -v "not owned"
+                find /lib/security /usr/lib/security /lib64/security /usr/lib64/security \
+                     -maxdepth 1 -name "*.so" -print0 2>/dev/null \
+                | xargs -0 -r -n 200 rpm -qf 2>/dev/null \
+                | grep -v "not owned"
+            ) || true
+            _rv_pkgs=$(sort -u <<< "$_rv_pkgs") || true
+
+            if [[ -z "$_rv_pkgs" ]]; then
+                log_warn "Binary integrity: no packages found owning critical binaries — skipping verify"
+                return 0
+            fi
+
+            local _rv_output
+            _rv_output=$(xargs -r -P4 -I{} rpm -V {} 2>/dev/null <<< "$_rv_pkgs") || true
+
+            while IFS= read -r _rv_line; do
+                [[ -z "$_rv_line" ]] && continue
+                local _rv_file
+                _rv_file=$(awk '{print $NF}' <<< "$_rv_line") || true
+                [[ -z "$_rv_file" ]] && continue
+                _is_critical_path "$_rv_file" || continue
+                _report_modified_binary "$_rv_file"
+            done <<< "$_rv_output"
+
+        else
+            log_warn "No package manager (dpkg/rpm) found — binary integrity verify skipped"
+            return 0
         fi
+        return 0
+    }
+    _verify_system_binaries || true
 
-        # Verify only the scoped package set, in parallel (4 workers)
-        local _dv_output
-        _dv_output=$(echo "$_dv_pkgs" | xargs -P4 -I{} dpkg --verify {} 2>/dev/null || true)
-
-        while IFS= read -r _dv_line; do
-            [[ -z "$_dv_line" ]] && continue
-            # Skip conffiles (dpkg marks them with " c " as second field)
-            [[ "$_dv_line" =~ ^[^[:space:]]+[[:space:]]+c[[:space:]] ]] && continue
-            local _dv_file
-            _dv_file=$(echo "$_dv_line" | awk '{print $NF}')
-            [[ -z "$_dv_file" ]] && continue
-            _is_critical_path "$_dv_file" || continue
-            _report_modified_binary "$_dv_file"
-        done <<< "$_dv_output"
-
-    elif command -v rpm &>/dev/null; then
-        # Scope-first: identify packages owning files in critical directories via rpm -qf
-        local _rv_pkgs
-        _rv_pkgs=$(
-            find /usr/bin /usr/sbin /bin /sbin -maxdepth 1 -type f -print0 2>/dev/null \
-            | xargs -0 -n 200 rpm -qf 2>/dev/null \
-            | grep -v "not owned"
-            find /lib/security /usr/lib/security /lib64/security /usr/lib64/security \
-                 -maxdepth 1 -name "*.so" -print0 2>/dev/null \
-            | xargs -0 -n 200 rpm -qf 2>/dev/null \
-            | grep -v "not owned"
-        )
-        _rv_pkgs=$(echo "$_rv_pkgs" | sort -u)
-
-        if [[ -z "$_rv_pkgs" ]]; then
-            log_warn "Binary integrity: no packages found owning critical binaries — skipping"
-            unset -f _report_modified_binary _is_critical_path
-            return
-        fi
-
-        # Verify only the scoped package set, in parallel (4 workers)
-        local _rv_output
-        _rv_output=$(echo "$_rv_pkgs" | xargs -P4 -I{} rpm -V {} 2>/dev/null || true)
-
-        while IFS= read -r _rv_line; do
-            [[ -z "$_rv_line" ]] && continue
-            local _rv_file
-            _rv_file=$(echo "$_rv_line" | awk '{print $NF}')
-            [[ -z "$_rv_file" ]] && continue
-            _is_critical_path "$_rv_file" || continue
-            _report_modified_binary "$_rv_file"
-        done <<< "$_rv_output"
-
-    else
-        log_warn "No package manager (dpkg/rpm) found — binary integrity check skipped"
-        return
-    fi
-
-    unset -f _report_modified_binary _is_critical_path
+    unset -f _report_modified_binary _is_critical_path _verify_system_binaries 2>/dev/null || true
 
     # ─── SUID/SGID active filesystem scan ────────────────────────────────────
     log_check "SUID/SGID files (active filesystem scan)"
@@ -6507,6 +6573,13 @@ check_binary_integrity() {
         "/usr/local/bin" "/usr/local/sbin"
         "/opt" "/tmp" "/dev/shm" "/var/tmp"
     )
+
+    # GTFOBins that yield a trivial root shell when SUID and are NEVER shipped
+    # SUID by any distro. dpkg --verify does not report mode-only changes, so a
+    # SUID bit added to a package-managed binary like /usr/bin/find is invisible
+    # to package verification — flag by name instead. (PANIX --suid --default
+    # sets SUID on find/dash/python/python3.)
+    local _suid_gtfobins=" find dash bash sh zsh ksh csh tcsh python python2 python3 pypy perl ruby lua luau php node nodejs vim vi view rvim nano pico emacs awk gawk mawk nawk sed ed less more man nmap tar cpio dd tee cp mv install rsync xargs env expect gdb make git socat nc ncat netcat busybox flock start-stop-daemon ip ionice nice taskset stdbuf time timeout watch strace ltrace zip unzip gzip bzip2 xz "
 
     local _suid_count=0
     for _sp in "${_suid_paths[@]}"; do
@@ -6535,6 +6608,21 @@ check_binary_integrity() {
                 _matched_pattern="suid_unmanaged_binary"
                 _matched_string="unmanaged SUID: $(basename "$_suid_file")"
                 log_finding "Unmanaged SUID binary: $_suid_file"
+            fi
+
+            # GTFOBin SUID escalation — independent of package status (mode change
+            # is not caught by dpkg --verify). A SUID shell/interpreter/file tool
+            # is a root-shell vector and never a legitimate distro default.
+            if [[ "$_confidence" != "CRITICAL" ]]; then
+                local _suid_base; _suid_base=$(basename "$_suid_file")
+                local _suid_base_stripped="${_suid_base%%[0-9.]*}"
+                if [[ "$_suid_gtfobins" == *" $_suid_base "* ]] || \
+                   [[ "$_suid_gtfobins" == *" $_suid_base_stripped "* ]]; then
+                    _confidence="CRITICAL"
+                    _matched_pattern="suid_gtfobin"
+                    _matched_string="SUID on GTFOBin: $_suid_base (pkg=$_pkg)"
+                    log_finding "SUID bit set on GTFOBin (root-shell vector): $_suid_file"
+                fi
             fi
 
             # If SUID file is a shell script, analyze content
@@ -6600,10 +6688,18 @@ check_binary_integrity() {
 
         while IFS= read -r _cap_line; do
             [[ -z "$_cap_line" ]] && continue
-            # Format: /path/to/binary = cap_net_raw+ep
-            local _cap_file _cap_caps
-            read -r _cap_file _ _cap_caps <<< "$_cap_line"
+            # Two getcap output formats exist:
+            #   libcap < 2.41: /path/to/binary = cap_net_raw+ep
+            #   libcap >= 2.41 (Ubuntu 22.04+): /path/to/binary cap_net_raw=ep
+            local _cap_file _cap_tok2 _cap_tok3 _cap_caps
+            read -r _cap_file _cap_tok2 _cap_tok3 <<< "$_cap_line"
+            if [[ "$_cap_tok2" == "=" ]]; then
+                _cap_caps="$_cap_tok3"
+            else
+                _cap_caps="$_cap_tok2"
+            fi
             [[ -z "$_cap_file" ]] && continue
+            [[ -z "$_cap_caps" ]] && continue
 
             local _hash; _hash=$(get_file_hash "$_cap_file")
             local _meta; _meta=$(get_file_metadata "$_cap_file")
@@ -6640,7 +6736,7 @@ check_binary_integrity() {
                     log_finding "cap_setuid on unmanaged binary: $_cap_file"
                 fi
             # cap_net_raw on pkg-owned utility → LOW (expected for ping, tcpdump)
-            elif [[ "$_cap_caps" =~ "cap_net_raw" ]] && [[ "$_pkg" == "managed" ]]; then
+            elif [[ "$_cap_caps" =~ "cap_net_raw" ]] && [[ "$_pkg" != "unmanaged" ]]; then
                 _confidence="LOW"
             elif [[ "$_pkg" == "unmanaged" ]]; then
                 _confidence="MEDIUM"
@@ -6805,6 +6901,12 @@ main() {
         > "$_mcsv"
         > "$_mjsonl"
         (
+            # Resilience: modules must run every check to completion. They capture
+            # command outcomes explicitly (|| true, || ret=$?), so `set -e` here
+            # only risks aborting a whole module on one incidental non-zero exit
+            # (as happened in check_binary_integrity, silently dropping the SUID,
+            # capability and hijack scans). Disable it inside the module subshell.
+            set +e +o pipefail
             CSV_FILE="$_mcsv"
             JSONL_FILE="$_mjsonl"
             MODULE_NAME="$_mname"
@@ -6831,7 +6933,10 @@ main() {
     log_info "=========================================="
     log_info "Detection Complete!"
     log_info "=========================================="
-    FINDINGS_COUNT=$(grep -c '^{' "$JSONL_FILE" 2>/dev/null || echo 0)
+    # grep -c prints the count (including 0) itself — '|| true' only guards the
+    # non-zero exit status; do NOT '|| echo 0' (that would emit "0" twice)
+    FINDINGS_COUNT=$(grep -c '^{' "$JSONL_FILE" 2>/dev/null || true)
+    FINDINGS_COUNT=${FINDINGS_COUNT:-0}
     log_info "Total findings logged: $FINDINGS_COUNT"
     log_info "Results saved to:"
     log_info "  CSV:   $CSV_FILE"
@@ -6845,51 +6950,24 @@ main() {
     SCAN_ELAPSED=$(( SCAN_END_EPOCH - SCAN_EPOCH ))
     HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}') || HOST_IP="N/A"
 
-    # Count findings by confidence from JSONL (single pass per level)
+    # Count findings by confidence level from JSONL.
+    # A plain grep on the '"confidence":"X"' key is reliable here: escape_json()
+    # escapes every double-quote inside field VALUES (\" ), so the unescaped
+    # sequence can only occur as the actual JSON key — no python/jq dependency
+    # needed (this tool must stay pure bash + coreutils).
     local CNT_CRITICAL CNT_HIGH CNT_MEDIUM CNT_LOW
-    # Count findings by confidence using JSON field parse (avoids false counts from field content)
-    CNT_CRITICAL=$(python3 -c "
-import sys, json
-count = 0
-for line in open('$JSONL_FILE'):
-    try:
-        if json.loads(line).get('confidence') == 'CRITICAL': count += 1
-    except: pass
-print(count)
-" 2>/dev/null || grep -c '"confidence":"CRITICAL"' "$JSONL_FILE" 2>/dev/null || echo 0)
-    CNT_HIGH=$(python3 -c "
-import sys, json
-count = 0
-for line in open('$JSONL_FILE'):
-    try:
-        if json.loads(line).get('confidence') == 'HIGH': count += 1
-    except: pass
-print(count)
-" 2>/dev/null || grep -c '"confidence":"HIGH"' "$JSONL_FILE" 2>/dev/null || echo 0)
-    CNT_MEDIUM=$(python3 -c "
-import sys, json
-count = 0
-for line in open('$JSONL_FILE'):
-    try:
-        if json.loads(line).get('confidence') == 'MEDIUM': count += 1
-    except: pass
-print(count)
-" 2>/dev/null || grep -c '"confidence":"MEDIUM"' "$JSONL_FILE" 2>/dev/null || echo 0)
-    CNT_LOW=$(python3 -c "
-import sys, json
-count = 0
-for line in open('$JSONL_FILE'):
-    try:
-        if json.loads(line).get('confidence') == 'LOW': count += 1
-    except: pass
-print(count)
-" 2>/dev/null || grep -c '"confidence":"LOW"' "$JSONL_FILE" 2>/dev/null || echo 0)
+    CNT_CRITICAL=$(grep -c '"confidence":"CRITICAL"' "$JSONL_FILE" 2>/dev/null || true)
+    CNT_HIGH=$(grep -c '"confidence":"HIGH"' "$JSONL_FILE" 2>/dev/null || true)
+    CNT_MEDIUM=$(grep -c '"confidence":"MEDIUM"' "$JSONL_FILE" 2>/dev/null || true)
+    CNT_LOW=$(grep -c '"confidence":"LOW"' "$JSONL_FILE" 2>/dev/null || true)
+    CNT_CRITICAL=${CNT_CRITICAL:-0}; CNT_HIGH=${CNT_HIGH:-0}
+    CNT_MEDIUM=${CNT_MEDIUM:-0};     CNT_LOW=${CNT_LOW:-0}
 
     cat > "$REPORT_FILE" << REPORT
 ================================================================================
   Persistnux — Linux Persistence Detection Report
 ================================================================================
-  Version    : 2.4.0
+  Version    : ${VERSION}
   Date/Time  : $(date '+%Y-%m-%d %H:%M:%S %Z')
   Hostname   : ${HOSTNAME}
   IP Address : ${HOST_IP}

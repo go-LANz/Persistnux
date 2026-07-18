@@ -5,6 +5,69 @@ All notable changes to Persistnux will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-07-10
+
+Production-hardening release. Findings validated against the **PANIX** persistence
+toolkit (https://github.com/Aegrah/PANIX) as a live detection benchmark on Ubuntu/Kali.
+
+### Fixed — Critical
+
+**`check_binary_integrity` aborted mid-module, silently disabling four scans**
+- Under `set -eo pipefail`, the scope-first package-verify step
+  (`pkgs=$(find … | xargs dpkg -S | awk …)`) exits non-zero whenever `dpkg -S`
+  is handed unowned files or `xargs` runs with empty input — propagating a
+  failure that aborted the entire function. Everything after it — the **SUID/SGID
+  scan, file-capability scan, and binary-hijacking scan** — never ran, on every
+  system. Verify logic is now isolated in a helper invoked with `|| true`, uses
+  `xargs -r`, and guards each scoping/verify assignment. The active-filesystem
+  scans always run now.
+- Module subshells now run with `set +e +o pipefail` so a single incidental
+  non-zero exit can never silently drop the remainder of a module's checks.
+
+**Binary content was pattern-matched as text (false positives + noise)**
+- `analyze_script_content()` now skips non-script (ELF/binary) files. Previously a
+  package-verified udev rule whose `RUN+=` target was a binary (e.g.
+  `/usr/sbin/dmsetup` in `95-dm-notify.rules`) was reported **CRITICAL** with a
+  garbage `matched_string`, plus `grep: binary file matches` stderr noise. The
+  udev `RUN+=` and D-Bus `Exec=` target reads are additionally gated on `is_script`.
+
+### Added — Detection coverage (found via PANIX benchmark)
+
+- **systemd `/usr/local/lib/systemd/system`** added to the unit, generator, and
+  `.path`-unit search paths. It is a valid unit path (`systemd-analyze unit-paths`)
+  and the default drop location for `PANIX --systemd --default`; units there were
+  previously invisible.
+- **SUID-on-GTFOBin escalation** — a SUID bit on a shell/interpreter/file tool
+  (`find`, `dash`, `python*`, `perl`, `vim`, `awk`, `tar`, …) is now CRITICAL
+  regardless of package status. `dpkg --verify` does not report mode-only changes,
+  so a SUID bit added to a package-managed GTFOBin (`PANIX --suid --default`) was
+  previously rated LOW.
+
+### Fixed — Correctness / output
+
+- `file_capability` parsing now handles both `getcap` output formats (libcap
+  `<2.41` `path = caps` and `>=2.41` `path caps`); prior code mis-split the newer
+  format and could drop the capability string.
+- Dead `cap_net_raw` check compared package status to the literal `"managed"`
+  (never produced); now `!= "unmanaged"`.
+- Dead `/boot/initrd.img-*` recency check read a nonexistent `days_old:` metadata
+  key; now derives age from the `modified:` epoch and `SCAN_EPOCH`.
+- Report confidence counts are pure `grep` (no `python3` dependency) and no longer
+  risk a double-printed `0` from `grep -c … || echo 0`.
+- SSH `AuthorizedKeysFile` handling expands the `%h` token (home dir) in addition
+  to `%u`.
+
+### Changed — Robustness / hygiene
+
+- Version is now a single `VERSION` variable used by the banner, `--help`, and the
+  text report (header, usage, and report had drifted to `2.4.0`).
+- Temp directory is created with `mktemp -d` (`0700`) instead of the predictable
+  `/tmp/persistnux_<timestamp>` — removes a symlink/pre-creation race for a tool
+  that runs as root on potentially compromised hosts.
+- Package-status cache is now shared across the parallel module subshells via a
+  tab-separated file cache (append-only, lock-free); previously each forked module
+  started with an empty in-memory cache and repeated every `dpkg`/`rpm` lookup.
+
 ## [2.5.0] - 2026-03-10
 
 ### Added
